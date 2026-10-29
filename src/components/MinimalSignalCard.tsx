@@ -28,14 +28,14 @@ export const MinimalSignalCard: React.FC<MinimalSignalCardProps> = ({
             <div>
               <div className="flex items-center gap-2">
                 <span className="font-bold text-slate-900 dark:text-white text-sm">
-                  SMC Confluence Engine Active
+                  Institutional Confluence Active
                 </span>
                 <span className="text-[10px] uppercase font-mono tracking-widest px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border border-emerald-500/25 font-semibold">
                   Background Scanning
                 </span>
               </div>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 leading-relaxed max-w-xl">
-                Scanning SMC retests, confirmed trend pullbacks, and breakouts. Neutral-timeframe candidates can qualify; counter-trend candidates are excluded from auto-execution. Score, risk, spread, and news checks still apply.
+                Analyzing H1 market structure, order block mitigation, and discount/premium dealing ranges. Qualified setups require a 5.0+ score, candle confirmation, and an active London or New York session.
               </p>
             </div>
           </div>
@@ -79,7 +79,7 @@ export const MinimalSignalCard: React.FC<MinimalSignalCardProps> = ({
                   : 'bg-rose-600 text-white shadow-sm shadow-rose-600/30'
               }`}
             >
-              VALID SMC SIGNAL
+              VALID CONFLUENCE SIGNAL
             </span>
             <span className="text-xs font-mono font-bold text-slate-700 dark:text-slate-300">
               Confluence: {sig.score} / 5.0
