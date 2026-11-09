@@ -860,12 +860,12 @@ export function analyzeInstrument(
     rank: 4, // assigned below in rankOpportunities
   };
 
-  if (analysis.signal && isPrecisionEntryReady(analysis)) {
+  if (analysis.signal && (isPrecisionEntryReady(analysis) || (analysis.status === 'READY' && analysis.spreadAcceptable && analysis.confluenceScore >= 60))) {
     void dispatchSniperAlert({
       symbol,
       direction: analysis.signal.direction,
       timeframe: signalTimeframe,
-      strategy: 'SMC POI Retest',
+      strategy: analysis.signal.strategy || 'SMC POI Retest',
       entry: Number(price.toFixed(config.digits)),
       sl: suggestedSL,
       tp1: suggestedTP1,
@@ -878,7 +878,7 @@ export function analyzeInstrument(
       confluenceScore,
       recommendedLot: sizingResult.safeVolume || undefined,
       sniperGrade,
-      optimalTradeEntry,
+      optimalTradeEntry: optimalTradeEntry || Number(price.toFixed(config.digits)),
       triggerPattern: candlePattern.name !== 'Neutral Price Action' ? candlePattern.name : undefined,
       validUntil: expiryTimestamp,
     });

@@ -1,10 +1,3 @@
-/**
- * TradingViewWidget.tsx - Institutional-Grade Dual Chart Workstation
- * Supports both Official TradingView Advanced Real-Time Chart and
- * Institutional SMC Engine Chart with broker ticks, indicator toggles,
- * and auto-scenario focus.
- */
-
 import React, { memo, useState, useCallback } from 'react';
 import {
   ExternalLink,
@@ -13,14 +6,10 @@ import {
   RefreshCw,
   Eye,
   EyeOff,
-  SlidersHorizontal,
   ChevronDown,
   Sparkles,
-  BarChart3,
-  Layers,
 } from 'lucide-react';
 import {
-  SMCInteractiveChart,
   ChartTimeframe,
   SMCIndicatorConfig,
   DEFAULT_INDICATOR_CONFIG,
@@ -59,7 +48,6 @@ export const TradingViewWidget: React.FC<TradingViewWidgetProps> = memo(({
 }) => {
   const initialTimeframe = timeframes.find((timeframe) => timeframe.interval === initialInterval)?.value ?? 'M1';
   const [selectedTf, setSelectedTf] = useState<ChartTimeframe>(initialTimeframe);
-  const [chartMode, setChartMode] = useState<'tradingview' | 'smc'>('smc');
   const [showIndicators, setShowIndicators] = useState(true);
   const [indicatorConfig, setIndicatorConfig] = useState<SMCIndicatorConfig>(DEFAULT_INDICATOR_CONFIG);
   const [showConfigMenu, setShowConfigMenu] = useState(false);
@@ -112,40 +100,17 @@ export const TradingViewWidget: React.FC<TradingViewWidgetProps> = memo(({
     >
       {/* Chart Top Bar */}
       <div className="px-3 sm:px-4 py-2 bg-slate-50/90 dark:bg-zinc-900/90 border-b border-slate-200 dark:border-zinc-800 flex items-center justify-between flex-wrap gap-2">
-        {/* Left: Engine Mode Switcher & Symbol Indicator */}
+        {/* Left: Symbol Indicator & Timeframe Controls */}
         <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
-          {/* Dual Engine Tabs */}
-          <div className="flex items-center bg-slate-200/80 dark:bg-[#0c0e12] p-0.5 rounded-lg border border-slate-200 dark:border-[#222938]">
-            <button
-              onClick={() => setChartMode('tradingview')}
-              className={`px-2 sm:px-2.5 py-1 rounded-md text-[10px] sm:text-[11px] font-bold transition-all flex items-center gap-1 sm:gap-1.5 cursor-pointer ${
-                chartMode === 'tradingview'
-                  ? 'bg-slate-900 text-white dark:bg-white dark:text-slate-950 shadow-xs'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-              }`}
-              title="Official TradingView live candlestick chart with real-time quotes"
-            >
-              <BarChart3 className="w-3 h-3 sm:w-3.5 sm:h-3.5" />
-              <span className="hidden sm:inline">TradingView Official</span>
-              <span className="sm:hidden">TradingView</span>
-            </button>
-            <button
-              onClick={() => setChartMode('smc')}
-              className={`px-2 sm:px-2.5 py-1 rounded-md text-[10px] sm:text-[11px] font-bold transition-all flex items-center gap-1 sm:gap-1.5 cursor-pointer ${
-                chartMode === 'smc'
-                  ? 'bg-slate-900 text-white dark:bg-white dark:text-slate-950 shadow-xs'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-              }`}
-              title="Institutional SMC execution chart with Order Blocks, FVGs, and live broker trade lines"
-            >
-              <Layers className="w-3 h-3 sm:w-3.5 sm:h-3.5" />
-              <span className="hidden sm:inline">SMC Engine</span>
-              <span className="sm:hidden">SMC</span>
-            </button>
-          </div>
-
-          <span className="font-bold text-slate-900 dark:text-white text-xs px-1.5 py-0.5 rounded bg-sky-500/10 text-sky-600 dark:text-sky-300 border border-sky-500/20">
+          <span className="font-extrabold text-slate-900 dark:text-white text-xs px-2 py-0.5 rounded bg-sky-500/10 text-sky-600 dark:text-sky-300 border border-sky-500/20">
             {rawSymbol}
+          </span>
+
+          <span
+            className="hidden sm:inline-flex items-center text-[10px] font-bold px-2 py-0.5 rounded-full border bg-slate-500/10 text-slate-600 dark:text-slate-400 border-slate-500/20"
+            title="TradingView advanced charts with institutional SMC indicator overlay"
+          >
+            TradingView Chart
           </span>
 
           <span
@@ -324,40 +289,27 @@ export const TradingViewWidget: React.FC<TradingViewWidgetProps> = memo(({
         }`}
         style={typeof height === 'number' ? { height: `${height}px` } : undefined}
       >
-        {chartMode === 'tradingview' ? (
-          <>
-            <OfficialTradingViewEmbed
-              key={`tv-${symbol}-${selectedTf}-${chartKey}`}
-              symbol={symbol}
-              isDark={isDark}
-              interval={
-                selectedTf === 'M1'
-                  ? '1'
-                  : selectedTf === 'M5'
-                  ? '5'
-                  : selectedTf === 'M15'
-                  ? '15'
-                  : selectedTf === 'H4'
-                  ? '240'
-                  : '60'
-              }
-              height={typeof height === 'number' ? height : '100%'}
-            />
-            <SMCOverlayHUD
-              showIndicators={showIndicators}
-              indicatorConfig={indicatorConfig}
-              onSwitchToSMC={() => setChartMode('smc')}
-            />
-          </>
-        ) : (
-          <SMCInteractiveChart
-            key={`smc-${selectedTf}-${chartKey}`}
-            timeframe={selectedTf}
-            height={typeof height === 'number' ? height : 650}
-            showIndicators={showIndicators}
-            indicatorConfig={indicatorConfig}
-          />
-        )}
+        <OfficialTradingViewEmbed
+          key={`tv-${symbol}-${selectedTf}-${chartKey}`}
+          symbol={symbol}
+          isDark={isDark}
+          interval={
+            selectedTf === 'M1'
+              ? '1'
+              : selectedTf === 'M5'
+              ? '5'
+              : selectedTf === 'M15'
+              ? '15'
+              : selectedTf === 'H4'
+              ? '240'
+              : '60'
+          }
+          height={typeof height === 'number' ? height : '100%'}
+        />
+        <SMCOverlayHUD
+          showIndicators={showIndicators}
+          indicatorConfig={indicatorConfig}
+        />
       </div>
     </div>
   );

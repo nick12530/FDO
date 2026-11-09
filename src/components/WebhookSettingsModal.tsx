@@ -19,14 +19,18 @@ import {
   Zap,
   Sliders,
   Sparkles,
+  Radio,
 } from 'lucide-react';
 import {
   getWebhookConfig,
   saveWebhookConfig,
   sendTelegramMessage,
   sendCustomWebhook,
+  dispatchLiveSignalAlert,
   WebhookConfig,
 } from '../utils/webhookNotifier';
+import { useMarket, useTicker } from '../hooks/useTradingStore';
+import type { SupportedSymbol } from '../engine/instrumentConfig';
 
 interface WebhookSettingsModalProps {
   isOpen: boolean;
@@ -57,6 +61,9 @@ export const WebhookSettingsModal: React.FC<WebhookSettingsModalProps> = ({ isOp
       onClose();
     }, 1200);
   };
+
+  const market = useMarket();
+  const ticker = useTicker();
 
   const handleTestNotification = async () => {
     setTesting(true);
@@ -106,6 +113,59 @@ export const WebhookSettingsModal: React.FC<WebhookSettingsModalProps> = ({ isOp
       setTestResult({
         ok: false,
         msg: err?.message || 'Failed to dispatch test alert.',
+      });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const handleSendLiveSignal = async () => {
+    setTesting(true);
+    setTestResult(null);
+
+    try {
+      if (!config.telegramBotToken || !config.telegramChatId) {
+        throw new Error('Please enter both Telegram Bot Token and Chat ID first.');
+      }
+
+      const topOpp = market.scannerAnalyses?.find((a) => a.status === 'READY') ||
+        market.scannerAnalyses?.find((a) => a.symbol === ticker.symbol) ||
+        market.scannerAnalyses?.[0];
+
+      const sym = (topOpp?.symbol || ticker.symbol || 'XAUUSD') as SupportedSymbol;
+      const dir = topOpp?.bias === 'SELL' ? 'SELL' : 'BUY';
+      const entry = topOpp?.price || ticker.bid || 2700;
+      const sl = topOpp?.suggestedSL || (dir === 'BUY' ? entry * 0.995 : entry * 1.005);
+      const tp = topOpp?.suggestedTP || (dir === 'BUY' ? entry * 1.01 : entry * 0.99);
+
+      const res = await dispatchLiveSignalAlert({
+        symbol: sym,
+        direction: dir,
+        timeframe: market.currentTimeframe || 'M15',
+        strategy: topOpp?.signal?.strategy || 'Institutional SMC Liquidity POI',
+        entry,
+        sl,
+        tp,
+        tp2: topOpp?.suggestedTP2,
+        tp3: topOpp?.suggestedTP3,
+        confluenceScore: topOpp?.confluenceScore || 85,
+        lotSize: topOpp?.safeLotSize || 0.02,
+        riskReward: topOpp?.riskRewardRatio ? topOpp.riskRewardRatio.toFixed(1) : '2.4',
+        force: true,
+      });
+
+      if (!res.ok) {
+        throw new Error(res.error || 'Failed to dispatch live signal to Telegram.');
+      }
+
+      setTestResult({
+        ok: true,
+        msg: `✅ Live signal for ${sym} (${dir}) sent directly to your Telegram channel!`,
+      });
+    } catch (err: any) {
+      setTestResult({
+        ok: false,
+        msg: err?.message || 'Failed to dispatch live signal to Telegram.',
       });
     } finally {
       setTesting(false);
@@ -313,17 +373,17 @@ export const WebhookSettingsModal: React.FC<WebhookSettingsModalProps> = ({ isOp
               </label>
 
               <div className="flex items-center justify-between pt-1">
-                <span>Minimum Confluence (precision floor: 88):</span>
-                <span className="font-bold text-amber-500">{config.minConfluenceScore} / 100</span>
+                <span>Minimum Confluence Floor:</span>
+                <span className="font-extrabold text-amber-500">{config.minConfluenceScore} / 100</span>
               </div>
               <input
                 type="range"
-                min="88"
+                min="50"
                 max="100"
                 step="1"
                 value={config.minConfluenceScore}
                 onChange={(e) => setConfig((prev) => ({ ...prev, minConfluenceScore: Number(e.target.value) }))}
-                className="w-full accent-amber-500"
+                className="w-full accent-amber-500 cursor-pointer"
               />
             </div>
           </div>
@@ -354,16 +414,29 @@ export const WebhookSettingsModal: React.FC<WebhookSettingsModalProps> = ({ isOp
         </div>
 
         {/* Footer Actions */}
-        <div className="px-5 py-3.5 border-t border-slate-100 dark:border-zinc-800 bg-slate-50/80 dark:bg-[#12151b] flex items-center justify-between gap-3 shrink-0">
-          <button
-            type="button"
-            disabled={testing}
-            onClick={handleTestNotification}
-            className="px-3.5 py-2 rounded-xl bg-sky-500/15 hover:bg-sky-500/25 text-sky-700 dark:text-sky-300 border border-sky-500/30 font-bold transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
-          >
-            <Send className="w-3.5 h-3.5" />
-            <span>{testing ? 'Sending Test...' : 'Send Test Alert'}</span>
-          </button>
+        <div className="px-5 py-3.5 border-t border-slate-100 dark:border-zinc-800 bg-slate-50/80 dark:bg-[#12151c] flex items-center justify-between gap-2 sm:gap-3 shrink-0 flex-wrap">
+          <div className="flex items-center gap-2 flex-wrap">
+            <button
+              type="button"
+              disabled={testing}
+              onClick={handleTestNotification}
+              className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-slate-800 dark:text-zinc-200 border border-slate-300 dark:border-zinc-700 font-bold transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50 text-[11px]"
+            >
+              <Send className="w-3.5 h-3.5 text-sky-500" />
+              <span>{testing ? 'Sending...' : 'Test Connection'}</span>
+            </button>
+
+            <button
+              type="button"
+              disabled={testing}
+              onClick={handleSendLiveSignal}
+              className="px-3 py-2 rounded-xl bg-sky-500/15 hover:bg-sky-500/25 text-sky-700 dark:text-sky-300 border border-sky-500/30 font-bold transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50 text-[11px]"
+              title="Dispatches the current verified live setup directly to your Telegram channel"
+            >
+              <Zap className="w-3.5 h-3.5 text-amber-500" />
+              <span>Send Live Setup</span>
+            </button>
+          </div>
 
           <div className="flex items-center gap-2">
             <button

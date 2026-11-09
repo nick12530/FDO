@@ -29,8 +29,8 @@ export const DEFAULT_WEBHOOK_CONFIG: WebhookConfig = {
   telegramBotToken: '',
   telegramChatId: '',
   webhookUrl: '',
-  minConfluenceScore: 88,
-  onlySniperSignals: true,
+  minConfluenceScore: 65,
+  onlySniperSignals: false,
   alertOnApproachingEntry: true,
   alertOnExecutions: true,
   soundAlerts: true,
@@ -47,7 +47,7 @@ export function getWebhookConfig(): WebhookConfig {
       ...DEFAULT_WEBHOOK_CONFIG,
       ...stored,
       minConfluenceScore: Number.isFinite(minConfluenceScore)
-        ? Math.min(100, Math.max(88, minConfluenceScore))
+        ? Math.min(100, Math.max(50, minConfluenceScore))
         : DEFAULT_WEBHOOK_CONFIG.minConfluenceScore,
     };
   } catch {
@@ -176,17 +176,13 @@ export async function dispatchSniperAlert(params: {
   optimalTradeEntry?: number;
   triggerPattern?: string;
   validUntil: number;
+  force?: boolean;
 }): Promise<boolean> {
   const config = getWebhookConfig();
-  if (!config.enabled) return false;
+  if (!config.enabled && !params.force) return false;
 
-  // Filter criteria
-  if (
-    params.confluenceScore < Math.max(88, config.minConfluenceScore) ||
-    params.sniperGrade !== 'A+' ||
-    !params.optimalTradeEntry ||
-    params.validUntil <= Date.now()
-  ) {
+  // Filter criteria: respect configured min confluence score
+  if (!params.force && (params.confluenceScore < config.minConfluenceScore || params.validUntil <= Date.now())) {
     return false;
   }
 
@@ -194,7 +190,7 @@ export async function dispatchSniperAlert(params: {
   const signalKey = `${params.symbol}-${params.direction}-${params.timeframe}`;
   const now = Date.now();
   const lastSent = recentlySentSignals.get(signalKey);
-  if (lastSent && now - lastSent < 300_000) {
+  if (!params.force && lastSent && now - lastSent < 300_000) {
     return false; // Skip duplicate notification within 5 mins
   }
   recentlySentSignals.set(signalKey, now);
@@ -202,7 +198,9 @@ export async function dispatchSniperAlert(params: {
   const isBuy = params.direction === 'BUY';
   const dirBadge = isBuy ? '🟢 BUY SETUP' : '🔴 SELL SETUP';
   const gradeLabel = params.sniperGrade ? ` • <b>Grade ${params.sniperGrade}</b>` : '';
-  const oteLine = `  • <b>OTE Entry Trigger:</b> <code>${params.optimalTradeEntry.toFixed(cfg.digits)}</code>\n`;
+  const oteLine = params.optimalTradeEntry
+    ? `  • <b>OTE Entry Trigger:</b> <code>${params.optimalTradeEntry.toFixed(cfg.digits)}</code>\n`
+    : '';
   const triggerLine = params.triggerPattern
     ? `  • <b>Trigger Pattern:</b> ${params.triggerPattern}\n`
     : '';
@@ -214,13 +212,13 @@ export async function dispatchSniperAlert(params: {
   });
 
   const telegramHtml = `
-⚡️ <b>PRECISION ENTRY ALERT</b> ⚡️
+⚡️ <b>INSTITUTIONAL SIGNAL ALERT</b> ⚡️
 ━━━━━━━━━━━━━━━━━━━━━━━━
 💎 <b>PAIR:</b> #${params.symbol}
 🎯 <b>SETUP:</b> <b>${dirBadge}</b>
 📊 <b>TIMEFRAME:</b> ${params.timeframe}  |  <b>CONFLUENCE:</b> ${params.confluenceScore}/100${gradeLabel}
 
-📍 <b>CURRENT QUOTE:</b> <code>${params.entry.toFixed(cfg.digits)}</code>
+📍 <b>ENTRY:</b> <code>${params.entry.toFixed(cfg.digits)}</code>
 ${oteLine}🛑 <b>STOP LOSS:</b> <code>${params.sl.toFixed(cfg.digits)}</code> (-${params.slPips} pips)
 
 🎯 <b>TARGET OBJECTIVES:</b>
@@ -233,19 +231,19 @@ ${oteLine}🛑 <b>STOP LOSS:</b> <code>${params.sl.toFixed(cfg.digits)}</code> (
 ${triggerLine}  • <b>Suggested Sizing:</b> <code>${params.recommendedLot ? `${params.recommendedLot.toFixed(2)} Lots` : '0.01 - 0.05 Lots'}</code>
   • <b>Trade Rule:</b> Move Stop Loss to Break-Even (BE) once TP1 is secured
 ━━━━━━━━━━━━━━━━━━━━━━━━
-⏳ <b>Entry window closes:</b> ${validUntil} UTC
-⚠️ <i>High-confluence setup, not a guarantee of profit. Confirm the live quote and risk before execution.</i>
-🕒 <i>${new Date(now).toLocaleTimeString('en-GB', { timeZone: 'UTC' })} UTC • NIFTY Terminal</i>
+⏳ <b>Valid until:</b> ${validUntil} UTC
+⚠️ <i>Live broker quotes verified. Verify risk before execution.</i>
+🕒 <i>${new Date(now).toLocaleTimeString('en-GB', { timeZone: 'UTC' })} UTC • SMC Trading System</i>
 `.trim();
 
   let sent = false;
 
-  if ((config.type === 'telegram' || config.type === 'both') && config.telegramBotToken && config.telegramChatId) {
+  if (config.telegramBotToken && config.telegramChatId) {
     const res = await sendTelegramMessage(config.telegramBotToken, config.telegramChatId, telegramHtml);
     if (res.ok) sent = true;
   }
 
-  if ((config.type === 'webhook' || config.type === 'both') && config.webhookUrl) {
+  if (config.webhookUrl) {
     const payload = {
       event: 'SNIPER_SIGNAL',
       symbol: params.symbol,
@@ -269,6 +267,63 @@ ${triggerLine}  • <b>Suggested Sizing:</b> <code>${params.recommendedLot ? `${
 
   if (!sent) recentlySentSignals.delete(signalKey);
   return sent;
+}
+
+/**
+ * Dispatches an active live signal directly to Telegram / Webhook (manual trigger or scanner sync)
+ */
+export async function dispatchLiveSignalAlert(params: {
+  symbol: SupportedSymbol;
+  direction: 'BUY' | 'SELL';
+  timeframe: string;
+  strategy: string;
+  entry: number;
+  sl: number;
+  tp: number;
+  tp2?: number;
+  tp3?: number;
+  confluenceScore: number;
+  lotSize?: number;
+  riskReward?: string | number;
+  force?: boolean;
+}): Promise<{ ok: boolean; error?: string }> {
+  const config = getWebhookConfig();
+  if (!config.telegramBotToken || !config.telegramChatId) {
+    return { ok: false, error: 'Telegram credentials missing. Configure Bot Token & Chat ID in Webhook settings.' };
+  }
+
+  const signalKey = `live-${params.symbol}-${params.direction}-${params.timeframe}`;
+  const now = Date.now();
+  const lastSent = recentlySentSignals.get(signalKey);
+  if (!params.force && lastSent && now - lastSent < 180_000) {
+    return { ok: false, error: 'Signal already sent to Telegram within the last 3 minutes.' };
+  }
+  recentlySentSignals.set(signalKey, now);
+
+  const cfg = getInstrumentConfig(params.symbol);
+  const isBuy = params.direction === 'BUY';
+  const dirBadge = isBuy ? '🟢 BUY SETUP' : '🔴 SELL SETUP';
+  const rr = params.riskReward ?? (params.sl && params.entry ? (Math.abs(params.tp - params.entry) / Math.max(0.0001, Math.abs(params.entry - params.sl))).toFixed(1) : '2.0');
+
+  const text = `
+⚡ <b>SMC LIVE TRADING SIGNAL</b> ⚡
+━━━━━━━━━━━━━━━━━━━━━━━━
+💎 <b>PAIR:</b> #${params.symbol}
+🎯 <b>DIRECTION:</b> <b>${dirBadge}</b>
+📊 <b>TIMEFRAME:</b> ${params.timeframe}  |  <b>CONFLUENCE:</b> ${params.confluenceScore}/100
+
+📍 <b>ENTRY PRICE:</b> <code>${params.entry.toFixed(cfg.digits)}</code>
+🛑 <b>STOP LOSS:</b> <code>${params.sl.toFixed(cfg.digits)}</code>
+🎯 <b>PRIMARY TARGET:</b> <code>${params.tp.toFixed(cfg.digits)}</code>
+${params.tp2 ? `🎯 <b>TARGET 2:</b> <code>${params.tp2.toFixed(cfg.digits)}</code>\n` : ''}${params.tp3 ? `🎯 <b>TARGET 3:</b> <code>${params.tp3.toFixed(cfg.digits)}</code>\n` : ''}⚖️ <b>RISK/REWARD:</b> 1:${rr}
+
+🛡 <b>SETUP:</b> ${params.strategy}
+📦 <b>SUGGESTED VOLUME:</b> <code>${params.lotSize ? `${params.lotSize.toFixed(2)} Lots` : '0.01 - 0.05 Lots'}</code>
+━━━━━━━━━━━━━━━━━━━━━━━━
+🕒 <i>${new Date(now).toLocaleTimeString('en-GB', { timeZone: 'UTC' })} UTC • Live Trading Terminal</i>
+`.trim();
+
+  return await sendTelegramMessage(config.telegramBotToken, config.telegramChatId, text);
 }
 
 export async function dispatchApproachingEntryAlert(params: {

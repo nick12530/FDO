@@ -281,6 +281,7 @@ export class TradingEngine {
   activeSymbol: SupportedSymbol = 'XAUUSD';
   scannerAnalyses: PairAnalysis[] = [];
   bestOpportunity: PairAnalysis | null = null;
+  lastExecutionError: MarketState['lastExecutionError'] = null;
   pairData: Record<
     SupportedSymbol,
     {
@@ -1122,6 +1123,7 @@ export class TradingEngine {
         candlestickAnalysis,
         scannerAnalyses: this.scannerAnalyses,
         bestOpportunity: this.bestOpportunity,
+        lastExecutionError: this.lastExecutionError,
       };
     }
     return this._cachedMarket;
@@ -2814,13 +2816,21 @@ export class TradingEngine {
           if (market.signal) {
             this.recordExecutedSignal(market.signal, res.ticket, riskVolume, symbolToTrade, rationale);
           }
-          this.slog(`MT5 Broker Fill #${res.ticket}: ${symbolToTrade} ${direction} ${res.filledVolume}L @ ${res.price}`, 'trade');
         } catch (err: any) {
           const errMsg = err?.message || 'Rejected';
+          const isTradeDisabled = errMsg.includes('10017') || errMsg.toLowerCase().includes('trade disabled');
+          this.lastExecutionError = {
+            symbol: symbolToTrade,
+            message: errMsg,
+            timestamp: Date.now(),
+            isTradeDisabled,
+          };
           this.slog(`MT5 Broker Execution Error on ${symbolToTrade}: ${errMsg}`, 'error');
           if (market.signal) {
             this.recordRejectedSignal(market.signal, `MT5 bridge error: ${errMsg}`, symbolToTrade);
           }
+          this.invalidateMarket();
+          this.emit('market');
         }
       })();
       return { ok: true, ticket, price: openPrice };

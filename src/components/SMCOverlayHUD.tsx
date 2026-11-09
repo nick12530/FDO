@@ -26,13 +26,11 @@ interface SMCOverlayHUDProps {
   indicatorConfig: SMCIndicatorConfig;
   onToggleIndicators?: () => void;
   onFocusOrderBlock?: () => void;
-  onSwitchToSMC?: () => void;
 }
 
 export const SMCOverlayHUD: React.FC<SMCOverlayHUDProps> = memo(({
   showIndicators,
   indicatorConfig,
-  onSwitchToSMC,
 }) => {
   const market = useMarket();
   const positionsState = usePositions();

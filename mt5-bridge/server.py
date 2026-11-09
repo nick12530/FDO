@@ -216,6 +216,9 @@ def get_symbol_spec(login: int, server: str, symbol: str, info: Any) -> dict:
         }
         if any(not math.isfinite(value) for value in spec.values()):
             raise HTTPException(status_code=503, detail="MT5 returned non-finite symbol risk specifications.")
+        trade_mode_val = int(getattr(info, "trade_mode", 4) or 0)
+        spec["tradeMode"] = trade_mode_val
+        spec["tradeDisabled"] = bool(trade_mode_val == 0)
         _symbol_spec_cache[key] = spec
     return _symbol_spec_cache[key]
 

@@ -379,6 +379,12 @@ export interface MarketState {
   candlestickAnalysis?: CandlestickAnalysis;
   scannerAnalyses?: PairAnalysis[];
   bestOpportunity?: PairAnalysis | null;
+  lastExecutionError?: {
+    symbol: string;
+    message: string;
+    timestamp: number;
+    isTradeDisabled?: boolean;
+  } | null;
 }
 
 export interface SymbolTradingSpec {
@@ -391,6 +397,8 @@ export interface SymbolTradingSpec {
   volumeStep: number;
   tradeStopsLevel: number;
   tradeFreezeLevel: number;
+  tradeMode?: number;
+  tradeDisabled?: boolean;
 }
 
 export interface PositionsState {

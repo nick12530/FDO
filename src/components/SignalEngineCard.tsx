@@ -19,12 +19,15 @@ import {
   Plus,
   TrendingUp,
   TrendingDown,
+  AlertTriangle,
+  Send,
 } from 'lucide-react';
 import { Signal, TradeDirection } from '../types/smc';
 import { buildSignalRationale } from '../engine/tradeJournal';
 import { getInstrumentConfig } from '../engine/instrumentConfig';
 import type { SupportedSymbol } from '../engine/instrumentConfig';
 import { signalAudioNotifier } from '../utils/audioNotification';
+import { dispatchLiveSignalAlert } from '../utils/webhookNotifier';
 
 interface SignalEngineCardProps {
   onExecuteSignal?: (customVolume?: number, positionCount?: number, signal?: Signal) => void | Promise<void>;
@@ -62,7 +65,13 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
   const positionCount = 1;
   const [copied, setCopied] = useState(false);
   const [executedFeedback, setExecutedFeedback] = useState<string | null>(null);
+  const [tgFeedback, setTgFeedback] = useState<string | null>(null);
   const [selectedSignalId, setSelectedSignalId] = useState<string | null>(null);
+
+  const isBrokerTradeDisabled =
+    Boolean(market.symbolSpec?.tradeDisabled) ||
+    (market.lastExecutionError?.symbol === ticker.symbol &&
+      Boolean(market.lastExecutionError?.isTradeDisabled));
 
   const selectedSignal = readySignals.find(
     (signal) => `${signal.strategy}:${signal.direction}:${signal.timeframe}:${signal.timestamp}` === selectedSignalId
@@ -101,6 +110,32 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
   const rewardPts = rawSig ? Math.abs(rawSig.tp - entryPrice) : 0;
   const riskPips = riskPts / instrumentConfig.pipSize;
   const rewardPips = rewardPts / instrumentConfig.pipSize;
+
+  const handleSendTelegram = async () => {
+    if (!rawSig) return;
+    try {
+      const res = await dispatchLiveSignalAlert({
+        symbol: ticker.symbol as SupportedSymbol,
+        direction: rawSig.direction,
+        timeframe: rawSig.timeframe,
+        strategy: rawSig.strategy,
+        entry: rawSig.entry,
+        sl: rawSig.sl,
+        tp: rawSig.tp,
+        confluenceScore: Math.round(rawSig.score * 10),
+        lotSize: riskLimitedLotSize ?? lotSize,
+        force: true,
+      });
+      if (res.ok) {
+        setTgFeedback('Sent to Telegram!');
+      } else {
+        setTgFeedback(res.error || 'Failed to send');
+      }
+    } catch (e: any) {
+      setTgFeedback(e?.message || 'Error');
+    }
+    setTimeout(() => setTgFeedback(null), 3000);
+  };
 
   const tradeMetrics = useMemo(() => {
     const config = instrumentConfig;
@@ -192,8 +227,8 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
 
         <div className="flex items-center gap-2">
           {rawSig && (
-            <span className="text-xs font-bold text-slate-700 dark:text-slate-300">
-              Score: <strong className="text-slate-900 dark:text-white">{rawSig.score.toFixed(1)}/10</strong>
+            <span className="text-xs font-extrabold text-slate-800 dark:text-slate-200">
+              Score: <strong className="text-slate-900 dark:text-white font-black">{rawSig.score.toFixed(1)}/10</strong>
             </span>
           )}
           <button
@@ -205,8 +240,32 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
           >
             {copied ? <Check className="w-4 h-4 text-emerald-500" /> : <Copy className="w-4 h-4" />}
           </button>
+          <button
+            type="button"
+            onClick={handleSendTelegram}
+            title="Dispatch this live signal to Telegram channel"
+            disabled={!rawSig}
+            className="p-1 rounded text-slate-400 hover:text-sky-500 dark:text-slate-500 dark:hover:text-sky-400 transition-colors cursor-pointer disabled:opacity-40 flex items-center gap-1"
+          >
+            <Send className="w-4 h-4 text-sky-500" />
+            {tgFeedback && <span className="text-[10px] text-emerald-500 font-extrabold">{tgFeedback}</span>}
+          </button>
         </div>
       </div>
+
+      {/* Broker Trade Disabled Banner (Retcode 10017) */}
+      {isBrokerTradeDisabled && (
+        <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-800 dark:text-amber-300 text-xs font-mono">
+          <div className="font-extrabold flex items-center gap-1.5 mb-1 text-amber-700 dark:text-amber-200">
+            <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0" />
+            <span>Broker Trade Disabled for {ticker.symbol} (retcode 10017)</span>
+          </div>
+          <p className="text-[11px] font-semibold leading-relaxed">
+            Your broker has disabled order execution for <strong>{ticker.symbol}</strong> on this account.
+            Quotes and chart indicators remain active. Switch to <strong>GOLD (XAUUSD)</strong> or <strong>EURUSD</strong> to place live trades.
+          </p>
+        </div>
+      )}
 
       {/* 2. Direction & Summary */}
       <div className={`rounded-lg p-3 border transition-all ${
@@ -344,9 +403,9 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
       <button
         data-hotkey-execute="true"
         onClick={handleExecute}
-        disabled={isWideSpread || !rawSig || !sizingInfo || !hasSafeLot || Boolean(scannerBlockReason)}
-        className={`w-full py-3 px-4 rounded-xl font-bold text-sm tracking-wide transition-all flex items-center justify-center gap-2 cursor-pointer ${
-          isWideSpread || !rawSig || !sizingInfo || !hasSafeLot || Boolean(scannerBlockReason)
+        disabled={isBrokerTradeDisabled || isWideSpread || !rawSig || !sizingInfo || !hasSafeLot || Boolean(scannerBlockReason)}
+        className={`w-full py-3.5 px-4 rounded-xl font-black text-sm tracking-wide transition-all flex items-center justify-center gap-2 cursor-pointer ${
+          isBrokerTradeDisabled || isWideSpread || !rawSig || !sizingInfo || !hasSafeLot || Boolean(scannerBlockReason)
             ? 'bg-slate-100 text-slate-400 dark:bg-[#1a2320] dark:text-slate-500 cursor-not-allowed border border-slate-200 dark:border-[#222d29]'
             : activeDirection === 'SELL'
             ? 'bg-rose-600 hover:bg-rose-700 text-white shadow-sm'
@@ -354,7 +413,9 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
         }`}
       >
         <span>
-          {!rawSig
+          {isBrokerTradeDisabled
+            ? `Trading Disabled by Broker (${ticker.symbol})`
+            : !rawSig
             ? 'Waiting for Confirmed Setup'
             : isWideSpread
             ? `Spread Too Wide (${ticker.spread} pts)`
