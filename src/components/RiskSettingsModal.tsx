@@ -62,11 +62,11 @@ export const RiskSettingsModal: React.FC<RiskSettingsModalProps> = ({
       role="dialog"
       aria-modal="true"
       aria-labelledby="risk-settings-title"
-      className="fixed inset-0 z-[100] bg-black/70 backdrop-blur-sm flex items-center justify-center p-3 sm:p-4 overflow-y-auto"
+      className="fixed inset-0 z-[170] bg-black/55 backdrop-blur-xs flex justify-end"
     >
-      <div className="bg-white dark:bg-black border border-zinc-200 dark:border-zinc-800 rounded-2xl w-full max-w-lg shadow-2xl overflow-hidden max-h-[92dvh] flex flex-col my-auto font-mono text-xs">
+      <div className="ws-surface border-l w-full max-w-lg h-full shadow-2xl overflow-hidden flex flex-col text-xs">
         {/* Header */}
-        <div className="flex items-center justify-between px-4 sm:px-6 py-3.5 border-b border-zinc-200 dark:border-zinc-800 shrink-0">
+        <div className="flex items-center justify-between px-5 py-4 ws-subtle border-b shrink-0">
           <div className="flex items-center gap-2.5">
             <Shield className="w-5 h-5 text-emerald-500" />
             <div>

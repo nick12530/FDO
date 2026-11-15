@@ -133,6 +133,8 @@ export interface Signal {
   humanExplanation?: HumanSignalExplanation;
   liquiditySweep?: LiquiditySweepInfo;
   isOutOfSessionException?: boolean;
+  executionMode?: 'MARKET' | 'PULLBACK_LIMIT';
+  regime?: 'TRENDING' | 'EXPANSION' | 'CHOP' | 'LOW_VOL';
   volumeMetrics?: VolumeMetrics;
   confluenceBreakdown?: MultiFactorConfluenceBreakdown;
 }
@@ -183,6 +185,7 @@ export interface PendingOrder {
   maxDriftPips: number;
   currentDriftPips: number;
   status: 'PENDING' | 'TRIGGERED' | 'CANCELLED';
+  isBrokerOrder?: boolean;
   strategyRationale?: string;
   strategyOrderBlock?: Zone;
 }
@@ -193,6 +196,7 @@ export interface ClosedTrade {
   orderTicket?: number;
   positionTicket?: number;
   openTime?: string;
+  openedAt?: string;
   closeTime?: string;
   closedAt?: string;
   type: TradeDirection;
@@ -278,6 +282,7 @@ export interface NewsSentimentItem {
 }
 
 export interface IntermarketStatus {
+  hasLiveData?: boolean;
   dxyBias: 'bullish' | 'bearish' | 'neutral';
   dxyChangePct: number;
   vixLevel: number;
@@ -448,6 +453,7 @@ export interface EngineState {
   leverage?: number;
   allowHighConfluenceOverride?: boolean;
   autoSelectBestScenario?: boolean;
+  executionMode?: 'MARKET' | 'PULLBACK_LIMIT';
 }
 
 export interface MacroSentimentState {
@@ -495,3 +501,25 @@ export interface TerminalSnapshot extends TickerState, MarketState, EngineState 
 }
 
 export type StoreChannel = 'ticker' | 'market' | 'positions' | 'engine' | 'events' | 'scanner';
+
+export interface SMCIndicatorConfig {
+  orderBlocks: boolean;
+  fairValueGaps: boolean;
+  structure: boolean;
+  signals: boolean;
+  trades: boolean;
+  tvEma?: boolean;
+  tvRsi?: boolean;
+  tvVwap?: boolean;
+}
+
+export const DEFAULT_INDICATOR_CONFIG: SMCIndicatorConfig = {
+  orderBlocks: true,
+  fairValueGaps: true,
+  structure: true,
+  signals: true,
+  trades: true,
+  tvEma: true,
+  tvRsi: false,
+  tvVwap: false,
+};

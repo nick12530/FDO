@@ -1,4 +1,4 @@
-import { Candle, ClosedTrade, EconomicEvent, InstrumentType, TradeDirection, NewsSentimentItem } from '../types/smc';
+import { Candle, ClosedTrade, EconomicEvent, InstrumentType, PendingOrder, TradeDirection, NewsSentimentItem } from '../types/smc';
 import type { SymbolRiskSpec } from './riskConfig';
 
 export interface BridgeAccountSnapshot {
@@ -9,6 +9,7 @@ export interface BridgeAccountSnapshot {
     equity: number;
     margin_free: number;
     leverage?: number;
+    daily_start_balance?: number;
   };
   positions: Array<{
     ticket: number;
@@ -23,6 +24,7 @@ export interface BridgeAccountSnapshot {
     comment: string;
     time: string;
   }>;
+  pendingOrders?: PendingOrder[];
   symbol: string;
   instrumentType: InstrumentType;
   accountMode: 'demo' | 'live' | 'contest' | 'unknown';
@@ -467,6 +469,9 @@ export class MT5BridgeConnector {
     instrumentType: InstrumentType;
     signalTimeframe: 'M1' | 'M5' | 'M15';
     signalTimestamp: string;
+    orderType?: 'MARKET' | 'LIMIT';
+    limitPrice?: number;
+    expirationMinutes?: number;
     magic?: number;
     forceExecute?: boolean;
     bypassCircuitBreaker?: boolean;
@@ -498,6 +503,7 @@ export class MT5BridgeConnector {
       pending: boolean;
       account: BridgeAccountSnapshot['account'];
       positions: BridgeAccountSnapshot['positions'];
+      pendingOrders?: PendingOrder[];
       symbol: BridgeAccountSnapshot['symbol'];
       accountMode: BridgeAccountSnapshot['accountMode'];
       tradingHalted: boolean;
@@ -536,6 +542,7 @@ export class MT5BridgeConnector {
     this.onDataCallback?.({
       account: response.account,
       positions: response.positions,
+      pendingOrders: response.pendingOrders,
       symbol: response.symbol,
       accountMode: response.accountMode,
       tradingHalted: response.tradingHalted,
@@ -559,6 +566,21 @@ export class MT5BridgeConnector {
       partial: response.partial,
       pending: response.pending,
     };
+  }
+
+  async cancelPendingOrder(ticket: number, symbol?: string): Promise<void> {
+    if (!this.expectedAccount || !this.isConnected) throw new Error('MT5 account identity is not verified.');
+    const snapshot = await this.request<BridgeAccountSnapshot>('/api/cancel-order', {
+      method: 'POST',
+      body: JSON.stringify({
+        ticket,
+        ...(symbol ? { symbol } : {}),
+        expectedLogin: this.expectedAccount.login,
+        expectedServer: this.expectedAccount.server,
+      }),
+    });
+    this.lastPing = Date.now();
+    this.onDataCallback?.({ ...snapshot, instrumentType: this.instrumentType });
   }
 
   async closePosition(ticket: number, volume?: number): Promise<void> {
@@ -678,15 +700,39 @@ export class MT5BridgeConnector {
     }
   }
 
+  public async refreshAccountHistory(): Promise<ClosedTrade[]> {
+    if (!this.isConnected || !this.expectedAccount) return [];
+    const accountSnap = { ...this.expectedAccount };
+    const trades = await this.request<ClosedTrade[]>(
+      `/api/history?days=365&symbol=ALL`,
+      {}
+    );
+    if (
+      this.expectedAccount &&
+      this.expectedAccount.login === accountSnap.login &&
+      this.expectedAccount.server === accountSnap.server
+    ) {
+      this.onClosedTradesCallback?.(Array.isArray(trades) ? trades : []);
+    }
+    return Array.isArray(trades) ? trades : [];
+  }
+
   private async refreshClosedTrades() {
-    if (!this.isConnected || this.closedTradesInFlight) return;
+    if (!this.isConnected || this.closedTradesInFlight || !this.expectedAccount) return;
     this.closedTradesInFlight = true;
+    const accountSnap = { ...this.expectedAccount };
     try {
       const trades = await this.request<ClosedTrade[]>(
-        `/api/history?days=180&symbol=${encodeURIComponent(this.symbol)}`,
+        `/api/history?days=365&symbol=ALL`,
         {}
       );
-      this.onClosedTradesCallback?.(trades);
+      if (
+        this.expectedAccount &&
+        this.expectedAccount.login === accountSnap.login &&
+        this.expectedAccount.server === accountSnap.server
+      ) {
+        this.onClosedTradesCallback?.(Array.isArray(trades) ? trades : []);
+      }
     } catch (error) {
       console.error('[MT5 Bridge] Closed-trade history refresh failed:', error);
     } finally {

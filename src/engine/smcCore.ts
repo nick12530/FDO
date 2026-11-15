@@ -17,12 +17,12 @@ import {
   EconomicEvent,
   MultiFactorConfluenceBreakdown,
 } from '../types/smc';
-import { analyzeGoldCandlestickPatterns } from './candlestickPatterns';
+import { analyzeCandlestickPatterns } from './candlestickPatterns';
 import { evaluateVolumeConfluence } from './volumeEngine';
 import { evaluateMacroSurpriseConfluence } from './macroSurpriseEngine';
 import { newsSentimentEngine } from './newsSentimentEngine';
 import { intermarketEngine } from './intermarketEngine';
-import type { SupportedSymbol } from './instrumentConfig';
+import { getInstrumentConfig, type SupportedSymbol } from './instrumentConfig';
 
 // ============================================================
 // 1. INDICATORS: Wilder's ATR
@@ -384,49 +384,103 @@ export function sessionFilter(dateOrTimestamp: Date | number): SessionInfo {
 export function detectLiquiditySweep(
   candles: Candle[],
   swings: Swing[],
-  direction: 'BUY' | 'SELL'
+  direction: 'BUY' | 'SELL',
+  lookbackBars: number = 3,
+  digits: number = 2
 ): LiquiditySweepInfo {
   if (candles.length < 5) return { hasSweep: false };
-  const lastCandle = candles[candles.length - 1];
-  const prevCandles = candles.slice(-12, -1);
+  const lastIdx = candles.length - 1;
+  const lastCandle = candles[lastIdx];
+  const maxCheck = Math.min(Math.max(1, lookbackBars), Math.max(1, candles.length - 4));
 
-  if (direction === 'SELL') {
-    // Bearish SFP: Wick pierced ABOVE prior swing high / Asian high, but close rejected back BELOW it
-    const recentHighs = swings.filter((s) => s.kind === 'H').slice(-6);
-    const targetHigh = recentHighs.length > 0
-      ? Math.max(...recentHighs.map((h) => h.price))
-      : Math.max(...prevCandles.map((c) => c.high));
+  for (let offset = 0; offset < maxCheck; offset++) {
+    const sweepIdx = lastIdx - offset;
+    const sweepCandle = candles[sweepIdx];
+    const priorCandles = candles.slice(Math.max(0, sweepIdx - 11), sweepIdx);
+    if (priorCandles.length === 0) continue;
 
-    const swept = lastCandle.high > targetHigh && lastCandle.close < targetHigh;
-    if (swept) {
-      return {
-        hasSweep: true,
-        type: 'SWING_HIGH_SFP',
-        sweptPrice: targetHigh,
-        rejectionConfirmed: true,
-        description: `Bearish Liquidity Sweep / SFP: Wick pierced above $${targetHigh.toFixed(2)} taking buy-side liquidity, rejected back into range (Close: $${lastCandle.close.toFixed(2)}).`,
-      };
-    }
-  } else {
-    // Bullish SFP: Wick pierced BELOW prior swing low / Asian low, but close rejected back ABOVE it
-    const recentLows = swings.filter((s) => s.kind === 'L').slice(-6);
-    const targetLow = recentLows.length > 0
-      ? Math.min(...recentLows.map((l) => l.price))
-      : Math.min(...prevCandles.map((c) => c.low));
+    if (direction === 'SELL') {
+      const priorHighs = swings.filter((s) => s.kind === 'H' && s.idx < sweepIdx).slice(-6);
+      const targetHigh = priorHighs.length > 0
+        ? Math.max(...priorHighs.map((h) => h.price))
+        : Math.max(...priorCandles.map((c) => c.high));
 
-    const swept = lastCandle.low < targetLow && lastCandle.close > targetLow;
-    if (swept) {
-      return {
-        hasSweep: true,
-        type: 'SWING_LOW_SFP',
-        sweptPrice: targetLow,
-        rejectionConfirmed: true,
-        description: `Bullish Liquidity Sweep / SFP: Wick pierced below $${targetLow.toFixed(2)} taking sell-side liquidity, rejected back into range (Close: $${lastCandle.close.toFixed(2)}).`,
-      };
+      const swept = sweepCandle.high > targetHigh && lastCandle.close < targetHigh;
+      const multiBarConfirmed =
+        offset === 0 || (lastCandle.close < lastCandle.open && lastCandle.close < sweepCandle.high);
+
+      if (swept && multiBarConfirmed) {
+        const barLabel = offset === 0 ? 'SFP' : `${offset + 1}-Bar Sweep`;
+        return {
+          hasSweep: true,
+          type: 'SWING_HIGH_SFP',
+          sweptPrice: targetHigh,
+          rejectionConfirmed: true,
+          description: `Bearish Liquidity Sweep / ${barLabel}: Wick pierced above ${targetHigh.toFixed(digits)} taking buy-side liquidity, rejected back into range (Close: ${lastCandle.close.toFixed(digits)}).`,
+        };
+      }
+    } else {
+      const priorLows = swings.filter((s) => s.kind === 'L' && s.idx < sweepIdx).slice(-6);
+      const targetLow = priorLows.length > 0
+        ? Math.min(...priorLows.map((l) => l.price))
+        : Math.min(...priorCandles.map((c) => c.low));
+
+      const swept = sweepCandle.low < targetLow && lastCandle.close > targetLow;
+      const multiBarConfirmed =
+        offset === 0 || (lastCandle.close > lastCandle.open && lastCandle.close > sweepCandle.low);
+
+      if (swept && multiBarConfirmed) {
+        const barLabel = offset === 0 ? 'SFP' : `${offset + 1}-Bar Sweep`;
+        return {
+          hasSweep: true,
+          type: 'SWING_LOW_SFP',
+          sweptPrice: targetLow,
+          rejectionConfirmed: true,
+          description: `Bullish Liquidity Sweep / ${barLabel}: Wick pierced below ${targetLow.toFixed(digits)} taking sell-side liquidity, rejected back into range (Close: ${lastCandle.close.toFixed(digits)}).`,
+        };
+      }
     }
   }
 
   return { hasSweep: false };
+}
+
+export function evaluateMarketRegime(
+  candles: Candle[],
+  atrArr: number[]
+): { regime: 'TRENDING' | 'EXPANSION' | 'CHOP' | 'LOW_VOL'; efficiencyRatio: number; atrRatio: number } {
+  const period = 10;
+  if (candles.length <= period) {
+    return { regime: 'TRENDING', efficiencyRatio: 0.5, atrRatio: 1.0 };
+  }
+
+  const slice = candles.slice(-(period + 1));
+  const netMove = Math.abs(slice[slice.length - 1].close - slice[0].close);
+  let totalPath = 0;
+  for (let i = 1; i < slice.length; i++) {
+    totalPath += Math.abs(slice[i].close - slice[i - 1].close);
+  }
+  const efficiencyRatio = totalPath > 0 ? netMove / totalPath : 0;
+
+  const validAtrs = atrArr.slice(-20).filter((v) => Number.isFinite(v) && v > 0);
+  const atrNow = validAtrs.length > 0 ? validAtrs[validAtrs.length - 1] : 0;
+  const avgAtr = validAtrs.length > 0 ? validAtrs.reduce((s, v) => s + v, 0) / validAtrs.length : atrNow;
+  const atrRatio = avgAtr > 0 ? atrNow / avgAtr : 1.0;
+
+  let regime: 'TRENDING' | 'EXPANSION' | 'CHOP' | 'LOW_VOL' = 'TRENDING';
+  if (atrRatio >= 1.35 && efficiencyRatio >= 0.32) {
+    regime = 'EXPANSION';
+  } else if (atrRatio < 0.72 && efficiencyRatio < 0.22) {
+    regime = 'LOW_VOL';
+  } else if (efficiencyRatio < 0.20) {
+    regime = 'CHOP';
+  }
+
+  return {
+    regime,
+    efficiencyRatio: Number(efficiencyRatio.toFixed(2)),
+    atrRatio: Number(atrRatio.toFixed(2)),
+  };
 }
 
 export function hasRecentCandleGap(candles: Candle[], intervalMs: number, lookback: number = 4): boolean {
@@ -520,8 +574,29 @@ export function evaluateConfluence(
     }
   }
 
+  const cfg = context?.symbol ? getInstrumentConfig(context.symbol) : null;
+  const pipSize = cfg ? cfg.pipSize : (price > 500 ? 0.1 : price > 20 ? 0.01 : 0.0001);
+  const digits = cfg ? cfg.digits : (price > 500 ? 2 : price > 20 ? 3 : 5);
+  const symbolLabel = context?.symbol || (price > 500 ? 'Gold' : 'Market');
+  const fmt = (value: number) => value.toFixed(digits);
+  const pricePrefix = price > 500 ? '$' : '';
+
   let direction: 'BUY' | 'SELL' | null = null;
   let zone: Zone | null = null;
+
+  const pickBestZone = (bullish: boolean): Zone | null => {
+    const candidates = zones.filter(
+      (z) => z.bullish === bullish && z.tests <= 2 && z.bottom - 0.25 * atrNow <= price && price <= z.top + 0.25 * atrNow
+    );
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => {
+      if (a.tests !== b.tests) return a.tests - b.tests;
+      const distA = Math.abs((a.top + a.bottom) / 2 - price);
+      const distB = Math.abs((b.top + b.bottom) / 2 - price);
+      return distA - distB;
+    });
+    return candidates[0];
+  };
 
   if (ms.trend === 'bullish' && inDiscount) {
     score += 1.0;
@@ -530,13 +605,7 @@ export function evaluateConfluence(
       score += 1.0;
       reasons.push('⭐ Price in Golden OTE Zone (61.8% – 78.6% institutional Fibonacci sweet spot) (+1.0)');
     }
-    for (const z of zones) {
-      // Prioritize fresh zones (tests <= 1) for highest win rate
-      if (z.bullish && z.tests <= 2 && z.bottom - 0.25 * atrNow <= price && price <= z.top + 0.25 * atrNow) {
-        zone = z;
-        break;
-      }
-    }
+    zone = pickBestZone(true);
   } else if (ms.trend === 'bearish' && inPremium) {
     score += 1.0;
     reasons.push('Price in PREMIUM of HTF dealing range (> Equilibrium) (+1.0)');
@@ -544,12 +613,7 @@ export function evaluateConfluence(
       score += 1.0;
       reasons.push('⭐ Price in Golden OTE Zone (61.8% – 78.6% institutional Fibonacci sweet spot) (+1.0)');
     }
-    for (const z of zones) {
-      if (!z.bullish && z.tests <= 2 && z.bottom - 0.25 * atrNow <= price && price <= z.top + 0.25 * atrNow) {
-        zone = z;
-        break;
-      }
-    }
+    zone = pickBestZone(false);
   }
 
   let sl = 0;
@@ -557,6 +621,8 @@ export function evaluateConfluence(
   let tp1 = 0;
   let tp2 = 0;
   let tp3 = 0;
+
+  const minRequiredRR = timeframe === 'M1' ? 1.2 : timeframe === 'M5' ? 1.5 : 2.0;
 
   if (zone) {
     direction = zone.bullish ? 'BUY' : 'SELL';
@@ -582,13 +648,15 @@ export function evaluateConfluence(
       risk = atrNow;
       reasons.push('SL buffered to 1.0x ATR beyond market noise');
     }
-    const mult1 = Math.max(1.8, Number((rr * 0.9).toFixed(1)));
-    const mult2 = Math.max(3.2, Number((rr * 1.6).toFixed(1)));
-    const mult3 = Math.max(5.5, Number((rr * 2.8).toFixed(1)));
+
+    // Timeframe-calibrated target ladder for M1/M5 scalping vs M15 swings
+    const mult1 = timeframe === 'M1' ? 1.2 : timeframe === 'M5' ? 1.5 : Math.max(1.8, Number((rr * 0.9).toFixed(1)));
+    const mult2 = timeframe === 'M1' ? 2.0 : timeframe === 'M5' ? 2.5 : Math.max(3.2, Number((rr * 1.6).toFixed(1)));
+    const mult3 = timeframe === 'M1' ? 3.2 : timeframe === 'M5' ? 4.0 : Math.max(5.5, Number((rr * 2.8).toFixed(1)));
     tp1 = direction === 'BUY' ? price + mult1 * risk : price - mult1 * risk;
     tp2 = direction === 'BUY' ? price + mult2 * risk : price - mult2 * risk;
     tp3 = direction === 'BUY' ? price + mult3 * risk : price - mult3 * risk;
-    tp = tp2; // Primary target targets high-yield 3.2R+ pips
+    tp = tp2;
   } else {
     return null;
   }
@@ -611,8 +679,8 @@ export function evaluateConfluence(
     }
   }
 
-  // Liquidity Sweep / Swing Failure Pattern (SFP) Gate Engine (analyzed on closed candles)
-  const sweep = detectLiquiditySweep(closed, ms.swings, direction);
+  // Liquidity Sweep / Swing Failure Pattern (SFP) Gate Engine (3-bar lookback on closed candles)
+  const sweep = detectLiquiditySweep(closed, ms.swings, direction, 3, digits);
   if (sweep.hasSweep) {
     score += 1.5;
     reasons.push(`${sweep.description} (+1.5)`);
@@ -620,13 +688,23 @@ export function evaluateConfluence(
     // Tighten SL to the swept wick invalidation level for precision sniper entry
     if (sweep.sweptPrice) {
       const sniperSl = direction === 'BUY'
-        ? Number((sweep.sweptPrice - 0.2 * atrNow).toFixed(2))
-        : Number((sweep.sweptPrice + 0.2 * atrNow).toFixed(2));
+        ? Number((sweep.sweptPrice - 0.2 * atrNow).toFixed(digits))
+        : Number((sweep.sweptPrice + 0.2 * atrNow).toFixed(digits));
       if (Math.abs(price - sniperSl) < Math.abs(price - sl)) {
         sl = sniperSl;
-        reasons.push(`🎯 Sniper Stop Loss calibrated strictly to swept liquidity wick ($${sweep.sweptPrice.toFixed(1)})`);
+        reasons.push(`🎯 Sniper Stop Loss calibrated strictly to swept liquidity wick (${pricePrefix}${fmt(sweep.sweptPrice)})`);
       }
     }
+  }
+
+  // Market Regime Filter (detects low-efficiency chop vs clean displacement expansion)
+  const regimeInfo = evaluateMarketRegime(closed, aExec);
+  if (regimeInfo.regime === 'CHOP' && !sweep.hasSweep) {
+    score -= 0.5;
+    reasons.push(`⚠️ Choppy Regime (ER ${regimeInfo.efficiencyRatio}): Sub-optimal trend efficiency without sweep (-0.5)`);
+  } else if (regimeInfo.regime === 'EXPANSION') {
+    score += 0.25;
+    reasons.push(`⚡ Expansion Regime (ATR ${regimeInfo.atrRatio}x, ER ${regimeInfo.efficiencyRatio}) favors follow-through (+0.25)`);
   }
 
   if (!sess.tradable) return null;
@@ -634,7 +712,6 @@ export function evaluateConfluence(
   reasons.push(`Inside active ${sess.activeSessionName} (+0.5)`);
 
   // Asian session consolidation suppression (21:00 - 05:00 UTC / 00:00 - 08:00 EAT)
-  // Suppress low-liquidity false breakouts, unless an exceptional high-profit signal exception applies
   const inAsianConsolidation = Boolean(sess.asianConsolidation);
   const isHighProfitException = score >= 6.5;
   if (inAsianConsolidation && !isHighProfitException) {
@@ -644,8 +721,8 @@ export function evaluateConfluence(
     reasons.push('⭐ High-Profit Exception: Out-of-session institutional setup approved during Asian consolidation');
   }
 
-  // Mastered Gold Candlestick Pattern Engine (analyzed on closed candles)
-  const csAnalysis = analyzeGoldCandlestickPatterns(closed);
+  // Instrument-neutral Candlestick Pattern Engine (pip-scaled for FX + XAUUSD)
+  const csAnalysis = analyzeCandlestickPatterns(closed, pipSize, symbolLabel);
   const activePattern = csAnalysis.activePattern;
   const targetBias = direction === 'BUY' ? 'BULLISH' : 'BEARISH';
   if (activePattern.bias !== targetBias || activePattern.reliability < 80) return null;
@@ -654,7 +731,7 @@ export function evaluateConfluence(
 
   // Determine the triggering candle pattern and mechanics
   const isBear = direction === 'SELL';
-  const range = Math.max(0.1, lastCandle.high - lastCandle.low);
+  const range = Math.max(pipSize * 0.1, lastCandle.high - lastCandle.low);
   const upperWick = lastCandle.high - Math.max(lastCandle.open, lastCandle.close);
   const lowerWick = Math.min(lastCandle.open, lastCandle.close) - lastCandle.low;
   const body = Math.abs(lastCandle.close - lastCandle.open);
@@ -670,7 +747,7 @@ export function evaluateConfluence(
     : lastCandle.close < lastCandle.open && (body >= 0.50 * range || lastCandle.close < prevCandle.low);
 
   // 1. Institutional Volume Footprint & RVOL Confluence
-  const volResult = evaluateVolumeConfluence(closed, direction);
+  const volResult = evaluateVolumeConfluence(closed, direction, digits);
   const smcBaseScore = score;
   score += volResult.scoreBonus;
   reasons.push(...volResult.reasons);
@@ -741,66 +818,76 @@ export function evaluateConfluence(
   const patternName = activePattern.name;
   const tf = timeframe;
   const explanation = isBear
-    ? `${tf} candle at ${lastCandle.timeStr} swept into premium supply at $${lastCandle.high.toFixed(2)}, meeting heavy institutional sell volume and closing down at $${lastCandle.close.toFixed(2)}. ${zone ? `Rejection confirmed off ${zone.kind} Supply (${zone.bottom}-${zone.top}).` : ''}`
-    : `${tf} candle at ${lastCandle.timeStr} tapped discount demand at $${lastCandle.low.toFixed(2)}, soaking up sell-side liquidity with buyers pushing price up to close at $${lastCandle.close.toFixed(2)}. ${zone ? `Rejection confirmed off ${zone.kind} Demand (${zone.bottom}-${zone.top}).` : ''}`;
+    ? `${tf} candle at ${lastCandle.timeStr} swept into premium supply at ${pricePrefix}${fmt(lastCandle.high)}, meeting heavy institutional sell volume and closing down at ${pricePrefix}${fmt(lastCandle.close)}. ${zone ? `Rejection confirmed off ${zone.kind} Supply (${fmt(zone.bottom)}-${fmt(zone.top)}).` : ''}`
+    : `${tf} candle at ${lastCandle.timeStr} tapped discount demand at ${pricePrefix}${fmt(lastCandle.low)}, soaking up sell-side liquidity with buyers pushing price up to close at ${pricePrefix}${fmt(lastCandle.close)}. ${zone ? `Rejection confirmed off ${zone.kind} Demand (${fmt(zone.bottom)}-${fmt(zone.top)}).` : ''}`;
 
   const actionReason = isBear
-    ? `SELL triggered: ${activePattern.name} swept into premium supply (${zone ? `${zone.bottom.toFixed(1)}-${zone.top.toFixed(1)}` : 'POI'}) with strong sell displacement, rejecting ${wickRatio}. ${activePattern.marketInsight}`
-    : `BUY triggered: ${activePattern.name} absorbed into discount demand (${zone ? `${zone.bottom.toFixed(1)}-${zone.top.toFixed(1)}` : 'POI'}) with aggressive buyer response, rejecting ${wickRatio}. ${activePattern.marketInsight}`;
-
-  const perfectEntryReason = isBear
-    ? `Perfect Entry identified @ $${price.toFixed(2)} on ${tf} confirmation: Tight SL at $${sl.toFixed(2)} (${Math.abs(price - sl).toFixed(1)} pts risk) targeting 1:${rr} RR @ $${tp.toFixed(2)}.`
-    : `Perfect Entry identified @ $${price.toFixed(2)} on ${tf} confirmation: Tight SL at $${sl.toFixed(2)} (${Math.abs(price - sl).toFixed(1)} pts risk) targeting 1:${rr} RR @ $${tp.toFixed(2)}.`;
+    ? `SELL triggered: ${activePattern.name} swept into premium supply (${zone ? `${fmt(zone.bottom)}-${fmt(zone.top)}` : 'POI'}) with strong sell displacement, rejecting ${wickRatio}. ${activePattern.marketInsight}`
+    : `BUY triggered: ${activePattern.name} absorbed into discount demand (${zone ? `${fmt(zone.bottom)}-${fmt(zone.top)}` : 'POI'}) with aggressive buyer response, rejecting ${wickRatio}. ${activePattern.marketInsight}`;
 
   const riskPts = Math.abs(price - sl);
   const rewardPts = Math.abs(tp - price);
-  if (riskPts <= 0 || rewardPts / riskPts < 2) return null;
-  const rrRatio = (rewardPts / Math.max(0.1, riskPts)).toFixed(1);
+  if (riskPts <= 0 || rewardPts / riskPts < minRequiredRR) return null;
+  const rrRatio = (rewardPts / Math.max(pipSize * 0.1, riskPts)).toFixed(1);
 
-  const humanExplanation = {
-    headline: isBear
-      ? `Institutional SELL Setup: High-Probability Short on Gold`
-      : `Institutional BUY Setup: High-Probability Long on Gold`,
-    simpleSummary: isBear
-      ? `Gold reached an expensive resistance ceiling where institutional sellers dumped inventory. Smart money rejected higher prices, setting up a high-probability drop.`
-      : `Gold dipped into a discounted wholesale demand zone. Institutional buyers stepped in with strong volume, absorbing sell orders and preparing for a rally.`,
-    marketCondition: isBear
-      ? `Market tried pushing higher but encountered heavy institutional selling pressure, leaving a supply imbalance.`
-      : `Higher-timeframe market structure is bullish. Sellers failed to break lower support, confirming buyers remain in control.`,
-    tradeRationale: isBear
-      ? `Formed a ${patternName} (${wickRatio}) rejecting supply at $${price.toFixed(1)}. Risk is capped just above the swing high.`
-      : `Formed a ${patternName} (${wickRatio}) defending demand at $${price.toFixed(1)}. Risk is capped just below the swing low.`,
-    howToTrade: isBear
-      ? `Enter SELL now at market ($${price.toFixed(1)}). Keep your Stop Loss strictly at $${sl.toFixed(1)} (capping risk at $${riskPts.toFixed(1)}/oz). Target profit at $${tp.toFixed(1)} (+${rewardPts.toFixed(1)}/oz).`
-      : `Enter BUY now at market ($${price.toFixed(1)}). Keep your Stop Loss strictly at $${sl.toFixed(1)} (capping risk at $${riskPts.toFixed(1)}/oz). Target profit at $${tp.toFixed(1)} (+${rewardPts.toFixed(1)}/oz).`,
-    riskRewardSummary: `Risking $${riskPts.toFixed(1)} to make $${rewardPts.toFixed(1)} per oz (1 : ${rrRatio} Reward-to-Risk).`,
-  };
-
-  const pipSize = price > 500 ? 0.1 : 0.0001;
   const slPips = Number((riskPts / pipSize).toFixed(1));
   const targetPips1 = Number((Math.abs(tp1 - price) / pipSize).toFixed(1));
   const targetPips2 = Number((Math.abs(tp2 - price) / pipSize).toFixed(1));
   const targetPips3 = Number((Math.abs(tp3 - price) / pipSize).toFixed(1));
   const targetPips = targetPips2;
 
+  const perfectEntryReason = isBear
+    ? `Perfect Entry identified @ ${pricePrefix}${fmt(price)} on ${tf} confirmation: Tight SL at ${pricePrefix}${fmt(sl)} (${slPips} pips risk) targeting 1:${rrRatio} RR @ ${pricePrefix}${fmt(tp)}.`
+    : `Perfect Entry identified @ ${pricePrefix}${fmt(price)} on ${tf} confirmation: Tight SL at ${pricePrefix}${fmt(sl)} (${slPips} pips risk) targeting 1:${rrRatio} RR @ ${pricePrefix}${fmt(tp)}.`;
+
+  const humanExplanation = {
+    headline: isBear
+      ? `Institutional SELL Setup: High-Probability Short on ${symbolLabel}`
+      : `Institutional BUY Setup: High-Probability Long on ${symbolLabel}`,
+    simpleSummary: isBear
+      ? `${symbolLabel} reached a premium resistance zone where institutional sellers distributed inventory, rejecting higher prices.`
+      : `${symbolLabel} dipped into a discounted demand zone where institutional buyers absorbed sell orders for upside continuation.`,
+    marketCondition: isBear
+      ? `Higher-timeframe structure favors distribution. Push higher met heavy institutional supply imbalance.`
+      : `Higher-timeframe market structure is bullish. Sellers failed to hold lower support, confirming buyer control.`,
+    tradeRationale: isBear
+      ? `Formed a ${patternName} (${wickRatio}) rejecting supply at ${pricePrefix}${fmt(price)}. Risk is capped just above the swing high.`
+      : `Formed a ${patternName} (${wickRatio}) defending demand at ${pricePrefix}${fmt(price)}. Risk is capped just below the swing low.`,
+    howToTrade: isBear
+      ? `Execute SELL on ${symbolLabel} (${pricePrefix}${fmt(price)}). Stop Loss at ${pricePrefix}${fmt(sl)} (${slPips} pips). Target TP1 ${pricePrefix}${fmt(tp1)} / TP2 ${pricePrefix}${fmt(tp)}.`
+      : `Execute BUY on ${symbolLabel} (${pricePrefix}${fmt(price)}). Stop Loss at ${pricePrefix}${fmt(sl)} (${slPips} pips). Target TP1 ${pricePrefix}${fmt(tp1)} / TP2 ${pricePrefix}${fmt(tp)}.`,
+    riskRewardSummary: `Risking ${slPips} pips to target ${targetPips} pips (1 : ${rrRatio} Reward-to-Risk).`,
+  };
+
   // Entry countdown timer:
-  // M1: 90s validity window, M5: 300s validity window, M15: 900s validity window
   const validityDurationMs = timeframe === 'M15' ? 15 * 60_000 : timeframe === 'M5' ? 5 * 60_000 : 90_000;
   const candleTimeMs = toMilliseconds(lastCandle.time);
   const expiryTimestamp = candleTimeMs + timeframeMs + validityDurationMs;
   const validitySeconds = Math.max(0, Math.round((expiryTimestamp - now) / 1000));
 
-  // Sniper setup criteria: M15 or M5 timeframe, fresh POI or liquidity sweep, score >= 4.2
-  const isSniper = (timeframe === 'M15' || timeframe === 'M5') && (score >= 4.2 || (sweep.hasSweep && score >= 3.8));
+  // Sniper setup criteria: M15/M5 POI or high-score M1 sweep scalp
+  const isSniper =
+    timeframe === 'M1'
+      ? score >= 5.2 && sweep.hasSweep
+      : (timeframe === 'M15' || timeframe === 'M5') && (score >= 4.2 || (sweep.hasSweep && score >= 3.8));
   const sniperQualityIndex = Math.min(100, Math.max(50, Math.round((score / 6.0) * 100)));
   const sniperGrade: 'A+' | 'A' | 'B' = sniperQualityIndex >= 88 ? 'A+' : sniperQualityIndex >= 75 ? 'A' : 'B';
-  const optimalTradeEntry = sweep.hasSweep && sweep.sweptPrice
+
+  const rawOte = zone
+    ? zone.kind === 'FVG'
+      ? (zone.bottom + zone.top) / 2
+      : zone.bullish
+        ? zone.top
+        : zone.bottom
+    : sweep.hasSweep && sweep.sweptPrice
     ? direction === 'BUY'
-      ? Number((sweep.sweptPrice + 0.62 * (lastCandle.high - sweep.sweptPrice)).toFixed(2))
-      : Number((sweep.sweptPrice - 0.62 * (sweep.sweptPrice - lastCandle.low)).toFixed(2))
-    : zone
-    ? Number(((zone.bottom + zone.top) / 2).toFixed(2))
-    : Number(price.toFixed(2));
+      ? sweep.sweptPrice + 0.62 * (lastCandle.high - sweep.sweptPrice)
+      : sweep.sweptPrice - 0.62 * (sweep.sweptPrice - lastCandle.low)
+    : price;
+  const optimalTradeEntry = Number(rawOte.toFixed(digits));
+  const executionMode: Signal['executionMode'] =
+    Math.abs(price - optimalTradeEntry) > 0.25 * atrNow ? 'PULLBACK_LIMIT' : 'MARKET';
+
   const mitigationType = sweep.hasSweep
     ? 'Liquidity Sweep (SFP)'
     : zone
@@ -808,15 +895,16 @@ export function evaluateConfluence(
     : 'Structural POI Retest';
 
   return {
+    strategy: 'SMC POI Retest',
     direction,
     timeframe,
     score: Number(score.toFixed(2)),
-    entry: Number(price.toFixed(2)),
-    sl: Number(sl.toFixed(2)),
-    tp: Number(tp.toFixed(2)),
-    tp1: Number(tp1.toFixed(2)),
-    tp2: Number(tp2.toFixed(2)),
-    tp3: Number(tp3.toFixed(2)),
+    entry: Number(price.toFixed(digits)),
+    sl: Number(sl.toFixed(digits)),
+    tp: Number(tp.toFixed(digits)),
+    tp1: Number(tp1.toFixed(digits)),
+    tp2: Number(tp2.toFixed(digits)),
+    tp3: Number(tp3.toFixed(digits)),
     slPips,
     targetPips1,
     targetPips2,
@@ -828,9 +916,11 @@ export function evaluateConfluence(
     sniperQualityIndex,
     sniperGrade,
     optimalTradeEntry,
+    executionMode,
+    regime: regimeInfo.regime,
     mitigationType,
     reasons,
-    atr: Number(atrNow.toFixed(2)),
+    atr: Number(atrNow.toFixed(digits)),
     timestamp: new Date(Math.min(toMilliseconds(lastCandle.time), Date.now())).toISOString(),
     actionReason,
     perfectEntryReason,

@@ -297,6 +297,16 @@ class TradeRequest(BaseModel):
     bypassCooldown: bool = False
     bypassCircuitBreaker: bool = False
     forceExecute: bool = False
+    orderType: Literal["MARKET", "LIMIT"] = "MARKET"
+    limitPrice: float | None = Field(default=None, gt=0)
+    expirationMinutes: int = Field(default=10, ge=1, le=240)
+
+
+class CancelOrderRequest(BaseModel):
+    ticket: int = Field(gt=0)
+    symbol: str = Field(default="XAUUSD", max_length=32)
+    expectedLogin: int = Field(gt=0)
+    expectedServer: str = Field(min_length=1, max_length=128)
 
 
 class TradingControlRequest(BaseModel):
@@ -501,9 +511,54 @@ def read_positions() -> list[dict]:
     ]
 
 
+def read_pending_orders() -> list[dict]:
+    orders = mt5.orders_get()
+    if orders is None:
+        return []
+    buy_types = {
+        getattr(mt5, "ORDER_TYPE_BUY_LIMIT", 2),
+        getattr(mt5, "ORDER_TYPE_BUY_STOP", 4),
+        getattr(mt5, "ORDER_TYPE_BUY_STOP_LIMIT", 6),
+    }
+    buy_limit_type = getattr(mt5, "ORDER_TYPE_BUY_LIMIT", 2)
+    now_ts = datetime.now(timezone.utc).timestamp()
+    formatted: list[dict] = []
+    for order in orders:
+        o_type = int(getattr(order, "type", buy_limit_type))
+        direction = "BUY" if o_type in buy_types else "SELL"
+        setup_ts = int(getattr(order, "time_setup", now_ts) or now_ts)
+        exp_ts = int(getattr(order, "time_expiration", 0) or 0)
+        ttl_sec = max(60, exp_ts - setup_ts) if exp_ts > setup_ts else 600
+        rem_sec = max(0, exp_ts - int(now_ts)) if exp_ts > 0 else 600
+        formatted.append(
+            {
+                "ticket": int(order.ticket),
+                "symbol": str(order.symbol),
+                "type": "BUY_LIMIT" if direction == "BUY" else "SELL_LIMIT",
+                "direction": direction,
+                "volume": float(getattr(order, "volume_current", getattr(order, "volume_initial", 0.01))),
+                "entry": float(order.price_open),
+                "sl": float(order.sl),
+                "tp": float(order.tp),
+                "score": 0,
+                "strategy": str(getattr(order, "comment", "") or "SMC Limit"),
+                "createdTime": setup_ts * 1000,
+                "ttlSeconds": ttl_sec,
+                "expiresAt": (exp_ts * 1000) if exp_ts > 0 else int((setup_ts + ttl_sec) * 1000),
+                "remainingSeconds": rem_sec,
+                "maxDriftPips": 25,
+                "currentDriftPips": 0,
+                "status": "PENDING",
+                "isBrokerOrder": True,
+            }
+        )
+    return formatted
+
+
 def read_snapshot(symbol: str) -> dict:
     account = require_account()
     positions = read_positions()
+    pending_orders = read_pending_orders()
     resolved_symbol = resolve_broker_symbol(symbol)
     info = mt5.symbol_info(resolved_symbol)
     if info is None or not getattr(info, "visible", True):
@@ -527,13 +582,21 @@ def read_snapshot(symbol: str) -> dict:
         mt5.ACCOUNT_TRADE_MODE_CONTEST: "contest",
     }.get(account["trade_mode"], "unknown")
     account.pop("trade_mode")
+    now_utc = datetime.now(timezone.utc)
+    reconstructed_day_start = reconstruct_day_starting_balance(
+        account["login"],
+        account["server"],
+        account["balance"],
+        now_utc,
+    )
+    account["daily_start_balance"] = round(float(reconstructed_day_start), 2)
     with sqlite3.connect(STATE_DATABASE) as connection:
         connection.execute(
             """
             INSERT OR IGNORE INTO daily_risk (account_login, account_server, utc_date, start_balance)
             VALUES (?, ?, ?, ?)
             """,
-            (account["login"], account["server"], datetime.now(timezone.utc).date().isoformat(), account["balance"]),
+            (account["login"], account["server"], now_utc.date().isoformat(), account["daily_start_balance"]),
         )
         trading_halted = connection.execute(
             "SELECT state_value FROM control_state WHERE state_key = 'trading_halted'"
@@ -567,14 +630,15 @@ def read_snapshot(symbol: str) -> dict:
         ]
 
     return {
-         "account": account,
-         "positions": positions,
-         "symbol": resolved_symbol,
-         "accountMode": account_mode,
-         "tradingHalted": trading_halted,
-         "autoTrade": auto_trade,
-         "circuitBreakerEnabled": circuit_breaker_enabled,
-         "symbolSpec": symbol_spec,
+        "account": account,
+        "positions": positions,
+        "pendingOrders": pending_orders,
+        "symbol": resolved_symbol,
+        "accountMode": account_mode,
+        "tradingHalted": trading_halted,
+        "autoTrade": auto_trade,
+        "circuitBreakerEnabled": circuit_breaker_enabled,
+        "symbolSpec": symbol_spec,
         "bid": float(tick.bid),
         "ask": float(tick.ask),
         "spread": round((tick.ask - tick.bid) / info.point),
@@ -599,17 +663,18 @@ def _deal_cost(deal: Any) -> float:
 
 
 def read_closed_trades(days: int, symbol: str) -> list[dict]:
-    clean_sym = symbol.strip().upper()
-    cache_key = f"{clean_sym}:{days}"
+    account = require_account()
+    clean_sym = (symbol or "ALL").strip().upper()
+    include_all_symbols = clean_sym in ("ALL", "*", "ANY", "")
+    cache_key = f"{account['login']}:{account['server']}:{clean_sym}:{days}"
     now_ts = time.time()
 
-    # Fast in-memory cache hit (5s TTL) avoids repetitive heavy 180-day deal scans & IPC overhead
+    # Fast in-memory cache hit (5s TTL) avoids repetitive heavy deal scans & IPC overhead
     if cache_key in _closed_trades_cache:
         cached_ts, cached_trades = _closed_trades_cache[cache_key]
         if now_ts - cached_ts < _closed_trades_cache_ttl:
             return cached_trades
 
-    require_account()
     now = datetime.now(timezone.utc)
     deals = mt5.history_deals_get(now - timedelta(days=days), now)
     if deals is None:
@@ -620,11 +685,14 @@ def read_closed_trades(days: int, symbol: str) -> list[dict]:
         raise HTTPException(status_code=503, detail=f"MT5 positions unavailable: {mt5.last_error()}")
     open_position_ids = {int(position.ticket) for position in open_positions}
     deals_by_position: dict[int, list[Any]] = {}
-    resolved_symbol = resolve_broker_symbol(symbol)
+    resolved_symbol = "" if include_all_symbols else resolve_broker_symbol(symbol)
     for deal in deals:
-        deal_sym = str(deal.symbol)
-        if deal_sym == symbol or deal_sym == resolved_symbol or deal_sym.startswith(symbol):
-            deals_by_position.setdefault(int(deal.position_id), []).append(deal)
+        deal_sym = str(getattr(deal, "symbol", "") or "")
+        pos_id = int(getattr(deal, "position_id", 0) or 0)
+        if pos_id <= 0 or not deal_sym:
+            continue
+        if include_all_symbols or deal_sym == symbol or deal_sym == resolved_symbol or deal_sym.upper().startswith(clean_sym):
+            deals_by_position.setdefault(pos_id, []).append(deal)
 
     exits_by_position: dict[int, list[Any]] = {}
     for position_id, position_deals in deals_by_position.items():
@@ -649,7 +717,7 @@ def read_closed_trades(days: int, symbol: str) -> list[dict]:
                     position_deals = [
                         deal
                         for deal in historical_position_deals
-                        if str(deal.symbol) == symbol or str(deal.symbol) == resolved_symbol or str(deal.symbol).startswith(symbol)
+                        if include_all_symbols or str(deal.symbol) == symbol or str(deal.symbol) == resolved_symbol or str(deal.symbol).upper().startswith(clean_sym)
                     ]
                     entries = [deal for deal in position_deals if deal.entry == mt5.DEAL_ENTRY_IN]
             except Exception as exc:
@@ -677,8 +745,8 @@ def read_closed_trades(days: int, symbol: str) -> list[dict]:
         }
         rationale = str(entry.comment).strip()
         # SAFETY-FIX: Compute pip size dynamically from symbol (JPY: 0.01, XAUUSD/metals: 0.1, others: 0.0001) via mt5.symbol_info
-        deal_sym = str(entry.symbol) or symbol
-        sym_info = mt5.symbol_info(deal_sym)
+        deal_sym = str(entry.symbol) or ("" if include_all_symbols else symbol)
+        sym_info = mt5.symbol_info(deal_sym) if deal_sym else None
         upper_sym = deal_sym.upper()
         if "JPY" in upper_sym:
             pip_size = 0.01
@@ -693,20 +761,22 @@ def read_closed_trades(days: int, symbol: str) -> list[dict]:
         results.append(
             {
                 "ticket": int(last_exit.ticket),
+                "symbol": deal_sym,
                 "orderTicket": int(entry.order),
                 "positionTicket": position_id,
                 "openTime": open_time.strftime("%H:%M:%S"),
+                "openedAt": open_time.isoformat(),
                 "closeTime": close_time.strftime("%H:%M:%S"),
                 "closedAt": close_time.isoformat(),
                 "type": direction,
                 "volume": float(entry.volume),
                 "openPrice": float(entry.price),
                 "closePrice": close_price,
-                "profit": sum(_deal_cost(deal) for deal in position_deals),
+                "profit": round(sum(_deal_cost(deal) for deal in position_deals), 2),
                 "pips": calculated_pips,
                 "reason": reason_by_code.get(last_exit.reason, "Manual"),
                 "comment": str(last_exit.comment),
-                "strategyRationale": rationale if rationale and rationale != "SMC dashboard" else None,
+                "strategyRationale": rationale if rationale and rationale not in ("SMC dashboard", "SMC_CLOSE") else None,
             }
         )
 
@@ -961,8 +1031,8 @@ def set_circuit_breaker_control(payload: CircuitBreakerControlRequest, request: 
 @app.get("/api/history")
 def history(
     request: Request,
-    days: int = Query(default=180, ge=1, le=365),
-    symbol: str = Query(default="XAUUSD", min_length=1, max_length=32),
+    days: int = Query(default=365, ge=1, le=1825),
+    symbol: str = Query(default="ALL", min_length=1, max_length=32),
 ) -> list[dict]:
     require_bridge_token(request)
     return read_closed_trades(days, symbol.strip())
@@ -1214,11 +1284,30 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
         logger.warning(f"🚫 [423 Locked] This SMC point of interest on {symbol} was recently traded.")
         raise HTTPException(status_code=423, detail=f"This SMC point of interest on {symbol} was recently traded.")
 
-    order_type = mt5.ORDER_TYPE_BUY if payload.direction == "BUY" else mt5.ORDER_TYPE_SELL
     tick_size = symbol_spec.get("tickSize", 0.01) or 0.01
     digits = int(getattr(info, "digits", 2))
     point_val = float(getattr(info, "point", tick_size)) or tick_size
     min_stop_distance = max(float(symbol_spec.get("tradeStopsLevel", 0)) * point_val, tick_size * 5)
+
+    use_pending_limit = False
+    entry_reference_price = price
+    if payload.orderType == "LIMIT" and payload.limitPrice is not None and math.isfinite(payload.limitPrice):
+        rounded_limit = round(round(payload.limitPrice / tick_size) * tick_size, digits)
+        if payload.direction == "BUY" and rounded_limit < price - min_stop_distance:
+            use_pending_limit = True
+            entry_reference_price = rounded_limit
+        elif payload.direction == "SELL" and rounded_limit > price + min_stop_distance:
+            use_pending_limit = True
+            entry_reference_price = rounded_limit
+
+    if use_pending_limit:
+        order_type = (
+            getattr(mt5, "ORDER_TYPE_BUY_LIMIT", 2)
+            if payload.direction == "BUY"
+            else getattr(mt5, "ORDER_TYPE_SELL_LIMIT", 3)
+        )
+    else:
+        order_type = mt5.ORDER_TYPE_BUY if payload.direction == "BUY" else mt5.ORDER_TYPE_SELL
 
     # Auto-align SL and TP to valid tick sizes and broker limits instead of throwing 400 Bad Request
     if payload.sl:
@@ -1227,25 +1316,34 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
         payload.tp = round(round(payload.tp / tick_size) * tick_size, digits)
 
     if payload.direction == "BUY":
-        if payload.sl >= price or abs(price - payload.sl) < min_stop_distance:
-            payload.sl = round(price - min_stop_distance * 2, digits)
-        if payload.tp <= price or abs(payload.tp - price) < min_stop_distance:
-            payload.tp = round(price + min_stop_distance * 4, digits)
+        if payload.sl >= entry_reference_price or abs(entry_reference_price - payload.sl) < min_stop_distance:
+            payload.sl = round(entry_reference_price - min_stop_distance * 2, digits)
+        if payload.tp <= entry_reference_price or abs(payload.tp - entry_reference_price) < min_stop_distance:
+            payload.tp = round(entry_reference_price + min_stop_distance * 4, digits)
     else:
-        if payload.sl <= price or abs(payload.sl - price) < min_stop_distance:
-            payload.sl = round(price + min_stop_distance * 2, digits)
-        if payload.tp >= price or abs(price - payload.tp) < min_stop_distance:
-            payload.tp = round(price - min_stop_distance * 4, digits)
+        if payload.sl <= entry_reference_price or abs(payload.sl - entry_reference_price) < min_stop_distance:
+            payload.sl = round(entry_reference_price + min_stop_distance * 2, digits)
+        if payload.tp >= entry_reference_price or abs(entry_reference_price - payload.tp) < min_stop_distance:
+            payload.tp = round(entry_reference_price - min_stop_distance * 4, digits)
 
     # Target SL and TP requested
     desired_sl = float(payload.sl or 0.0)
     desired_tp = float(payload.tp or 0.0)
-    stop_distance = abs(price - desired_sl)
+    stop_distance = abs(entry_reference_price - desired_sl)
     risk_per_lot = stop_distance / symbol_spec["tickSize"] * symbol_spec["tickValue"]
     risk_budget = account["equity"] * RISK_CONFIG["riskPercentPerTrade"] / 100
+    allow_micro_floor = bool(RISK_CONFIG.get("adaptiveMicroFloorEnabled", False))
     if not math.isfinite(risk_per_lot) or risk_per_lot <= 0 or risk_budget <= 0:
         raise HTTPException(status_code=400, detail="Risk sizing inputs are invalid; order was not sent.")
-    safe_volume = volume_for_risk(risk_budget, risk_per_lot, vol_min, vol_step, vol_max)
+    safe_volume = volume_for_risk(
+        risk_budget,
+        risk_per_lot,
+        vol_min,
+        vol_step,
+        vol_max,
+        allow_micro_floor=allow_micro_floor,
+        equity=account["equity"],
+    )
     if safe_volume is None:
         min_lot_risk = risk_per_lot * vol_min
         raise HTTPException(
@@ -1336,6 +1434,8 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
         vol_min,
         vol_step,
         vol_max,
+        allow_micro_floor=(allow_micro_floor and current_portfolio_risk == 0.0),
+        equity=account["equity"],
     )
     if portfolio_safe_volume is None:
         raise HTTPException(
@@ -1377,8 +1477,10 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
     candidate_comments = [order_comment, ""]
 
     # Stops to try on initial entry
-    # If broker uses Market Execution (mode 2), start immediately with sl=0, tp=0
-    if is_market_exec:
+    # If broker uses Market Execution (mode 2) for instant market fills, start immediately with sl=0, tp=0
+    if use_pending_limit:
+        candidate_stops = [(desired_sl, desired_tp)]
+    elif is_market_exec:
         candidate_stops = [(0.0, 0.0)]
     else:
         candidate_stops = [(desired_sl, desired_tp), (0.0, 0.0)]
@@ -1413,7 +1515,7 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
             for fill in candidate_fillings:
                 # Refresh tick for accurate live price on each pass
                 cur_tick = mt5.symbol_info_tick(symbol)
-                cur_price = (cur_tick.ask if payload.direction == "BUY" else cur_tick.bid) if cur_tick else price
+                cur_price = entry_reference_price if use_pending_limit else ((cur_tick.ask if payload.direction == "BUY" else cur_tick.bid) if cur_tick else price)
                 current_risk_per_lot = abs(cur_price - desired_sl) / symbol_spec["tickSize"] * symbol_spec["tickValue"]
                 current_portfolio_budget = max(0.0, portfolio_risk_budget - current_portfolio_risk)
                 current_safe_volume = volume_for_risk(
@@ -1422,6 +1524,8 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
                     vol_min,
                     vol_step,
                     vol_max,
+                    allow_micro_floor=(allow_micro_floor and current_portfolio_budget >= risk_budget - 1e-9),
+                    equity=account["equity"],
                 )
                 if current_safe_volume is None:
                     min_lot_risk = current_risk_per_lot * vol_min
@@ -1447,7 +1551,7 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
                     payload.volume = current_safe_volume
 
                 request_data = {
-                    "action": mt5.TRADE_ACTION_DEAL,
+                    "action": getattr(mt5, "TRADE_ACTION_PENDING", 5) if use_pending_limit else mt5.TRADE_ACTION_DEAL,
                     "symbol": symbol,
                     "volume": payload.volume,
                     "type": order_type,
@@ -1459,6 +1563,9 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
                     "type_time": mt5.ORDER_TIME_GTC,
                     "type_filling": fill,
                 }
+                if use_pending_limit and hasattr(mt5, "ORDER_TIME_SPECIFIED"):
+                    request_data["type_time"] = getattr(mt5, "ORDER_TIME_SPECIFIED", mt5.ORDER_TIME_GTC)
+                    request_data["expiration"] = int((now + timedelta(minutes=payload.expirationMinutes)).timestamp())
                 if cmt:
                     request_data["comment"] = cmt
 
@@ -1800,6 +1907,29 @@ def modify_position(payload: StopsRequest, request: Request) -> dict:
         raise HTTPException(status_code=400, detail=f"MT5 stop update failed: {reason}")
     logger.info(f"🛡️ MT5 Stop Update OK for position #{payload.ticket}: SL={payload.sl}, TP={payload.tp}")
     return read_snapshot(position.symbol)
+
+
+@app.post("/api/cancel-order")
+def cancel_pending_order(payload: CancelOrderRequest, request: Request) -> dict:
+    require_bridge_token(request)
+    require_expected_account(payload.expectedLogin, payload.expectedServer)
+    matches = mt5.orders_get(ticket=payload.ticket)
+    if not matches:
+        raise HTTPException(status_code=404, detail=f"Pending MT5 order {payload.ticket} was not found.")
+    order = matches[0]
+    remove_action = getattr(mt5, "TRADE_ACTION_REMOVE", 8)
+    result = mt5.order_send(
+        {
+            "action": remove_action,
+            "order": int(order.ticket),
+            "symbol": str(order.symbol),
+        }
+    )
+    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+        reason = f"{result.retcode}: {result.comment}" if result else str(mt5.last_error())
+        raise HTTPException(status_code=400, detail=f"MT5 pending order cancel failed: {reason}")
+    logger.info(f"🗑️ MT5 Pending Order #{payload.ticket} cancelled successfully")
+    return read_snapshot(str(order.symbol) or payload.symbol)
 
 
 if __name__ == "__main__":

@@ -17,7 +17,6 @@ import {
   usePositions,
   useEngine,
   useScannerAnalyses,
-  useSignalValidations,
 } from './hooks/useTradingStore';
 import { tradingEngine } from './engine/tradingEngine';
 import { mt5Bridge } from './engine/mt5Bridge';
@@ -27,29 +26,23 @@ import type { PairAnalysis } from './engine/multiPairScanner';
 import { localDayKey } from './engine/tradeJournal';
 
 // Layout & Safety Components
-import { HeaderView } from './components/HeaderView';
+import { CommandBar, type WorkspaceModal } from './components/CommandBar';
 import { KillSwitchBanner } from './components/KillSwitchBanner';
 import { WeekendMarketBanner } from './components/WeekendMarketBanner';
-import { FooterView } from './components/FooterView';
 import { ConfirmDialog } from './components/ConfirmDialog';
 import { WorkspaceErrorBoundary } from './components/ErrorBoundary';
 
-// Control Bar & Multi-Pair Scanner Deck
-import { TerminalUtilitiesBar } from './components/TerminalUtilitiesBar';
-import { PairsSignalDeck } from './components/PairsSignalDeck';
-
-// Core Charting & Execution
+// 3-Zone Workstation Panels
+import { WatchlistRail } from './components/WatchlistRail';
 import { TradingViewWidget } from './components/TradingViewWidget';
 import { SignalEngineCard } from './components/SignalEngineCard';
-import { RunningTradesHUD } from './components/RunningTradesHUD';
-import { SignalQualityCard } from './components/SignalQualityCard';
-import { MacroSentimentRadar } from './components/MacroSentimentRadar';
+import { BottomWorkbench } from './components/BottomWorkbench';
 
 // Floating Notification Beacon
 import { SignalToastNotification } from './components/SignalToastNotification';
 
 // Icons
-import { AlertTriangle, ShieldAlert, Power } from 'lucide-react';
+import { AlertTriangle, Power } from 'lucide-react';
 
 // Lazy-loaded Modals
 const Mt5BridgeModal = lazy(() =>
@@ -83,15 +76,12 @@ export default function App() {
   const positionsState = usePositions();
   const engine = useEngine();
   const scannerAnalyses = useScannerAnalyses();
-  const signalValidations = useSignalValidations();
 
   const activeSymbol = (ticker.symbol || 'XAUUSD') as SupportedSymbol;
   const instrumentCfg = INSTRUMENTS[activeSymbol] || INSTRUMENTS.XAUUSD;
 
-  // Active modal
-  const [activeModal, setActiveModal] = useState<
-    'bridge' | 'settings' | 'closed_trades' | 'daily_report' | 'tradingview' | 'help' | 'webhook' | null
-  >(null);
+  // Active modal / drawer
+  const [activeModal, setActiveModal] = useState<WorkspaceModal | null>(null);
   const [reportDate, setReportDate] = useState(() => localDayKey(new Date()));
 
   // Confirmation dialog
@@ -246,6 +236,7 @@ export default function App() {
     setActiveModal(null);
   }, []);
   const handleOpenBridge = useCallback(() => setActiveModal('bridge'), []);
+  const handleOpenWebhook = useCallback(() => setActiveModal('webhook'), []);
   const handleOpenTradingView = useCallback(() => setActiveModal('tradingview'), []);
   const handleOpenHelp = useCallback(() => setActiveModal('help'), []);
   const handleOpenClosedTrades = useCallback(() => setActiveModal('closed_trades'), []);
@@ -327,78 +318,60 @@ export default function App() {
       {/* 3. Weekend Interbank Schedule Banner (only active when market closed) */}
       <WeekendMarketBanner />
 
-      {/* 4. Institutional Top Navigation Header */}
-      <HeaderView
+      {/* 4. Unified Workstation Command Bar */}
+      <CommandBar
         isDark={isDark}
         onToggleTheme={toggleTheme}
         onOpenModal={handleOpenModal}
         onToggleKillSwitchPrompt={handleRequestKillSwitchToggle}
       />
 
-      {/* 5. Minimal Focused Terminal Workspace */}
-      <main className="flex-1 max-w-[1600px] w-full mx-auto px-3 sm:px-6 py-4 space-y-4 min-w-0">
+      {/* 5. Workstation Layout: Collapsible Square Scanner Deck -> Chart + Ticket Split -> Lower Workbench */}
+      <main className="flex-1 max-w-[1680px] w-full mx-auto px-3 sm:px-5 py-3.5 min-w-0">
         <WorkspaceErrorBoundary>
-          {/* Essential safety and sound controls */}
-          <TerminalUtilitiesBar
-            onToggleKillSwitchPrompt={handleRequestKillSwitchToggle}
-          />
+          <div className="space-y-3.5">
+            {/* Zone 1: 4-Pair Collapsible Square Market Scanner Deck */}
+            <WatchlistRail
+              scannerAnalyses={scannerAnalyses}
+              activeSymbol={activeSymbol}
+              onSelectSymbol={handleSelectSymbol}
+              onExecuteTrade={handleExecuteAnalysis}
+              onOpenBridge={handleOpenBridge}
+              onOpenWebhook={handleOpenWebhook}
+            />
 
-          {/* Multi-Pair Signals & Confluence Deck (4 Instruments) */}
-          <PairsSignalDeck
-            scannerAnalyses={scannerAnalyses}
-            activeSymbol={activeSymbol}
-            onSelectSymbol={handleSelectSymbol}
-            onExecuteTrade={handleExecuteAnalysis}
-          />
+            {/* Zone 2: Primary Chart + Execution Ticket */}
+            <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_360px] gap-3.5 items-stretch">
+              <div className="min-w-0">
+                <TradingViewWidget
+                  isDark={isDark}
+                  symbol={instrumentCfg.tvSymbol}
+                  interval="1"
+                  height={480}
+                  onExpand={handleOpenTradingView}
+                  onOpenHelp={handleOpenHelp}
+                />
+              </div>
 
-          {/* Live Running Trades & Positions HUD */}
-          <div className="min-w-0">
-            <RunningTradesHUD
+              <div className="min-w-0">
+                <SignalEngineCard
+                  onExecuteSignal={handleExecuteSignal}
+                  onOpenWebhook={handleOpenWebhook}
+                />
+              </div>
+            </div>
+
+            {/* Zone 3: Full-Width Tabbed Workbench Dock */}
+            <BottomWorkbench
               onOpenTradeStation={handleOpenClosedTrades}
+              onOpenWebhook={handleOpenWebhook}
             />
           </div>
-
-          {/* Primary Trading Desk: keep the chart between execution and health diagnostics */}
-          <div className="grid grid-cols-1 2xl:grid-cols-[minmax(400px,0.9fr)_minmax(0,1.55fr)] gap-4 min-w-0 items-start">
-            <div className="w-full min-w-0">
-              <SignalEngineCard onExecuteSignal={handleExecuteSignal} />
-            </div>
-
-            <div className="neo-panel w-full border rounded-2xl overflow-hidden min-w-0">
-              <TradingViewWidget
-                isDark={isDark}
-                symbol={instrumentCfg.tvSymbol}
-                interval="1"
-                height={460}
-                onExpand={handleOpenTradingView}
-                onOpenHelp={handleOpenHelp}
-              />
-            </div>
-          </div>
-
-          {/* Institutional Macro, News Sentiment & Volume Order Flow Radar */}
-          <div className="min-w-0">
-            <MacroSentimentRadar />
-          </div>
-
-          <SignalQualityCard
-            ticker={ticker}
-            market={market}
-            analyses={scannerAnalyses}
-            closedTrades={positionsState.closedTrades}
-            positions={positionsState.positions}
-            pendingOrders={positionsState.pendingOrders || []}
-            validations={signalValidations}
-          />
-
         </WorkspaceErrorBoundary>
       </main>
 
       {/* 6. Floating Sniper Entry Beacon / Toast Notification */}
       <SignalToastNotification onExecuteSignal={handleExecuteSignal} />
-
-      {/* 7. Institutional Footer */}
-      <FooterView />
 
       {/* 8. Confirmation Dialog for Critical Safety Actions */}
       {confirmDialog && (
@@ -427,7 +400,14 @@ export default function App() {
           />
         )}
         {activeModal === 'closed_trades' && (
-          <ClosedTradesModal isOpen={true} onClose={handleCloseModal} />
+          <ClosedTradesModal
+            isOpen={true}
+            onClose={handleCloseModal}
+            onOpenDailyReport={(dateKey) => {
+              setReportDate(dateKey);
+              setActiveModal('daily_report');
+            }}
+          />
         )}
         {activeModal === 'daily_report' && (
           <DailyReportModal

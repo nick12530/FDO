@@ -16,10 +16,25 @@ import {
   JournalSignalRecord,
   JournalTradeRecord,
 } from '../types/smc';
-import { readSignalValidations, subscribeJournal } from '../engine/tradeJournal';
+import {
+  getActiveJournalAccountKey,
+  readSignalValidations,
+  readStoredJournalSignals,
+  readStoredJournalTrades,
+  subscribeJournal,
+} from '../engine/tradeJournal';
 import type { SignalValidationRecord } from '../engine/signalValidation';
 import type { PairAnalysis } from '../engine/multiPairScanner';
 import type { SupportedSymbol } from '../engine/instrumentConfig';
+import {
+  getWebhookRuntimeState,
+  subscribeWebhookState,
+  type WebhookRuntimeState,
+} from '../utils/webhookNotifier';
+
+export function useWebhookState(): WebhookRuntimeState {
+  return useSyncExternalStore(subscribeWebhookState, getWebhookRuntimeState, getWebhookRuntimeState);
+}
 
 export function useTicker(): TickerState {
   const subscribe = useCallback((cb: () => void) => tradingEngine.on('ticker', cb), []);
@@ -80,7 +95,12 @@ export function useActiveSymbol(): SupportedSymbol {
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
 
-let cachedSignalsRaw: string = '';
+function getScopedStorageKey(baseKey: string): string {
+  const scope = getActiveJournalAccountKey();
+  return scope === 'standalone' ? baseKey : `${baseKey}::${scope}`;
+}
+
+let cachedSignalsToken: string = '';
 let cachedSignalsSnapshot: JournalSignalRecord[] = [];
 
 export function useJournalSignals(): JournalSignalRecord[] {
@@ -95,11 +115,12 @@ export function useJournalSignals(): JournalSignalRecord[] {
 
   const getSnapshot = useCallback(() => {
     try {
-      const stored = localStorage.getItem('smc.journal-signals.v1') || '[]';
-      if (stored !== cachedSignalsRaw) {
-        cachedSignalsRaw = stored;
-        const parsed = JSON.parse(stored);
-        cachedSignalsSnapshot = Array.isArray(parsed) ? parsed : [];
+      const storageKey = getScopedStorageKey('smc.journal-signals.v1');
+      const stored = localStorage.getItem(storageKey) || '[]';
+      const token = `${storageKey}::${stored}`;
+      if (token !== cachedSignalsToken) {
+        cachedSignalsToken = token;
+        cachedSignalsSnapshot = readStoredJournalSignals();
       }
     } catch {
       // fallback
@@ -110,7 +131,7 @@ export function useJournalSignals(): JournalSignalRecord[] {
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
 
-let cachedTradesRaw: string = '';
+let cachedTradesToken: string = '';
 let cachedTradesSnapshot: JournalTradeRecord[] = [];
 
 export function useJournalTrades(): JournalTradeRecord[] {
@@ -125,11 +146,12 @@ export function useJournalTrades(): JournalTradeRecord[] {
 
   const getSnapshot = useCallback(() => {
     try {
-      const stored = localStorage.getItem('smc.journal-trades.v1') || '[]';
-      if (stored !== cachedTradesRaw) {
-        cachedTradesRaw = stored;
-        const parsed = JSON.parse(stored);
-        cachedTradesSnapshot = Array.isArray(parsed) ? parsed : [];
+      const storageKey = getScopedStorageKey('smc.journal-trades.v1');
+      const stored = localStorage.getItem(storageKey) || '[]';
+      const token = `${storageKey}::${stored}`;
+      if (token !== cachedTradesToken) {
+        cachedTradesToken = token;
+        cachedTradesSnapshot = readStoredJournalTrades();
       }
     } catch {
       // fallback
@@ -140,16 +162,18 @@ export function useJournalTrades(): JournalTradeRecord[] {
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
 
-let cachedValidationsRaw = '';
+let cachedValidationsToken = '';
 let cachedValidationsSnapshot: SignalValidationRecord[] = [];
 
 export function useSignalValidations(): SignalValidationRecord[] {
   const subscribe = useCallback((cb: () => void) => subscribeJournal(cb), []);
   const getSnapshot = useCallback(() => {
     try {
-      const stored = localStorage.getItem('smc.signal-validation.v1') || '[]';
-      if (stored !== cachedValidationsRaw) {
-        cachedValidationsRaw = stored;
+      const storageKey = getScopedStorageKey('smc.signal-validation.v1');
+      const stored = localStorage.getItem(storageKey) || '[]';
+      const token = `${storageKey}::${stored}`;
+      if (token !== cachedValidationsToken) {
+        cachedValidationsToken = token;
         cachedValidationsSnapshot = readSignalValidations();
       }
     } catch (error) {

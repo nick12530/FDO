@@ -8,7 +8,7 @@
  */
 
 import React, { useState, useMemo } from 'react';
-import { useMarket, useTicker, useEngine } from '../hooks/useTradingStore';
+import { useMarket, useTicker, useEngine, useWebhookState } from '../hooks/useTradingStore';
 import { tradingEngine } from '../engine/tradingEngine';
 import {
   ArrowRight,
@@ -31,6 +31,7 @@ import { dispatchLiveSignalAlert } from '../utils/webhookNotifier';
 
 interface SignalEngineCardProps {
   onExecuteSignal?: (customVolume?: number, positionCount?: number, signal?: Signal) => void | Promise<void>;
+  onOpenWebhook?: () => void;
 }
 
 const LOT_PRESETS = [0.01, 0.02, 0.05, 0.10];
@@ -42,10 +43,11 @@ function formatSignalCountdown(seconds?: number): string {
   return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
 }
 
-export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ onExecuteSignal }) => {
+export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ onExecuteSignal, onOpenWebhook }) => {
   const market = useMarket();
   const ticker = useTicker();
   const engine = useEngine();
+  const webhook = useWebhookState();
 
   // Filter to only show READY signals (executable)
   const readySignals = useMemo(() => {
@@ -61,12 +63,13 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
 
   // Execution parameters
   const [lotSize, setLotSize] = useState<number>(0.01);
-  const [sizingMode, setSizingMode] = useState<'lots' | 'risk'>('lots');
   const positionCount = 1;
   const [copied, setCopied] = useState(false);
   const [executedFeedback, setExecutedFeedback] = useState<string | null>(null);
-  const [tgFeedback, setTgFeedback] = useState<string | null>(null);
+  const [tgFeedback, setTgFeedback] = useState<{ ok: boolean; text: string } | null>(null);
   const [selectedSignalId, setSelectedSignalId] = useState<string | null>(null);
+
+  const executionMode = engine.executionMode ?? 'MARKET';
 
   const isBrokerTradeDisabled =
     Boolean(market.symbolSpec?.tradeDisabled) ||
@@ -99,6 +102,11 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
   const currentSpot = activeDirection === 'BUY' ? ticker.ask : ticker.bid;
   const entryPrice = currentSpot;
   const signalEntry = rawSig?.entry ?? null;
+  const otePrice =
+    rawSig?.optimalTradeEntry &&
+    Math.abs(rawSig.optimalTradeEntry - rawSig.entry) > instrumentConfig.pointSize * 5
+      ? rawSig.optimalTradeEntry
+      : null;
   const riskLimitedLotSize = rawSig ? tradingEngine.getRiskBasedVolume(rawSig.sl, lotSize, rawSig.direction) : null;
   const sizingInfo = rawSig
     ? tradingEngine.getRiskSizingInfo(rawSig.sl, rawSig.direction, ticker.symbol as SupportedSymbol)
@@ -112,27 +120,35 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
   const rewardPips = rewardPts / instrumentConfig.pipSize;
 
   const handleSendTelegram = async () => {
+    if (!webhook.hasValidDestination) {
+      onOpenWebhook?.();
+      setTgFeedback({ ok: false, text: 'Configure Telegram in Alerts' });
+      setTimeout(() => setTgFeedback(null), 3000);
+      return;
+    }
     if (!rawSig) return;
     try {
+      const normalizedConfluence =
+        rawSig.score <= 10 ? Math.round(rawSig.score * 10) : Math.round(rawSig.score);
       const res = await dispatchLiveSignalAlert({
         symbol: ticker.symbol as SupportedSymbol,
         direction: rawSig.direction,
         timeframe: rawSig.timeframe,
-        strategy: rawSig.strategy,
+        strategy: rawSig.strategy || 'SMC Setup',
         entry: rawSig.entry,
         sl: rawSig.sl,
         tp: rawSig.tp,
-        confluenceScore: Math.round(rawSig.score * 10),
+        confluenceScore: normalizedConfluence,
         lotSize: riskLimitedLotSize ?? lotSize,
         force: true,
       });
       if (res.ok) {
-        setTgFeedback('Sent to Telegram!');
+        setTgFeedback({ ok: true, text: 'Sent to TG' });
       } else {
-        setTgFeedback(res.error || 'Failed to send');
+        setTgFeedback({ ok: false, text: res.error || 'Failed to send' });
       }
-    } catch (e: any) {
-      setTgFeedback(e?.message || 'Error');
+    } catch (e: unknown) {
+      setTgFeedback({ ok: false, text: e instanceof Error ? e.message : 'Error' });
     }
     setTimeout(() => setTgFeedback(null), 3000);
   };
@@ -215,20 +231,27 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
   };
 
   return (
-    <div className="w-full border border-slate-200 dark:border-[#222d29] rounded-xl p-4 sm:p-5 bg-white dark:bg-[#121917] flex flex-col justify-between space-y-4 font-mono text-xs transition-colors">
-      {/* 1. Header: Pair, Direction, Score */}
-      <div className="flex items-center justify-between pb-1 gap-2">
-        <div className="flex items-center gap-2">
-          <div className="flex items-center gap-1.5 font-bold text-sm text-slate-900 dark:text-white">
-            <span>{ticker.symbol} Signal</span>
-            <span className="text-slate-400 dark:text-slate-500 font-normal text-xs">· Spread: {ticker.spread} pts</span>
+    <div className="ws-surface border rounded-xl overflow-hidden flex flex-col h-full text-xs">
+      {/* 1. Header */}
+      <div className="px-4 py-3 ws-subtle border-b flex items-center justify-between gap-2">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <h2 className="font-extrabold text-sm text-slate-950 dark:text-white tracking-tight">
+              {ticker.symbol} Ticket
+            </h2>
+            <span className="font-mono text-[11px] font-bold text-slate-600 dark:text-slate-300 tabular-nums">
+              {ticker.spread} PTS
+            </span>
           </div>
+          <p className="text-[11px] font-medium text-slate-500 dark:text-slate-400 mt-0.5">
+            {rawSig ? `${rawSig.strategy || 'SMC Setup'} · ${rawSig.timeframe}` : 'Monitoring live broker quotes'}
+          </p>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1.5 shrink-0">
           {rawSig && (
-            <span className="text-xs font-extrabold text-slate-800 dark:text-slate-200">
-              Score: <strong className="text-slate-900 dark:text-white font-black">{rawSig.score.toFixed(1)}/10</strong>
+            <span className="font-mono text-xs font-bold text-slate-900 dark:text-white tabular-nums mr-1">
+              {(rawSig.score <= 10 ? rawSig.score : rawSig.score / 10).toFixed(1)}/10
             </span>
           )}
           <button
@@ -236,197 +259,282 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
             onClick={handleCopy}
             title="Copy signal parameters"
             disabled={!rawSig}
-            className="p-1 rounded text-slate-400 hover:text-slate-900 dark:text-slate-500 dark:hover:text-white transition-colors cursor-pointer disabled:opacity-40"
+            className="p-1.5 rounded-lg text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200/60 dark:hover:bg-[#1b2130] transition-colors cursor-pointer disabled:opacity-40"
           >
-            {copied ? <Check className="w-4 h-4 text-emerald-500" /> : <Copy className="w-4 h-4" />}
+            {copied ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
           </button>
           <button
             type="button"
             onClick={handleSendTelegram}
-            title="Dispatch this live signal to Telegram channel"
-            disabled={!rawSig}
-            className="p-1 rounded text-slate-400 hover:text-sky-500 dark:text-slate-500 dark:hover:text-sky-400 transition-colors cursor-pointer disabled:opacity-40 flex items-center gap-1"
+            title={
+              !webhook.hasValidDestination
+                ? 'Configure Telegram Alerts'
+                : rawSig
+                  ? 'Dispatch live signal to Telegram'
+                  : 'Telegram configured (waiting for confirmed setup)'
+            }
+            disabled={!rawSig && webhook.hasValidDestination}
+            className="p-1.5 rounded-lg text-slate-400 hover:text-sky-500 dark:hover:text-sky-400 hover:bg-slate-200/60 dark:hover:bg-[#1b2130] transition-colors cursor-pointer disabled:opacity-40 flex items-center gap-1"
           >
-            <Send className="w-4 h-4 text-sky-500" />
-            {tgFeedback && <span className="text-[10px] text-emerald-500 font-extrabold">{tgFeedback}</span>}
+            <Send
+              className={`w-3.5 h-3.5 ${
+                webhook.status === 'ACTIVE'
+                  ? 'text-emerald-500'
+                  : webhook.status === 'ERROR'
+                    ? 'text-rose-500'
+                    : 'text-sky-500'
+              }`}
+            />
+            {tgFeedback && (
+              <span
+                className={`text-[11px] font-semibold ${
+                  tgFeedback.ok ? 'text-emerald-500' : 'text-rose-500'
+                }`}
+              >
+                {tgFeedback.text}
+              </span>
+            )}
           </button>
         </div>
       </div>
 
-      {/* Broker Trade Disabled Banner (Retcode 10017) */}
-      {isBrokerTradeDisabled && (
-        <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-800 dark:text-amber-300 text-xs font-mono">
-          <div className="font-extrabold flex items-center gap-1.5 mb-1 text-amber-700 dark:text-amber-200">
-            <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0" />
-            <span>Broker Trade Disabled for {ticker.symbol} (retcode 10017)</span>
-          </div>
-          <p className="text-[11px] font-semibold leading-relaxed">
-            Your broker has disabled order execution for <strong>{ticker.symbol}</strong> on this account.
-            Quotes and chart indicators remain active. Switch to <strong>GOLD (XAUUSD)</strong> or <strong>EURUSD</strong> to place live trades.
-          </p>
-        </div>
-      )}
-
-      {/* 2. Direction & Summary */}
-      <div className={`rounded-lg p-3 border transition-all ${
-        rawSig
-          ? isBull
-            ? 'bg-emerald-50/50 dark:bg-emerald-950/20 border-emerald-200 dark:border-emerald-900/40'
-            : 'bg-rose-50/50 dark:bg-rose-950/20 border-rose-200 dark:border-rose-900/40'
-          : 'bg-slate-50 dark:bg-[#0f1513] border-slate-200 dark:border-[#222d29]'
-      }`}>
-        <div className="flex items-center justify-between gap-2 mb-1">
-          <div className="flex items-center gap-2">
-            <span className={`px-2 py-0.5 rounded text-xs font-bold uppercase flex items-center gap-1 ${
-              rawSig
-                ? isBull
-                  ? 'bg-emerald-600 text-white'
-                  : 'bg-rose-600 text-white'
-                : 'bg-slate-200 text-slate-600 dark:bg-[#222d29] dark:text-slate-400'
-            }`}>
-              {isBull ? <TrendingUp className="w-3.5 h-3.5" /> : <TrendingDown className="w-3.5 h-3.5" />}
-              <span>{rawSig ? rawSig.direction : 'WAITING'}</span>
-            </span>
-            <span className="text-xs text-slate-600 dark:text-slate-300 font-medium">
-              {rawSig ? `${rawSig.strategy} · ${rawSig.timeframe}` : 'Monitoring broker quotes'}
-            </span>
-          </div>
-
-          {rawSig && rawSig.validitySeconds && rawSig.validitySeconds > 0 && (
-            <span className="text-[11px] text-slate-400 tabular-nums">
-              Window: {formatSignalCountdown(rawSig.validitySeconds)}
-            </span>
+      <div className="p-4 flex-1 flex flex-col justify-between space-y-4">
+        <div className="space-y-4">
+          {/* Broker Trade Disabled Banner (Retcode 10017) */}
+          {isBrokerTradeDisabled && (
+            <div className="p-3 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-800 dark:text-amber-300 text-xs">
+              <div className="font-semibold flex items-center gap-1.5 mb-1">
+                <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0" />
+                <span>Broker Trade Disabled ({ticker.symbol} · 10017)</span>
+              </div>
+              <p className="text-[11px] leading-relaxed">
+                Execution is disabled for <strong>{ticker.symbol}</strong> on this account. Switch to XAUUSD or EURUSD to execute live orders.
+              </p>
+            </div>
           )}
-        </div>
 
-        <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
-          {rawSig
-            ? rawSig.humanExplanation?.simpleSummary || buildSignalRationale(rawSig)
-            : 'Standing by for structural market break or liquidity sweep confirmation.'}
-        </p>
+          {/* Setup Selector (when multiple timeframe/strategy setups are ready) */}
+          {readySignals.length > 1 && (
+            <div className="flex items-center gap-1 overflow-x-auto pb-1">
+              {readySignals.slice(0, 4).map((sigItem) => {
+                const sigId = `${sigItem.strategy}:${sigItem.direction}:${sigItem.timeframe}:${sigItem.timestamp}`;
+                const active =
+                  rawSig &&
+                  `${rawSig.strategy}:${rawSig.direction}:${rawSig.timeframe}:${rawSig.timestamp}` === sigId;
+                return (
+                  <button
+                    key={sigId}
+                    type="button"
+                    onClick={() => setSelectedSignalId(sigId)}
+                    className={`px-2 py-1 rounded-md text-[11px] font-mono font-semibold border whitespace-nowrap transition-colors cursor-pointer ${
+                      active
+                        ? 'bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-950 border-slate-900 dark:border-slate-100'
+                        : 'ws-subtle text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
+                    }`}
+                  >
+                    {sigItem.timeframe} · {sigItem.direction} · {(sigItem.score <= 10 ? sigItem.score : sigItem.score / 10).toFixed(1)}
+                  </button>
+                );
+              })}
+            </div>
+          )}
 
-        {scannerBlockReason && (
-          <p className="mt-2 text-[11px] text-amber-700 dark:text-amber-300">
-            Hold: {scannerBlockReason}
-          </p>
-        )}
-      </div>
-
-      {/* 3. Level Triad: Entry, Stop Loss, Take Profit */}
-      <div className="grid grid-cols-3 gap-2 text-center">
-        <div className="p-2.5 rounded-lg border border-slate-200 dark:border-[#222d29] bg-slate-50/50 dark:bg-[#0f1513]">
-          <span className="text-[10px] text-slate-400 uppercase font-semibold block">Entry</span>
-          <span className="text-sm font-bold text-slate-900 dark:text-white tabular-nums block mt-0.5">
-            {signalEntry === null ? '—' : signalEntry.toFixed(instrumentConfig.digits)}
-          </span>
-          <span className="text-[10px] text-slate-400 block mt-0.5">{rawSig ? rawSig.timeframe : 'Pending'}</span>
-        </div>
-
-        <div className="p-2.5 rounded-lg border border-slate-200 dark:border-[#222d29] bg-slate-50/50 dark:bg-[#0f1513]">
-          <span className="text-[10px] text-rose-500 uppercase font-semibold block">Stop Loss</span>
-          <span className="text-sm font-bold text-rose-600 dark:text-rose-400 tabular-nums block mt-0.5">
-            {slPrice === null ? '—' : `$${slPrice.toFixed(2)}`}
-          </span>
-          <span className="text-[10px] text-slate-400 block mt-0.5">
-            {rawSig ? `-${riskPips.toFixed(1)}p ($${tradeMetrics.riskDollar})` : 'Pending'}
-          </span>
-        </div>
-
-        <div className="p-2.5 rounded-lg border border-slate-200 dark:border-[#222d29] bg-slate-50/50 dark:bg-[#0f1513]">
-          <span className="text-[10px] text-emerald-500 uppercase font-semibold block">Take Profit</span>
-          <span className="text-sm font-bold text-emerald-600 dark:text-emerald-400 tabular-nums block mt-0.5">
-            {tpPrice === null ? '—' : tpPrice.toFixed(instrumentConfig.digits)}
-          </span>
-          <span className="text-[10px] text-slate-400 block mt-0.5">
-            {rawSig ? `+${rewardPips.toFixed(1)}p (+$${tradeMetrics.rewardDollar})` : 'Pending'}
-          </span>
-        </div>
-      </div>
-
-      {/* 4. Sizing Controls & R:R Summary */}
-      <div className="p-2.5 rounded-lg border border-slate-200 dark:border-[#222d29] bg-slate-50/40 dark:bg-[#0f1513] flex items-center justify-between gap-2 flex-wrap">
-        <div>
-          <span className="text-[10px] text-slate-400 uppercase font-semibold block">Risk &amp; Reward</span>
-          <span className="text-xs font-bold text-slate-800 dark:text-slate-200">
-            1:{tradeMetrics.rrRatio} RR · {riskLimitedLotSize && riskLimitedLotSize > 0 ? `${riskLimitedLotSize.toFixed(2)}L safe` : 'Sizing hold'}
-          </span>
-        </div>
-
-        {/* Lot Adjustment */}
-        <div className="flex items-center gap-1.5">
-          <div className="flex items-center gap-1">
-            {LOT_PRESETS.map((preset) => (
-              <button
-                key={preset}
-                type="button"
-                onClick={() => setLotSize(preset)}
-                className={`px-2 py-0.5 rounded text-[10px] font-bold border transition-colors cursor-pointer ${
-                  lotSize === preset
-                    ? 'bg-slate-900 text-white dark:bg-white dark:text-black border-slate-900 dark:border-white'
-                    : 'bg-white dark:bg-[#1a2320] text-slate-600 dark:text-slate-300 border-slate-200 dark:border-[#222d29] hover:border-slate-300'
+          {/* 2. Direction & Rationale */}
+          <div className="space-y-2 pb-3 border-b border-slate-200 dark:border-[#2b3b59]">
+            <div className="flex items-center justify-between gap-2">
+              <span
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-bold ${
+                  rawSig
+                    ? isBull
+                      ? 'bg-emerald-600 text-white'
+                      : 'bg-rose-600 text-white'
+                    : 'ws-subtle text-slate-500 dark:text-slate-400 border'
                 }`}
               >
-                {preset.toFixed(2)}L
-              </button>
-            ))}
+                {isBull ? <TrendingUp className="w-3.5 h-3.5" /> : <TrendingDown className="w-3.5 h-3.5" />}
+                <span>{rawSig ? rawSig.direction : 'WAITING'}</span>
+              </span>
+
+              {rawSig && rawSig.validitySeconds && rawSig.validitySeconds > 0 && (
+                <span className="font-mono text-[11px] text-slate-400 tabular-nums">
+                  Window {formatSignalCountdown(rawSig.validitySeconds)}
+                </span>
+              )}
+            </div>
+
+            <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+              {rawSig
+                ? rawSig.humanExplanation?.simpleSummary || buildSignalRationale(rawSig)
+                : 'Standing by for structural market break or liquidity sweep confirmation.'}
+            </p>
+
+            {scannerBlockReason && (
+              <p className="text-[11px] font-medium text-amber-600 dark:text-amber-400">
+                Hold: {scannerBlockReason}
+              </p>
+            )}
           </div>
 
-          <div className="flex items-center gap-1 border border-slate-200 dark:border-[#222d29] rounded px-1.5 py-0.5 bg-white dark:bg-[#121917]">
-            <button
-              type="button"
-              onClick={() => handleAdjustLot(-0.01)}
-              className="p-0.5 text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white cursor-pointer"
-            >
-              <Minus className="w-3 h-3" />
-            </button>
-            <span className="font-bold tabular-nums w-10 text-center text-slate-900 dark:text-white text-xs">
-              {(riskLimitedLotSize ?? lotSize).toFixed(2)}
-            </span>
-            <button
-              type="button"
-              onClick={() => handleAdjustLot(0.01)}
-              className="p-0.5 text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white cursor-pointer"
-            >
-              <Plus className="w-3 h-3" />
-            </button>
+          {/* 3. Level Triad (Clean Hairline Columns) */}
+          <div className="grid grid-cols-3 divide-x divide-slate-200 dark:divide-[#2b3b59] pb-3 border-b border-slate-200 dark:border-[#2b3b59]">
+            <div className="pr-2">
+              <span className="text-[11px] font-semibold text-slate-500 dark:text-slate-400 block">
+                {otePrice !== null && executionMode === 'PULLBACK_LIMIT' ? 'OTE Limit' : 'Entry'}
+              </span>
+              <span className="font-mono text-sm font-extrabold text-slate-950 dark:text-white tabular-nums block mt-0.5">
+                {otePrice !== null && executionMode === 'PULLBACK_LIMIT'
+                  ? otePrice.toFixed(instrumentConfig.digits)
+                  : signalEntry === null
+                    ? '—'
+                    : signalEntry.toFixed(instrumentConfig.digits)}
+              </span>
+              <span className="font-mono text-[11px] text-slate-500 dark:text-slate-400 block mt-0.5 tabular-nums">
+                {otePrice !== null && executionMode !== 'PULLBACK_LIMIT'
+                  ? `OTE ${otePrice.toFixed(instrumentConfig.digits)}`
+                  : rawSig
+                    ? `${rawSig.timeframe}${rawSig.regime ? ` · ${rawSig.regime}` : ''}`
+                    : 'Pending'}
+              </span>
+            </div>
+
+            <div className="px-2.5">
+              <span className="text-[11px] font-semibold text-rose-600 dark:text-rose-400 block">Stop Loss</span>
+              <span className="font-mono text-sm font-extrabold text-rose-600 dark:text-rose-400 tabular-nums block mt-0.5">
+                {slPrice === null ? '—' : slPrice.toFixed(instrumentConfig.digits)}
+              </span>
+              <span className="font-mono text-[11px] text-slate-500 dark:text-slate-400 tabular-nums block mt-0.5">
+                {rawSig ? `-${riskPips.toFixed(1)}p · -$${tradeMetrics.riskDollar}` : 'Pending'}
+              </span>
+            </div>
+
+            <div className="pl-2.5">
+              <span className="text-[11px] font-semibold text-emerald-600 dark:text-emerald-400 block">Take Profit</span>
+              <span className="font-mono text-sm font-extrabold text-emerald-600 dark:text-emerald-400 tabular-nums block mt-0.5">
+                {tpPrice === null ? '—' : tpPrice.toFixed(instrumentConfig.digits)}
+              </span>
+              <span className="font-mono text-[11px] text-slate-500 dark:text-slate-400 tabular-nums block mt-0.5">
+                {rawSig ? `+${rewardPips.toFixed(1)}p · +$${tradeMetrics.rewardDollar}` : 'Pending'}
+              </span>
+            </div>
           </div>
+
+          {/* 4. Execution Mode, Lot Sizing & Risk Summary */}
+          <div className="space-y-2.5">
+            <div className="flex items-center justify-between text-xs">
+              <span className="text-slate-500 dark:text-slate-400">Auto Fill Mode</span>
+              <div className="inline-flex rounded-md border border-slate-200 dark:border-[#2b3b59] overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => tradingEngine.setExecutionMode('MARKET')}
+                  className={`px-2 py-0.5 text-[11px] font-semibold transition-colors cursor-pointer ${
+                    executionMode === 'MARKET'
+                      ? 'bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-950'
+                      : 'ws-subtle text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                  }`}
+                >
+                  Market
+                </button>
+                <button
+                  type="button"
+                  onClick={() => tradingEngine.setExecutionMode('PULLBACK_LIMIT')}
+                  className={`px-2 py-0.5 text-[11px] font-semibold transition-colors cursor-pointer border-l border-slate-200 dark:border-[#2b3b59] ${
+                    executionMode === 'PULLBACK_LIMIT'
+                      ? 'bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-950'
+                      : 'ws-subtle text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                  }`}
+                >
+                  OTE Limit
+                </button>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between text-xs">
+              <span className="text-slate-500 dark:text-slate-400">Risk / Reward</span>
+              <span className="font-mono font-semibold text-slate-900 dark:text-white tabular-nums">
+                1:{tradeMetrics.rrRatio} · {riskLimitedLotSize && riskLimitedLotSize > 0 ? `${riskLimitedLotSize.toFixed(2)}L safe` : 'Sizing hold'}
+              </span>
+            </div>
+
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1">
+                {LOT_PRESETS.map((preset) => (
+                  <button
+                    key={preset}
+                    type="button"
+                    onClick={() => setLotSize(preset)}
+                    className={`px-2 py-1 rounded-md font-mono text-[11px] font-semibold border transition-colors cursor-pointer ${
+                      lotSize === preset
+                        ? 'bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-950 border-slate-900 dark:border-slate-100'
+                        : 'ws-subtle text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
+                    }`}
+                  >
+                    {preset.toFixed(2)}
+                  </button>
+                ))}
+              </div>
+
+              <div className="flex items-center gap-1 ws-subtle border rounded-lg px-1.5 py-0.5">
+                <button
+                  type="button"
+                  onClick={() => handleAdjustLot(-0.01)}
+                  aria-label="Decrease lot size"
+                  className="p-1 text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white cursor-pointer"
+                >
+                  <Minus className="w-3 h-3" />
+                </button>
+                <span className="font-mono font-bold tabular-nums w-11 text-center text-slate-900 dark:text-white text-xs">
+                  {(riskLimitedLotSize ?? lotSize).toFixed(2)}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => handleAdjustLot(0.01)}
+                  aria-label="Increase lot size"
+                  className="p-1 text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white cursor-pointer"
+                >
+                  <Plus className="w-3 h-3" />
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* 5. Execution CTA */}
+        <div className="space-y-2 pt-2">
+          {executedFeedback && (
+            <div className="p-2 rounded-lg bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-xs font-semibold text-center">
+              ✓ {executedFeedback}
+            </div>
+          )}
+
+          <button
+            data-hotkey-execute="true"
+            onClick={handleExecute}
+            disabled={isBrokerTradeDisabled || isWideSpread || !rawSig || !sizingInfo || !hasSafeLot || Boolean(scannerBlockReason)}
+            className={`w-full py-3 px-4 rounded-xl font-bold text-xs tracking-wide transition-colors flex items-center justify-center gap-2 cursor-pointer ${
+              isBrokerTradeDisabled || isWideSpread || !rawSig || !sizingInfo || !hasSafeLot || Boolean(scannerBlockReason)
+                ? 'ws-subtle text-slate-400 dark:text-slate-500 cursor-not-allowed border'
+                : activeDirection === 'SELL'
+                ? 'bg-rose-600 hover:bg-rose-700 text-white'
+                : 'bg-emerald-600 hover:bg-emerald-700 text-white'
+            }`}
+          >
+            <span>
+              {isBrokerTradeDisabled
+                ? `Trading Disabled (${ticker.symbol})`
+                : !rawSig
+                ? 'Waiting for Confirmed Setup'
+                : isWideSpread
+                ? `Spread Too Wide (${ticker.spread} pts)`
+                : !hasSafeLot
+                ? 'Risk Limit Exceeded'
+                : scannerBlockReason
+                ? 'Setup Held by Safety Filter'
+                : `Execute ${activeDirection} ${(riskLimitedLotSize ?? lotSize).toFixed(2)}L @ ${entryPrice.toFixed(instrumentConfig.digits)}`}
+            </span>
+            <ArrowRight className="w-4 h-4 shrink-0" />
+          </button>
         </div>
       </div>
-
-      {executedFeedback && (
-        <div className="p-2 rounded bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-xs font-bold text-center">
-          ✓ {executedFeedback}
-        </div>
-      )}
-
-      {/* 5. Execution Button */}
-      <button
-        data-hotkey-execute="true"
-        onClick={handleExecute}
-        disabled={isBrokerTradeDisabled || isWideSpread || !rawSig || !sizingInfo || !hasSafeLot || Boolean(scannerBlockReason)}
-        className={`w-full py-3.5 px-4 rounded-xl font-black text-sm tracking-wide transition-all flex items-center justify-center gap-2 cursor-pointer ${
-          isBrokerTradeDisabled || isWideSpread || !rawSig || !sizingInfo || !hasSafeLot || Boolean(scannerBlockReason)
-            ? 'bg-slate-100 text-slate-400 dark:bg-[#1a2320] dark:text-slate-500 cursor-not-allowed border border-slate-200 dark:border-[#222d29]'
-            : activeDirection === 'SELL'
-            ? 'bg-rose-600 hover:bg-rose-700 text-white shadow-sm'
-            : 'bg-emerald-600 hover:bg-emerald-700 text-white shadow-sm'
-        }`}
-      >
-        <span>
-          {isBrokerTradeDisabled
-            ? `Trading Disabled by Broker (${ticker.symbol})`
-            : !rawSig
-            ? 'Waiting for Confirmed Setup'
-            : isWideSpread
-            ? `Spread Too Wide (${ticker.spread} pts)`
-            : !hasSafeLot
-            ? 'Risk Limit Exceeded'
-            : scannerBlockReason
-            ? 'Setup Held by Safety Filter'
-            : `Execute ${activeDirection} ${(riskLimitedLotSize ?? lotSize).toFixed(2)}L @ ${entryPrice.toFixed(instrumentConfig.digits)}`}
-        </span>
-        <ArrowRight className="w-4 h-4 shrink-0" />
-      </button>
     </div>
   );
 });

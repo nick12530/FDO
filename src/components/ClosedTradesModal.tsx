@@ -1,15 +1,14 @@
 /**
- * ClosedTradesModal.tsx (AuditJournalModal)
- * Minimalist, high-performance Trade & Signal Audit Journal.
- * In full sync with real-time system:
- * - Records all trades taken (both live RUNNING positions & CLOSED trade history)
- * - Records all signals logged by the engine (both EXECUTED and REJECTED with full reasons)
- * - Clean typography, zero pill-badge sandwiching, refined dark institutional aesthetics.
+ * ClosedTradesModal.tsx - Minimalist Trade History, Monthly P&L Calendar & Signal Audit
+ * - Scoped per connected MT5 account (server::login)
+ * - Monthly interactive P&L calendar with daily win/loss totals and per-day trade drilldown
+ * - Live MT5 history re-sync button, zero mock data or synthetic fallbacks
  */
 
 import React, { useState, useEffect, useMemo } from 'react';
 import {
   useClosedTrades,
+  useEngine,
   useJournalSignals,
   useJournalTrades,
   usePositions,
@@ -17,20 +16,23 @@ import {
 } from '../hooks/useTradingStore';
 import {
   clearJournalSignals,
-  clearJournalTrades,
+  closedTradeDayKey,
+  localDayKey,
   updateTradeClosedInJournal,
 } from '../engine/tradeJournal';
 import { tradingEngine } from '../engine/tradingEngine';
+import { mt5Bridge } from '../engine/mt5Bridge';
 import { getInstrumentConfig, SupportedSymbol } from '../engine/instrumentConfig';
 import {
-  History,
-  X,
-  ArrowLeft,
-  CheckCircle2,
-  XCircle,
+  CalendarDays,
+  ChevronLeft,
+  ChevronRight,
   Download,
-  Trash2,
+  History,
+  RefreshCw,
   Search,
+  Trash2,
+  X,
   Zap,
 } from 'lucide-react';
 import type { JournalTradeRecord } from '../types/smc';
@@ -38,24 +40,77 @@ import type { JournalTradeRecord } from '../types/smc';
 interface ClosedTradesModalProps {
   isOpen: boolean;
   onClose: () => void;
-  defaultTab?: 'trades' | 'signals';
+  defaultTab?: 'calendar' | 'trades' | 'signals';
+  onOpenDailyReport?: (dateKey: string) => void;
+}
+
+interface DaySummary {
+  dateKey: string;
+  netPnl: number;
+  tradeCount: number;
+  winCount: number;
+  lossCount: number;
+  totalPips: number;
+  trades: JournalTradeRecord[];
+}
+
+const WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+function formatTradeTimeLabel(trade: JournalTradeRecord): string {
+  const isoCandidate = trade.closedAt || trade.openedAt;
+  if (isoCandidate) {
+    const d = new Date(isoCandidate);
+    if (!Number.isNaN(d.getTime())) {
+      return d.toLocaleString(undefined, {
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+    }
+  }
+  if (trade.closeTime && /^\d{2}:\d{2}/.test(trade.closeTime)) return trade.closeTime;
+  if (trade.openTime && /^\d{2}:\d{2}/.test(trade.openTime)) return trade.openTime;
+  return '—';
+}
+
+function formatCompactMoney(val: number): string {
+  const abs = Math.abs(val);
+  const sign = val > 0 ? '+' : val < 0 ? '-' : '';
+  if (abs >= 1000) return `${sign}$${(abs / 1000).toFixed(1)}k`;
+  return `${sign}$${abs.toFixed(abs >= 100 ? 0 : 2)}`;
 }
 
 export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
   isOpen,
   onClose,
-  defaultTab = 'trades',
+  defaultTab = 'calendar',
+  onOpenDailyReport,
 }) => {
-  const [activeTab, setActiveTab] = useState<'trades' | 'signals'>(defaultTab);
+  const [activeTab, setActiveTab] = useState<'calendar' | 'trades' | 'signals'>(defaultTab);
   const [tradeFilter, setTradeFilter] = useState<'all' | 'running' | 'closed'>('all');
   const [signalFilter, setSignalFilter] = useState<'all' | 'executed' | 'rejected'>('all');
   const [searchQuery, setSearchQuery] = useState('');
+  const [isSyncingMt5, setIsSyncingMt5] = useState(false);
+  const [syncNotice, setSyncNotice] = useState<string | null>(null);
+  const [confirmClear, setConfirmClear] = useState(false);
+
+  const todayKey = useMemo(() => localDayKey(new Date()), []);
+  const [selectedDayKey, setSelectedDayKey] = useState<string>(() => localDayKey(new Date()));
+  const [calendarMonth, setCalendarMonth] = useState<{ year: number; month: number }>(() => {
+    const now = new Date();
+    return { year: now.getFullYear(), month: now.getMonth() };
+  });
 
   const ticker = useTicker();
+  const engine = useEngine();
   const closedTrades = useClosedTrades();
   const storedJournalTrades = useJournalTrades();
   const { positions: livePositions } = usePositions();
   const journalSignals = useJournalSignals();
+
+  const mt5 = engine.mt5Account;
+  const isMt5Connected = Boolean(mt5?.connected);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -66,16 +121,13 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isOpen, onClose]);
 
-  // Combine live positions and recorded trades taken into a single deduplicated list with dynamic real-time PnL
   const allTradesTaken = useMemo<JournalTradeRecord[]>(() => {
     const map = new Map<number, JournalTradeRecord>();
 
-    // 1. Add recorded journal trades
     for (const trade of storedJournalTrades) {
       map.set(trade.ticket, { ...trade });
     }
 
-    // 2. Add closed trades and ensure closed status
     for (const trade of closedTrades) {
       const prev = map.get(trade.ticket);
       map.set(trade.ticket, {
@@ -85,7 +137,6 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
       });
     }
 
-    // 3. Overlay currently active live positions (mark as RUNNING)
     for (const pos of livePositions) {
       const prev = map.get(pos.ticket);
       map.set(pos.ticket, {
@@ -107,10 +158,11 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
       });
     }
 
-    // Dynamic real-time calculation for all RUNNING trades so PnL never stays at 0
     for (const [ticket, trade] of map.entries()) {
       if (trade.status === 'RUNNING') {
-        const matchingPos = livePositions.find((p) => p.ticket === ticket || (p.symbol === trade.symbol && p.type === trade.type));
+        const matchingPos = livePositions.find(
+          (p) => p.ticket === ticket || (p.symbol === trade.symbol && p.type === trade.type)
+        );
         if (matchingPos) {
           trade.profit = matchingPos.profit;
           trade.pips = matchingPos.pips;
@@ -124,14 +176,10 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
           const cfg = getInstrumentConfig(sym);
           const pts = trade.type === 'BUY' ? curPrice - trade.openPrice : trade.openPrice - curPrice;
           const pips = Number((pts / cfg.pipSize).toFixed(1));
-          let profit = 0;
-          if (cfg.category === 'metals') {
-            profit = Number((pts * trade.volume * cfg.contractSize).toFixed(2));
-          } else if (sym === 'USDJPY') {
-            profit = Number(((pts * trade.volume * cfg.contractSize) / Math.max(1, curPrice)).toFixed(2));
-          } else {
-            profit = Number((pts * trade.volume * cfg.contractSize).toFixed(2));
-          }
+          const profit =
+            sym === 'USDJPY'
+              ? Number(((pts * trade.volume * cfg.contractSize) / Math.max(1, curPrice)).toFixed(2))
+              : Number((pts * trade.volume * cfg.contractSize).toFixed(2));
           trade.profit = profit;
           trade.pips = pips;
           trade.closePrice = curPrice;
@@ -139,11 +187,105 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
       }
     }
 
-    // Sort by ticket descending (newest first)
-    return Array.from(map.values()).sort((a, b) => b.ticket - a.ticket);
+    return Array.from(map.values()).sort((a, b) => {
+      if (a.status === 'RUNNING' && b.status !== 'RUNNING') return -1;
+      if (a.status !== 'RUNNING' && b.status === 'RUNNING') return 1;
+      const aTime = a.closedAt || a.openedAt || '';
+      const bTime = b.closedAt || b.openedAt || '';
+      if (aTime !== bTime) return bTime.localeCompare(aTime);
+      return b.ticket - a.ticket;
+    });
   }, [storedJournalTrades, closedTrades, livePositions, ticker.bid, ticker.ask, ticker.symbol]);
 
-  // Filtered trades
+  const closedOnly = useMemo(
+    () => allTradesTaken.filter((t) => t.status !== 'RUNNING'),
+    [allTradesTaken]
+  );
+
+  // Group closed trades by local YYYY-MM-DD for the P&L Calendar
+  const dailyMap = useMemo(() => {
+    const map = new Map<string, DaySummary>();
+    for (const trade of closedOnly) {
+      const key = closedTradeDayKey(trade);
+      if (!key) continue;
+      let entry = map.get(key);
+      if (!entry) {
+        entry = {
+          dateKey: key,
+          netPnl: 0,
+          tradeCount: 0,
+          winCount: 0,
+          lossCount: 0,
+          totalPips: 0,
+          trades: [],
+        };
+        map.set(key, entry);
+      }
+      entry.netPnl = Number((entry.netPnl + (trade.profit || 0)).toFixed(2));
+      entry.tradeCount += 1;
+      if ((trade.profit || 0) > 0) entry.winCount += 1;
+      else if ((trade.profit || 0) < 0) entry.lossCount += 1;
+      entry.totalPips = Number((entry.totalPips + (trade.pips || 0)).toFixed(1));
+      entry.trades.push(trade);
+    }
+    return map;
+  }, [closedOnly]);
+
+  // Build Monday-first 6-row or 5-row calendar grid for calendarMonth
+  const calendarCells = useMemo(() => {
+    const { year, month } = calendarMonth;
+    const firstOfMonth = new Date(year, month, 1);
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
+    // Convert Sunday=0..Saturday=6 into Monday=0..Sunday=6
+    const startOffset = (firstOfMonth.getDay() + 6) % 7;
+    const totalCells = Math.ceil((startOffset + daysInMonth) / 7) * 7;
+
+    const cells: Array<{
+      dateKey: string;
+      dayNum: number;
+      inMonth: boolean;
+      summary: DaySummary | null;
+    }> = [];
+
+    for (let i = 0; i < totalCells; i++) {
+      const cellDate = new Date(year, month, 1 - startOffset + i);
+      const dateKey = localDayKey(cellDate);
+      cells.push({
+        dateKey,
+        dayNum: cellDate.getDate(),
+        inMonth: cellDate.getMonth() === month,
+        summary: dailyMap.get(dateKey) ?? null,
+      });
+    }
+    return cells;
+  }, [calendarMonth, dailyMap]);
+
+  const monthPrefix = `${calendarMonth.year}-${String(calendarMonth.month + 1).padStart(2, '0')}`;
+  const monthSummary = useMemo(() => {
+    let netPnl = 0;
+    let trades = 0;
+    let wins = 0;
+    let greenDays = 0;
+    let redDays = 0;
+    for (const [key, day] of dailyMap.entries()) {
+      if (!key.startsWith(monthPrefix)) continue;
+      netPnl += day.netPnl;
+      trades += day.tradeCount;
+      wins += day.winCount;
+      if (day.netPnl > 0) greenDays += 1;
+      else if (day.netPnl < 0) redDays += 1;
+    }
+    return {
+      netPnl: Number(netPnl.toFixed(2)),
+      trades,
+      winRate: trades > 0 ? ((wins / trades) * 100).toFixed(1) : '0.0',
+      greenDays,
+      redDays,
+    };
+  }, [dailyMap, monthPrefix]);
+
+  const selectedDaySummary = dailyMap.get(selectedDayKey) ?? null;
+
   const filteredTrades = useMemo(() => {
     return allTradesTaken.filter((trade) => {
       if (tradeFilter === 'running' && trade.status !== 'RUNNING') return false;
@@ -160,7 +302,6 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
     });
   }, [allTradesTaken, tradeFilter, searchQuery]);
 
-  // Filtered signals (reversed so newest first)
   const filteredSignals = useMemo(() => {
     const reversed = [...journalSignals].reverse();
     return reversed.filter((sig) => {
@@ -178,11 +319,9 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
     });
   }, [journalSignals, signalFilter, searchQuery]);
 
-  // Metrics
   const totalTradesCount = allTradesTaken.length;
   const runningCount = allTradesTaken.filter((t) => t.status === 'RUNNING').length;
-  const closedCount = allTradesTaken.filter((t) => t.status !== 'RUNNING').length;
-  const closedOnly = allTradesTaken.filter((t) => t.status !== 'RUNNING');
+  const closedCount = closedOnly.length;
   const wins = closedOnly.filter((t) => t.profit > 0).length;
   const winRate = closedCount > 0 ? ((wins / closedCount) * 100).toFixed(1) : '0.0';
   const totalNet = Number(closedOnly.reduce((sum, t) => sum + t.profit, 0).toFixed(2));
@@ -191,30 +330,56 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
   const executedSignalsCount = journalSignals.filter((s) => s.status === 'EXECUTED').length;
   const rejectedSignalsCount = journalSignals.filter((s) => s.status === 'REJECTED').length;
 
+  const handleSyncMt5History = async () => {
+    if (!isMt5Connected || isSyncingMt5) return;
+    setIsSyncingMt5(true);
+    setSyncNotice(null);
+    try {
+      const trades = await mt5Bridge.refreshAccountHistory();
+      setSyncNotice(`Synced ${trades.length} closed trades from MT5 #${mt5?.login}`);
+    } catch (err) {
+      setSyncNotice(err instanceof Error ? err.message : 'Failed to sync MT5 history');
+    } finally {
+      setIsSyncingMt5(false);
+      setTimeout(() => setSyncNotice(null), 3500);
+    }
+  };
+
+  const handleShiftMonth = (delta: number) => {
+    setCalendarMonth((prev) => {
+      const next = new Date(prev.year, prev.month + delta, 1);
+      return { year: next.getFullYear(), month: next.getMonth() };
+    });
+  };
+
+  const handleJumpToToday = () => {
+    const now = new Date();
+    setCalendarMonth({ year: now.getFullYear(), month: now.getMonth() });
+    setSelectedDayKey(todayKey);
+  };
+
   const handleExportCSV = () => {
     let csvContent = '';
-    if (activeTab === 'trades') {
-      csvContent = 'Ticket,Symbol,Type,Volume,OpenPrice,ClosePrice,Profit,Pips,Status,Reason,OpenTime\n';
-      for (const t of allTradesTaken) {
-        csvContent += `${t.ticket},${t.symbol || ''},${t.type},${t.volume},${t.openPrice},${t.closePrice},${t.profit},${t.pips},${t.status},${t.reason},${t.openTime}\n`;
-      }
-    } else {
+    if (activeTab === 'signals') {
       csvContent = 'ID,Timestamp,Symbol,Direction,Strategy,Timeframe,Score,Entry,SL,TP,Status,Ticket,RejectionReason\n';
       for (const s of journalSignals) {
         csvContent += `"${s.id}","${s.timestamp}","${s.symbol}","${s.direction}","${s.strategy}","${s.timeframe}",${s.score},${s.entry},${s.sl},${s.tp},"${s.status}","${s.ticket || ''}","${(s.rejectionReason || '').replace(/"/g, '""')}"\n`;
+      }
+    } else {
+      csvContent = 'Ticket,Symbol,Type,Volume,OpenPrice,ClosePrice,Profit,Pips,Status,Reason,ClosedAt\n';
+      for (const t of allTradesTaken) {
+        csvContent += `${t.ticket},${t.symbol || ''},${t.type},${t.volume},${t.openPrice},${t.closePrice},${t.profit},${t.pips},${t.status},${t.reason},${t.closedAt || t.openTime || ''}\n`;
       }
     }
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.setAttribute('download', `smc_${activeTab}_journal_${Date.now()}.csv`);
+    link.setAttribute('download', `nifty_${activeTab}_${mt5?.login || 'ledger'}_${Date.now()}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
   };
-
-  const [confirmClear, setConfirmClear] = useState(false);
 
   const handleCloseRunningTrade = (ticket: number) => {
     tradingEngine.closePosition(ticket, 'Manual');
@@ -251,235 +416,475 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
       setTimeout(() => setConfirmClear(false), 3500);
       return;
     }
-    if (activeTab === 'trades') {
-      tradingEngine.clearDailyTradesAndLogs();
-    } else {
+    if (activeTab === 'signals') {
       clearJournalSignals();
+    } else {
+      tradingEngine.clearDailyTradesAndLogs();
     }
     setConfirmClear(false);
   };
 
   if (!isOpen) return null;
 
+  const monthLabel = new Date(calendarMonth.year, calendarMonth.month, 1).toLocaleDateString(undefined, {
+    month: 'long',
+    year: 'numeric',
+  });
+
   return (
     <div
       role="dialog"
       aria-modal="true"
-      className="fixed inset-0 z-[170] flex items-center justify-center p-3 sm:p-5 bg-black/80 backdrop-blur-xs font-mono text-xs select-none animate-in fade-in duration-150"
+      aria-labelledby="trade-history-modal-title"
+      className="fixed inset-0 z-[170] flex justify-end bg-black/60 backdrop-blur-xs text-xs select-none"
     >
-      <div className="w-full max-w-4xl max-h-[90dvh] rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-200 dark:border-[#1e2230] shadow-2xl flex flex-col overflow-hidden transition-colors">
-        {/* Header: Title, Tabs and Top Close Button */}
-        <div className="px-5 py-3.5 border-b border-slate-200 dark:border-[#1e2230] flex items-center justify-between bg-slate-50/60 dark:bg-[#141722]/80 shrink-0 gap-3 flex-wrap">
-          <div className="flex items-center gap-2">
-            <History className="w-4 h-4 text-slate-700 dark:text-slate-300" />
-            <div>
-              <h2 className="font-bold text-sm text-slate-900 dark:text-white uppercase tracking-wider">
-                Trade &amp; Signal Journal
+      <div className="w-full max-w-4xl h-full ws-surface border-l shadow-2xl flex flex-col overflow-hidden">
+        {/* Clean Minimalist Header */}
+        <header className="px-5 py-3.5 ws-subtle border-b flex items-center justify-between gap-3 flex-wrap shrink-0">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <History className="w-4 h-4 text-sky-500 shrink-0" />
+            <div className="min-w-0">
+              <h2 id="trade-history-modal-title" className="font-extrabold text-sm text-slate-900 dark:text-white tracking-tight">
+                Trade History &amp; P&amp;L Calendar
               </h2>
-              <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                Synchronized with broker execution &amp; algorithmic risk filters
+              <p className="text-[11px] font-mono text-slate-500 dark:text-slate-400 truncate">
+                {isMt5Connected && mt5
+                  ? `MT5 #${mt5.login} · ${mt5.server}`
+                  : 'No MT5 account connected'}
               </p>
             </div>
           </div>
 
-          {/* Mode Switcher: Trades Taken vs Signals Audit */}
-          <div className="flex items-center bg-slate-200/70 dark:bg-[#090a0f] p-0.5 rounded-lg border border-slate-200 dark:border-[#1e2230] gap-0.5">
+          <div className="flex items-center gap-2 flex-wrap">
+            {isMt5Connected && (
+              <button
+                type="button"
+                onClick={handleSyncMt5History}
+                disabled={isSyncingMt5}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-300 dark:border-[#2b3b59] bg-white dark:bg-[#0b111d] text-[11px] font-bold text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-[#1e2d48] cursor-pointer disabled:opacity-50"
+                title="Fetch latest account trade history from MetaTrader 5"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isSyncingMt5 ? 'animate-spin text-sky-500' : 'text-sky-500'}`} />
+                <span>{isSyncingMt5 ? 'Syncing…' : 'Sync MT5'}</span>
+              </button>
+            )}
+
+            {/* Mode Switcher */}
+            <div className="flex items-center bg-slate-200/70 dark:bg-[#090d16] p-0.5 rounded-lg border border-slate-300 dark:border-[#2b3b59] gap-0.5">
+              <button
+                type="button"
+                onClick={() => setActiveTab('calendar')}
+                className={`px-3 py-1 rounded-md text-xs font-bold transition-colors cursor-pointer flex items-center gap-1.5 ${
+                  activeTab === 'calendar'
+                    ? 'bg-white text-slate-950 dark:bg-[#172238] dark:text-white shadow-2xs'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                <CalendarDays className="w-3.5 h-3.5 text-sky-500" />
+                <span>Calendar</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveTab('trades')}
+                className={`px-3 py-1 rounded-md text-xs font-bold transition-colors cursor-pointer flex items-center gap-1.5 ${
+                  activeTab === 'trades'
+                    ? 'bg-white text-slate-950 dark:bg-[#172238] dark:text-white shadow-2xs'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                <span>Trades ({totalTradesCount})</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveTab('signals')}
+                className={`px-3 py-1 rounded-md text-xs font-bold transition-colors cursor-pointer flex items-center gap-1.5 ${
+                  activeTab === 'signals'
+                    ? 'bg-white text-slate-950 dark:bg-[#172238] dark:text-white shadow-2xs'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                <span>Signals ({totalSignalsCount})</span>
+              </button>
+            </div>
+
             <button
               type="button"
-              onClick={() => setActiveTab('trades')}
-              className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
-                activeTab === 'trades'
-                  ? 'bg-white text-slate-900 dark:bg-[#1e2230] dark:text-white shadow-xs'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-              }`}
+              onClick={onClose}
+              aria-label="Close"
+              className="p-1.5 rounded-lg text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-[#1e2d48] transition-colors cursor-pointer"
             >
-              <span>Trades Taken ({totalTradesCount})</span>
-              {runningCount > 0 && (
-                <span className="text-[10px] text-emerald-500 font-bold">
-                  · {runningCount} active
-                </span>
-              )}
-            </button>
-            <button
-              type="button"
-              onClick={() => setActiveTab('signals')}
-              className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
-                activeTab === 'signals'
-                  ? 'bg-white text-slate-900 dark:bg-[#1e2230] dark:text-white shadow-xs'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-              }`}
-            >
-              <span>Signals Audit ({totalSignalsCount})</span>
+              <X className="w-4 h-4" />
             </button>
           </div>
+        </header>
 
-          <button
-            onClick={onClose}
-            className="p-1 rounded-lg text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-[#1e2230] transition-colors cursor-pointer"
-            title="Close Window"
-          >
-            <X className="w-5 h-5" />
-          </button>
-        </div>
+        {syncNotice && (
+          <div className="px-5 py-2 border-b border-slate-200 dark:border-[#2b3b59] bg-sky-500/10 text-sky-700 dark:text-sky-300 font-mono text-[11px] font-semibold">
+            {syncNotice}
+          </div>
+        )}
 
-        {/* Content Body */}
+        {/* Body */}
         <div className="flex-1 overflow-y-auto p-5 space-y-4">
-          {/* Summary Metric Strip */}
-          {activeTab === 'trades' ? (
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-center">
-              <div className="p-2.5 rounded-xl border border-slate-200 dark:border-[#1e2230] bg-slate-50/50 dark:bg-[#141722]/50">
-                <span className="text-[10px] uppercase font-bold text-slate-400 block">Total Taken</span>
-                <strong className="text-sm font-bold text-slate-900 dark:text-white tabular-nums block mt-0.5">
-                  {totalTradesCount} Orders
+          {/* Account Totals Strip */}
+          {activeTab !== 'signals' ? (
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+              <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-slate-50/70 dark:bg-[#141f35]">
+                <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400 block">Closed Trades</span>
+                <strong className="text-sm font-extrabold text-slate-900 dark:text-white tabular-nums block mt-0.5">
+                  {closedCount}
                 </strong>
               </div>
-              <div className="p-2.5 rounded-xl border border-slate-200 dark:border-[#1e2230] bg-slate-50/50 dark:bg-[#141722]/50">
-                <span className="text-[10px] uppercase font-bold text-slate-400 block">Active Running</span>
-                <strong className="text-sm font-bold text-sky-600 dark:text-sky-400 tabular-nums block mt-0.5">
-                  {runningCount} Open
+              <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-slate-50/70 dark:bg-[#141f35]">
+                <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400 block">Running</span>
+                <strong className="text-sm font-extrabold text-sky-600 dark:text-sky-400 tabular-nums block mt-0.5">
+                  {runningCount}
                 </strong>
               </div>
-              <div className="p-2.5 rounded-xl border border-slate-200 dark:border-[#1e2230] bg-slate-50/50 dark:bg-[#141722]/50">
-                <span className="text-[10px] uppercase font-bold text-slate-400 block">Win Rate (Closed)</span>
-                <strong className="text-sm font-bold text-slate-900 dark:text-white tabular-nums block mt-0.5">
+              <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-slate-50/70 dark:bg-[#141f35]">
+                <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400 block">Win Rate</span>
+                <strong className="text-sm font-extrabold text-slate-900 dark:text-white tabular-nums block mt-0.5">
                   {winRate}% ({wins}W / {closedCount - wins}L)
                 </strong>
               </div>
-              <div className="p-2.5 rounded-xl border border-slate-200 dark:border-[#1e2230] bg-slate-50/50 dark:bg-[#141722]/50">
-                <span className="text-[10px] uppercase font-bold text-slate-400 block">Realized Net P&amp;L</span>
+              <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-slate-50/70 dark:bg-[#141f35]">
+                <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400 block">Realized Net P&amp;L</span>
                 <strong
-                  className={`text-sm font-bold tabular-nums block mt-0.5 ${
+                  className={`text-sm font-extrabold tabular-nums block mt-0.5 ${
                     totalNet >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'
                   }`}
                 >
-                  {totalNet >= 0 ? '+' : ''}${totalNet.toFixed(2)} USD
+                  {totalNet >= 0 ? '+' : ''}${totalNet.toFixed(2)}
                 </strong>
               </div>
             </div>
           ) : (
-            <div className="grid grid-cols-3 gap-2.5 text-center">
-              <div className="p-2.5 rounded-xl border border-slate-200 dark:border-[#1e2230] bg-slate-50/50 dark:bg-[#141722]/50">
-                <span className="text-[10px] uppercase font-bold text-slate-400 block">Total Ingested</span>
-                <strong className="text-sm font-bold text-slate-900 dark:text-white tabular-nums block mt-0.5">
-                  {totalSignalsCount} Signals
+            <div className="grid grid-cols-3 gap-2.5">
+              <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-slate-50/70 dark:bg-[#141f35]">
+                <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400 block">Signals Logged</span>
+                <strong className="text-sm font-extrabold text-slate-900 dark:text-white tabular-nums block mt-0.5">
+                  {totalSignalsCount}
                 </strong>
               </div>
-              <div className="p-2.5 rounded-xl border border-slate-200 dark:border-[#1e2230] bg-slate-50/50 dark:bg-[#141722]/50">
-                <span className="text-[10px] uppercase font-bold text-emerald-600 dark:text-emerald-400 block">
-                  Executed by System
-                </span>
-                <strong className="text-sm font-bold text-emerald-600 dark:text-emerald-400 tabular-nums block mt-0.5">
+              <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-slate-50/70 dark:bg-[#141f35]">
+                <span className="text-[10px] uppercase font-bold text-emerald-600 dark:text-emerald-400 block">Executed</span>
+                <strong className="text-sm font-extrabold text-emerald-600 dark:text-emerald-400 tabular-nums block mt-0.5">
                   {executedSignalsCount}
                 </strong>
               </div>
-              <div className="p-2.5 rounded-xl border border-slate-200 dark:border-[#1e2230] bg-slate-50/50 dark:bg-[#141722]/50">
-                <span className="text-[10px] uppercase font-bold text-rose-600 dark:text-rose-400 block">
-                  Filtered / Blocked
-                </span>
-                <strong className="text-sm font-bold text-rose-600 dark:text-rose-400 tabular-nums block mt-0.5">
+              <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-slate-50/70 dark:bg-[#141f35]">
+                <span className="text-[10px] uppercase font-bold text-rose-600 dark:text-rose-400 block">Filtered</span>
+                <strong className="text-sm font-extrabold text-rose-600 dark:text-rose-400 tabular-nums block mt-0.5">
                   {rejectedSignalsCount}
                 </strong>
               </div>
             </div>
           )}
 
-          {/* Sub-Filters and Search Toolbar */}
-          <div className="flex items-center justify-between gap-2.5 flex-wrap">
-            <div className="flex items-center gap-1.5 flex-wrap">
-              {activeTab === 'trades' ? (
-                <>
+          {/* TAB 1: MONTHLY P&L CALENDAR */}
+          {activeTab === 'calendar' && (
+            <div className="space-y-4">
+              {/* Month Toolbar & Monthly Net Summary */}
+              <div className="flex items-center justify-between gap-3 flex-wrap p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-slate-50/60 dark:bg-[#141f35]">
+                <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => setTradeFilter('all')}
-                    className={`px-2.5 py-1 rounded text-xs font-bold transition-colors cursor-pointer ${
-                      tradeFilter === 'all'
-                        ? 'bg-slate-900 text-white dark:bg-white dark:text-black'
-                        : 'bg-slate-100 dark:bg-[#141722] text-slate-600 dark:text-slate-400 hover:text-white'
-                    }`}
+                    onClick={() => handleShiftMonth(-1)}
+                    aria-label="Previous month"
+                    className="p-1.5 rounded-lg border border-slate-300 dark:border-[#2b3b59] bg-white dark:bg-[#0b111d] text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-[#1e2d48] cursor-pointer"
                   >
-                    All ({totalTradesCount})
+                    <ChevronLeft className="w-3.5 h-3.5" />
+                  </button>
+                  <span className="font-extrabold text-sm text-slate-900 dark:text-white min-w-[140px] text-center">
+                    {monthLabel}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => handleShiftMonth(1)}
+                    aria-label="Next month"
+                    className="p-1.5 rounded-lg border border-slate-300 dark:border-[#2b3b59] bg-white dark:bg-[#0b111d] text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-[#1e2d48] cursor-pointer"
+                  >
+                    <ChevronRight className="w-3.5 h-3.5" />
                   </button>
                   <button
                     type="button"
-                    onClick={() => setTradeFilter('running')}
-                    className={`px-2.5 py-1 rounded text-xs font-bold transition-colors cursor-pointer ${
-                      tradeFilter === 'running'
-                        ? 'bg-slate-900 text-white dark:bg-white dark:text-black'
-                        : 'bg-slate-100 dark:bg-[#141722] text-slate-600 dark:text-slate-400 hover:text-white'
-                    }`}
+                    onClick={handleJumpToToday}
+                    className="px-2.5 py-1 rounded-lg border border-slate-300 dark:border-[#2b3b59] bg-white dark:bg-[#0b111d] text-[11px] font-bold text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-[#1e2d48] cursor-pointer"
                   >
-                    Running ({runningCount})
+                    Today
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => setTradeFilter('closed')}
-                    className={`px-2.5 py-1 rounded text-xs font-bold transition-colors cursor-pointer ${
-                      tradeFilter === 'closed'
-                        ? 'bg-slate-900 text-white dark:bg-white dark:text-black'
-                        : 'bg-slate-100 dark:bg-[#141722] text-slate-600 dark:text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    Closed ({closedCount})
-                  </button>
-                </>
-              ) : (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => setSignalFilter('all')}
-                    className={`px-2.5 py-1 rounded text-xs font-bold transition-colors cursor-pointer ${
-                      signalFilter === 'all'
-                        ? 'bg-slate-900 text-white dark:bg-white dark:text-black'
-                        : 'bg-slate-100 dark:bg-[#141722] text-slate-600 dark:text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    All ({totalSignalsCount})
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setSignalFilter('executed')}
-                    className={`px-2.5 py-1 rounded text-xs font-bold transition-colors cursor-pointer ${
-                      signalFilter === 'executed'
-                        ? 'bg-emerald-600 text-white'
-                        : 'bg-slate-100 dark:bg-[#141722] text-slate-600 dark:text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    Executed ({executedSignalsCount})
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setSignalFilter('rejected')}
-                    className={`px-2.5 py-1 rounded text-xs font-bold transition-colors cursor-pointer ${
-                      signalFilter === 'rejected'
-                        ? 'bg-rose-600 text-white'
-                        : 'bg-slate-100 dark:bg-[#141722] text-slate-600 dark:text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    Filtered ({rejectedSignalsCount})
-                  </button>
-                </>
-              )}
-            </div>
+                </div>
 
-            {/* Search Bar */}
-            <div className="relative min-w-[200px]">
-              <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search symbol, ticket, reason..."
-                className="w-full pl-8 pr-3 py-1 rounded-lg border border-slate-200 dark:border-[#1e2230] bg-slate-50 dark:bg-[#141722] text-slate-900 dark:text-white placeholder:text-slate-500 text-xs outline-none focus:border-slate-400"
-              />
-            </div>
-          </div>
+                <div className="flex items-center gap-4 font-mono text-xs tabular-nums flex-wrap">
+                  <span>
+                    <span className="text-slate-500 dark:text-slate-400">Month P&amp;L: </span>
+                    <strong className={monthSummary.netPnl >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}>
+                      {monthSummary.netPnl >= 0 ? '+' : ''}${monthSummary.netPnl.toFixed(2)}
+                    </strong>
+                  </span>
+                  <span className="text-slate-500 dark:text-slate-400">
+                    Days: <strong className="text-emerald-500">{monthSummary.greenDays}W</strong> /{' '}
+                    <strong className="text-rose-500">{monthSummary.redDays}L</strong>
+                  </span>
+                  <span className="text-slate-500 dark:text-slate-400">
+                    Trades: <strong className="text-slate-900 dark:text-white">{monthSummary.trades}</strong> ({monthSummary.winRate}%)
+                  </span>
+                </div>
+              </div>
 
-          {/* TAB 1: TRADES TAKEN TABLE */}
+              {/* 7-Day Calendar Grid */}
+              <div className="space-y-1.5">
+                <div className="grid grid-cols-7 gap-1.5 text-center text-[10px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                  {WEEKDAYS.map((day) => (
+                    <div key={day} className="py-1">
+                      {day}
+                    </div>
+                  ))}
+                </div>
+
+                <div className="grid grid-cols-7 gap-1.5">
+                  {calendarCells.map((cell) => {
+                    const isSelected = cell.dateKey === selectedDayKey;
+                    const isToday = cell.dateKey === todayKey;
+                    const s = cell.summary;
+                    const hasTrades = Boolean(s && s.tradeCount > 0);
+                    const isGreen = Boolean(s && s.netPnl > 0);
+                    const isRed = Boolean(s && s.netPnl < 0);
+
+                    return (
+                      <button
+                        key={cell.dateKey}
+                        type="button"
+                        onClick={() => setSelectedDayKey(cell.dateKey)}
+                        className={`min-h-[68px] sm:min-h-[76px] p-2 rounded-xl border text-left flex flex-col justify-between transition-all cursor-pointer ${
+                          !cell.inMonth ? 'opacity-40' : ''
+                        } ${
+                          hasTrades
+                            ? isGreen
+                              ? 'bg-emerald-500/10 border-emerald-500/40 hover:border-emerald-400'
+                              : isRed
+                                ? 'bg-rose-500/10 border-rose-500/40 hover:border-rose-400'
+                                : 'bg-slate-200/50 dark:bg-[#172238] border-slate-300 dark:border-[#374a6d]'
+                            : 'bg-white dark:bg-[#0d1424] border-slate-200 dark:border-[#23314c] hover:border-slate-400 dark:hover:border-[#3b527a]'
+                        } ${
+                          isSelected
+                            ? 'ring-2 ring-sky-500 border-sky-500'
+                            : isToday
+                              ? 'ring-1 ring-sky-500/50'
+                              : ''
+                        }`}
+                      >
+                        <div className="flex items-center justify-between w-full">
+                          <span
+                            className={`text-[11px] font-bold tabular-nums ${
+                              isToday
+                                ? 'text-sky-600 dark:text-sky-400'
+                                : 'text-slate-600 dark:text-slate-300'
+                            }`}
+                          >
+                            {cell.dayNum}
+                          </span>
+                          {hasTrades && s && (
+                            <span className="text-[10px] font-mono font-semibold text-slate-500 dark:text-slate-400 tabular-nums">
+                              {s.tradeCount}t
+                            </span>
+                          )}
+                        </div>
+
+                        {hasTrades && s ? (
+                          <div className="space-y-0.5 mt-1">
+                            <div
+                              className={`font-mono text-xs font-extrabold tabular-nums truncate ${
+                                isGreen
+                                  ? 'text-emerald-600 dark:text-emerald-400'
+                                  : isRed
+                                    ? 'text-rose-600 dark:text-rose-400'
+                                    : 'text-slate-700 dark:text-slate-200'
+                              }`}
+                            >
+                              {formatCompactMoney(s.netPnl)}
+                            </div>
+                            <div className="text-[10px] font-mono text-slate-500 dark:text-slate-400 tabular-nums">
+                              {s.winCount}W/{s.lossCount}L
+                            </div>
+                          </div>
+                        ) : (
+                          <span className="text-[10px] text-slate-300 dark:text-slate-700">—</span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Selected Day Drilldown Ledger */}
+              <div className="rounded-xl border border-slate-200 dark:border-[#2b3b59] overflow-hidden">
+                <div className="px-4 py-2.5 ws-subtle border-b flex items-center justify-between gap-2 flex-wrap">
+                  <div className="flex items-center gap-2.5 flex-wrap">
+                    <span className="font-extrabold text-xs text-slate-900 dark:text-white">
+                      {new Date(`${selectedDayKey}T12:00:00`).toLocaleDateString(undefined, {
+                        weekday: 'short',
+                        month: 'short',
+                        day: 'numeric',
+                        year: 'numeric',
+                      })}
+                    </span>
+                    {selectedDaySummary ? (
+                      <span
+                        className={`font-mono font-extrabold text-xs tabular-nums ${
+                          selectedDaySummary.netPnl >= 0
+                            ? 'text-emerald-600 dark:text-emerald-400'
+                            : 'text-rose-600 dark:text-rose-400'
+                        }`}
+                      >
+                        {selectedDaySummary.netPnl >= 0 ? '+' : ''}${selectedDaySummary.netPnl.toFixed(2)} USD ·{' '}
+                        {selectedDaySummary.tradeCount} trades ({selectedDaySummary.winCount}W / {selectedDaySummary.lossCount}L)
+                      </span>
+                    ) : (
+                      <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                        No closed trades on this date
+                      </span>
+                    )}
+                  </div>
+
+                  {onOpenDailyReport && (
+                    <button
+                      type="button"
+                      onClick={() => onOpenDailyReport(selectedDayKey)}
+                      className="text-[11px] font-bold text-sky-600 dark:text-sky-400 hover:underline cursor-pointer"
+                    >
+                      Open Daily Report →
+                    </button>
+                  )}
+                </div>
+
+                {selectedDaySummary && selectedDaySummary.trades.length > 0 && (
+                  <div className="overflow-x-auto max-h-56">
+                    <table className="w-full text-left border-collapse text-xs">
+                      <thead className="bg-slate-50 dark:bg-[#0d1424] border-b border-slate-200 dark:border-[#2b3b59] text-[10px] text-slate-500 dark:text-slate-400 uppercase">
+                        <tr>
+                          <th className="py-2 px-3">Ticket / Time</th>
+                          <th className="py-2 px-2">Pair</th>
+                          <th className="py-2 px-2">Side &amp; Lots</th>
+                          <th className="py-2 px-2">Entry → Exit</th>
+                          <th className="py-2 px-2">Reason</th>
+                          <th className="py-2 px-3 text-right">Net P&amp;L</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100 dark:divide-[#23314c] font-mono">
+                        {selectedDaySummary.trades.map((t) => {
+                          const sym = (t.symbol || 'XAUUSD') as SupportedSymbol;
+                          const d = getInstrumentConfig(sym).digits;
+                          return (
+                            <tr key={`${t.ticket}_${t.closedAt || t.closeTime}`} className="hover:bg-slate-50 dark:hover:bg-[#172238]/60">
+                              <td className="py-2 px-3">
+                                <span className="font-bold text-slate-900 dark:text-white">#{t.ticket}</span>
+                                <span className="block text-[10px] text-slate-400">{t.closeTime || formatTradeTimeLabel(t)}</span>
+                              </td>
+                              <td className="py-2 px-2 font-bold text-slate-800 dark:text-slate-200">{t.symbol || '—'}</td>
+                              <td className="py-2 px-2">
+                                <span className={`font-bold ${t.type === 'BUY' ? 'text-emerald-500' : 'text-rose-500'}`}>
+                                  {t.type}
+                                </span>{' '}
+                                <span className="text-slate-500 dark:text-slate-400">{t.volume}L</span>
+                              </td>
+                              <td className="py-2 px-2 tabular-nums text-slate-700 dark:text-slate-300">
+                                {t.openPrice.toFixed(d)} → {t.closePrice.toFixed(d)}
+                              </td>
+                              <td className="py-2 px-2 font-sans text-[11px] text-slate-500 dark:text-slate-400">
+                                {t.reason}
+                              </td>
+                              <td className="py-2 px-3 text-right font-extrabold tabular-nums">
+                                <span className={t.profit >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}>
+                                  {t.profit >= 0 ? '+' : ''}${t.profit.toFixed(2)}
+                                </span>
+                                <span className="block text-[10px] font-normal text-slate-400">
+                                  {t.pips >= 0 ? '+' : ''}{t.pips.toFixed(1)} pips
+                                </span>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Sub-Filters and Search Toolbar for Trades / Signals */}
+          {activeTab !== 'calendar' && (
+            <div className="flex items-center justify-between gap-2.5 flex-wrap">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                {activeTab === 'trades' ? (
+                  <>
+                    {(
+                      [
+                        { id: 'all', label: `All (${totalTradesCount})` },
+                        { id: 'running', label: `Running (${runningCount})` },
+                        { id: 'closed', label: `Closed (${closedCount})` },
+                      ] as const
+                    ).map((f) => (
+                      <button
+                        key={f.id}
+                        type="button"
+                        onClick={() => setTradeFilter(f.id)}
+                        className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-colors cursor-pointer ${
+                          tradeFilter === f.id
+                            ? 'bg-slate-900 text-white dark:bg-sky-500 dark:text-slate-950'
+                            : 'bg-slate-100 dark:bg-[#141f35] text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
+                        }`}
+                      >
+                        {f.label}
+                      </button>
+                    ))}
+                  </>
+                ) : (
+                  <>
+                    {(
+                      [
+                        { id: 'all', label: `All (${totalSignalsCount})`, activeClass: 'bg-slate-900 text-white dark:bg-sky-500 dark:text-slate-950' },
+                        { id: 'executed', label: `Executed (${executedSignalsCount})`, activeClass: 'bg-emerald-600 text-white' },
+                        { id: 'rejected', label: `Filtered (${rejectedSignalsCount})`, activeClass: 'bg-rose-600 text-white' },
+                      ] as const
+                    ).map((f) => (
+                      <button
+                        key={f.id}
+                        type="button"
+                        onClick={() => setSignalFilter(f.id)}
+                        className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-colors cursor-pointer ${
+                          signalFilter === f.id
+                            ? f.activeClass
+                            : 'bg-slate-100 dark:bg-[#141f35] text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
+                        }`}
+                      >
+                        {f.label}
+                      </button>
+                    ))}
+                  </>
+                )}
+              </div>
+
+              <div className="relative min-w-[210px]">
+                <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Search symbol, ticket, reason..."
+                  className="w-full pl-8 pr-3 py-1.5 rounded-lg border border-slate-300 dark:border-[#2b3b59] bg-slate-50 dark:bg-[#0d1424] text-slate-900 dark:text-white placeholder:text-slate-500 text-xs outline-none focus:border-sky-500"
+                />
+              </div>
+            </div>
+          )}
+
+          {/* TAB 2: TRADES TABLE */}
           {activeTab === 'trades' && (
-            <div className="rounded-xl border border-slate-200 dark:border-[#1e2230] overflow-x-auto max-h-[420px]">
+            <div className="rounded-xl border border-slate-200 dark:border-[#2b3b59] overflow-x-auto max-h-[440px]">
               {filteredTrades.length > 0 ? (
                 <table className="w-full text-left border-collapse text-xs">
-                  <thead className="sticky top-0 bg-slate-50 dark:bg-[#090a0f] border-b border-slate-200 dark:border-[#1e2230] text-[10px] text-slate-400 uppercase z-10">
+                  <thead className="sticky top-0 bg-slate-50 dark:bg-[#0d1424] border-b border-slate-200 dark:border-[#2b3b59] text-[10px] text-slate-500 dark:text-slate-400 uppercase z-10">
                     <tr>
                       <th className="py-2.5 px-3">Ticket / Time</th>
                       <th className="py-2.5 px-2">Instrument</th>
@@ -489,47 +894,41 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
                       <th className="py-2.5 px-3 text-right">Net P&amp;L</th>
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-slate-100 dark:divide-[#1e2230]">
+                  <tbody className="divide-y divide-slate-100 dark:divide-[#23314c]">
                     {filteredTrades.map((t) => {
                       const isRunning = t.status === 'RUNNING';
+                      const sym = (t.symbol || 'XAUUSD') as SupportedSymbol;
+                      const d = getInstrumentConfig(sym).digits;
                       return (
                         <tr
-                          key={`${t.ticket}_${t.openTime}`}
-                          className="hover:bg-slate-50 dark:hover:bg-[#141722]/50 transition-colors"
+                          key={`${t.ticket}_${t.closedAt || t.openTime || 'row'}`}
+                          className="hover:bg-slate-50 dark:hover:bg-[#172238]/60 transition-colors"
                         >
-                          <td className="py-2.5 px-3">
-                            <span className="font-bold text-slate-900 dark:text-slate-200 block">
+                          <td className="py-2.5 px-3 font-mono">
+                            <span className="font-bold text-slate-900 dark:text-slate-100 block">
                               #{t.ticket}
                             </span>
                             <span className="text-[10px] text-slate-400 block">
-                              {t.openTime ? new Date(t.openTime).toLocaleTimeString() : 'N/A'}
+                              {formatTradeTimeLabel(t)}
                             </span>
                           </td>
                           <td className="py-2.5 px-2 font-bold text-slate-800 dark:text-slate-200">
-                            {t.symbol || 'XAUUSD'}
+                            {t.symbol || '—'}
                           </td>
-                          <td className="py-2.5 px-2">
-                            <span
-                              className={`font-bold ${
-                                t.type === 'BUY' ? 'text-emerald-500' : 'text-rose-500'
-                              }`}
-                            >
+                          <td className="py-2.5 px-2 font-mono">
+                            <span className={`font-bold ${t.type === 'BUY' ? 'text-emerald-500' : 'text-rose-500'}`}>
                               {t.type}
                             </span>{' '}
                             <span className="text-slate-400">{t.volume}L</span>
                           </td>
-                          <td className="py-2.5 px-2 text-slate-700 dark:text-slate-300 tabular-nums">
-                            {(() => {
-                              const symCfg = getInstrumentConfig((t.symbol || 'XAUUSD') as SupportedSymbol);
-                              const d = symCfg.digits;
-                              return isRunning ? (
-                                <span>@ ${t.openPrice.toFixed(d)}</span>
-                              ) : (
-                                <span>
-                                  ${t.openPrice.toFixed(d)} → ${t.closePrice.toFixed(d)}
-                                </span>
-                              );
-                            })()}
+                          <td className="py-2.5 px-2 font-mono text-slate-700 dark:text-slate-300 tabular-nums">
+                            {isRunning ? (
+                              <span>@ {t.openPrice.toFixed(d)}</span>
+                            ) : (
+                              <span>
+                                {t.openPrice.toFixed(d)} → {t.closePrice.toFixed(d)}
+                              </span>
+                            )}
                           </td>
                           <td className="py-2.5 px-2">
                             {isRunning ? (
@@ -540,8 +939,7 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
                                 <button
                                   type="button"
                                   onClick={() => handleCloseRunningTrade(t.ticket)}
-                                  className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/40 text-rose-500 transition-colors cursor-pointer"
-                                  title="Close this trade at market"
+                                  className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-rose-500/15 hover:bg-rose-500/25 text-rose-500 transition-colors cursor-pointer"
                                 >
                                   Close
                                 </button>
@@ -552,14 +950,8 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
                               </span>
                             )}
                           </td>
-                          <td className="py-2.5 px-3 text-right font-bold tabular-nums">
-                            <span
-                              className={
-                                t.profit >= 0
-                                  ? 'text-emerald-600 dark:text-emerald-400'
-                                  : 'text-rose-600 dark:text-rose-400'
-                              }
-                            >
+                          <td className="py-2.5 px-3 text-right font-mono font-bold tabular-nums">
+                            <span className={t.profit >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}>
                               {t.profit >= 0 ? '+' : ''}${t.profit.toFixed(2)}
                             </span>
                             <span className="text-[10px] text-slate-400 block font-normal">
@@ -574,22 +966,24 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
               ) : (
                 <div className="py-12 text-center text-slate-400 space-y-1">
                   <span className="font-bold text-xs uppercase tracking-wider block">
-                    No matching trade records
+                    {isMt5Connected ? 'No matching trade records' : 'No MT5 Account Connected'}
                   </span>
                   <span className="text-[11px] block">
-                    Executed trades and active positions will automatically log here
+                    {isMt5Connected
+                      ? `No trades found for MT5 #${mt5?.login} matching the current filter.`
+                      : 'Connect your MetaTrader 5 account to sync and view its actual trade history.'}
                   </span>
                 </div>
               )}
             </div>
           )}
 
-          {/* TAB 2: SIGNALS AUDIT TABLE */}
+          {/* TAB 3: SIGNALS AUDIT TABLE */}
           {activeTab === 'signals' && (
-            <div className="rounded-xl border border-slate-200 dark:border-[#1e2230] overflow-x-auto max-h-[420px]">
+            <div className="rounded-xl border border-slate-200 dark:border-[#2b3b59] overflow-x-auto max-h-[440px]">
               {filteredSignals.length > 0 ? (
                 <table className="w-full text-left border-collapse text-xs">
-                  <thead className="sticky top-0 bg-slate-50 dark:bg-[#090a0f] border-b border-slate-200 dark:border-[#1e2230] text-[10px] text-slate-400 uppercase z-10">
+                  <thead className="sticky top-0 bg-slate-50 dark:bg-[#0d1424] border-b border-slate-200 dark:border-[#2b3b59] text-[10px] text-slate-500 dark:text-slate-400 uppercase z-10">
                     <tr>
                       <th className="py-2.5 px-3">Time / Pair</th>
                       <th className="py-2.5 px-2">Setup</th>
@@ -598,58 +992,49 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
                       <th className="py-2.5 px-3">Audit Outcome / Reason</th>
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-slate-100 dark:divide-[#1e2230]">
+                  <tbody className="divide-y divide-slate-100 dark:divide-[#23314c]">
                     {filteredSignals.map((sig) => {
                       const isExecuted = sig.status === 'EXECUTED';
+                      const d = getInstrumentConfig(sig.symbol as SupportedSymbol).digits;
                       return (
                         <tr
                           key={sig.id}
-                          className="hover:bg-slate-50 dark:hover:bg-[#141722]/50 transition-colors"
+                          className="hover:bg-slate-50 dark:hover:bg-[#172238]/60 transition-colors"
                         >
                           <td className="py-2.5 px-3">
-                            <span className="font-bold text-slate-900 dark:text-slate-200 block">
+                            <span className="font-bold text-slate-900 dark:text-slate-100 block">
                               {sig.symbol}
                             </span>
-                            <span className="text-[10px] text-slate-400 block">
+                            <span className="text-[10px] font-mono text-slate-400 block">
                               {new Date(sig.timestamp).toLocaleTimeString()}
                             </span>
                           </td>
                           <td className="py-2.5 px-2">
-                            <span
-                              className={`font-bold ${
-                                sig.direction === 'BUY' ? 'text-emerald-500' : 'text-rose-500'
-                              }`}
-                            >
+                            <span className={`font-bold ${sig.direction === 'BUY' ? 'text-emerald-500' : 'text-rose-500'}`}>
                               {sig.direction}
                             </span>{' '}
                             <span className="text-slate-700 dark:text-slate-300 font-medium">
                               {sig.strategy}
                             </span>
-                            <span className="text-[10px] text-slate-400 block">
-                              Score: {sig.score} • {sig.timeframe}
+                            <span className="text-[10px] text-slate-400 block font-mono">
+                              Score: {sig.score} · {sig.timeframe}
                             </span>
                           </td>
-                          <td className="py-2.5 px-2 tabular-nums text-slate-700 dark:text-slate-300 text-[11px]">
-                            <div>E: ${sig.entry.toFixed(2)}</div>
+                          <td className="py-2.5 px-2 font-mono tabular-nums text-slate-700 dark:text-slate-300 text-[11px]">
+                            <div>E: {sig.entry.toFixed(d)}</div>
                             <div className="text-slate-400">
-                              SL: ${sig.sl.toFixed(2)} | TP: ${sig.tp.toFixed(2)}
+                              SL: {sig.sl.toFixed(d)} | TP: {sig.tp.toFixed(d)}
                             </div>
                           </td>
                           <td className="py-2.5 px-2">
-                            {isExecuted ? (
-                              <span className="text-emerald-600 dark:text-emerald-400 font-bold text-[11px]">
-                                EXECUTED
-                              </span>
-                            ) : (
-                              <span className="text-rose-600 dark:text-rose-400 font-bold text-[11px]">
-                                REJECTED
-                              </span>
-                            )}
+                            <span className={`font-bold text-[11px] ${isExecuted ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>
+                              {isExecuted ? 'EXECUTED' : 'REJECTED'}
+                            </span>
                           </td>
                           <td className="py-2.5 px-3">
                             {isExecuted ? (
                               <div className="text-emerald-600 dark:text-emerald-400 font-medium">
-                                Filled Order #{sig.ticket || 'sim'} ({sig.volume || 0.01}L)
+                                Order #{sig.ticket || '—'} ({sig.volume || 0.01}L)
                               </div>
                             ) : (
                               <div className="text-rose-600 dark:text-rose-400 font-medium">
@@ -657,7 +1042,7 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
                               </div>
                             )}
                             {sig.rationale && (
-                              <span className="text-[10px] text-slate-400 line-clamp-1 mt-0.5">
+                              <span className="text-[10px] text-slate-400 line-clamp-1 mt-0.5 block">
                                 {sig.rationale}
                               </span>
                             )}
@@ -670,10 +1055,10 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
               ) : (
                 <div className="py-12 text-center text-slate-400 space-y-1">
                   <span className="font-bold text-xs uppercase tracking-wider block">
-                    No matching signal records
+                    No signal records
                   </span>
                   <span className="text-[11px] block">
-                    All processed signals (executed and rejected) will be recorded here
+                    Confirmed and filtered signals for the connected account appear here.
                   </span>
                 </div>
               )}
@@ -681,33 +1066,24 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
           )}
         </div>
 
-        {/* Footer: Bottom Controls and Actions */}
-        <div className="p-4 border-t border-slate-200 dark:border-[#1e2230] bg-slate-50/60 dark:bg-[#141722]/80 flex items-center justify-between gap-3 flex-wrap shrink-0">
-          <div className="flex items-center gap-2">
-            <button
-              onClick={onClose}
-              className="px-3 py-1.5 rounded-lg text-xs font-bold text-slate-700 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white bg-slate-200/80 hover:bg-slate-200 dark:bg-[#1e2230] transition-colors cursor-pointer flex items-center gap-1.5"
-            >
-              <ArrowLeft className="w-3.5 h-3.5" />
-              <span>Back</span>
-            </button>
-
-            <button
-              onClick={handleExportCSV}
-              className="px-3 py-1.5 rounded-lg text-xs font-bold text-slate-700 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white bg-slate-200/80 hover:bg-slate-200 dark:bg-[#1e2230] transition-colors cursor-pointer flex items-center gap-1.5"
-              title="Download Journal data as CSV"
-            >
-              <Download className="w-3.5 h-3.5" />
-              <span>Export CSV</span>
-            </button>
-          </div>
+        {/* Clean Footer */}
+        <footer className="px-5 py-3.5 ws-subtle border-t flex items-center justify-between gap-3 flex-wrap shrink-0">
+          <button
+            type="button"
+            onClick={handleExportCSV}
+            disabled={(activeTab === 'signals' ? journalSignals.length : allTradesTaken.length) === 0}
+            className="px-3 py-1.5 rounded-lg text-xs font-bold text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-[#2b3b59] bg-white dark:bg-[#0b111d] hover:bg-slate-100 dark:hover:bg-[#1e2d48] transition-colors cursor-pointer flex items-center gap-1.5 disabled:opacity-40"
+          >
+            <Download className="w-3.5 h-3.5" />
+            <span>Export CSV</span>
+          </button>
 
           <div className="flex items-center gap-2">
-            {activeTab === 'trades' && runningCount > 0 && (
+            {activeTab !== 'signals' && runningCount > 0 && (
               <button
+                type="button"
                 onClick={handleCloseAllRunningTrades}
-                className="px-3 py-1.5 rounded-lg text-xs font-bold bg-amber-500/10 hover:bg-amber-500/20 text-amber-600 dark:text-amber-400 border border-amber-500/30 transition-colors cursor-pointer flex items-center gap-1.5"
-                title="Close and reconcile all running positions"
+                className="px-3 py-1.5 rounded-lg text-xs font-bold bg-amber-500/15 hover:bg-amber-500/25 text-amber-600 dark:text-amber-400 border border-amber-500/30 transition-colors cursor-pointer flex items-center gap-1.5"
               >
                 <Zap className="w-3.5 h-3.5 fill-current" />
                 <span>Close All ({runningCount})</span>
@@ -715,26 +1091,27 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
             )}
 
             <button
+              type="button"
               onClick={handleClearCurrent}
               className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors cursor-pointer flex items-center gap-1.5 ${
                 confirmClear
                   ? 'bg-rose-600 text-white'
                   : 'text-rose-600 dark:text-rose-400 hover:bg-rose-500/10'
               }`}
-              title="Clear journal history for current view"
             >
               <Trash2 className="w-3.5 h-3.5" />
-              <span>{confirmClear ? 'Confirm Clear?' : `Clear ${activeTab === 'trades' ? 'Trades' : 'Signals'}`}</span>
+              <span>{confirmClear ? 'Confirm Clear?' : `Clear ${activeTab === 'signals' ? 'Signals' : 'Cache'}`}</span>
             </button>
 
             <button
+              type="button"
               onClick={onClose}
               className="px-4 py-1.5 rounded-lg text-xs font-bold bg-slate-900 text-white dark:bg-white dark:text-slate-950 transition-colors cursor-pointer"
             >
               Done
             </button>
           </div>
-        </div>
+        </footer>
       </div>
     </div>
   );

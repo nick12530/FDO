@@ -15,7 +15,7 @@
 
 import { Candle, VolumeMetrics } from '../types/smc';
 
-export function calculateRVOL(candles: Candle[], lookback: number = 20): VolumeMetrics {
+export function calculateRVOL(candles: Candle[], lookback: number = 20, digits: number = 2): VolumeMetrics {
   if (candles.length === 0) {
     return {
       currentVolume: 0,
@@ -40,7 +40,7 @@ export function calculateRVOL(candles: Candle[], lookback: number = 20): VolumeM
   const rawRvol = avgVol > 0 ? curVol / avgVol : 1.0;
   const rvol = Number(rawRvol.toFixed(2));
 
-  const totalRange = Math.max(0.0001, latest.high - latest.low);
+  const totalRange = Math.max(1e-7, latest.high - latest.low);
   const body = Math.abs(latest.close - latest.open);
   const upperWick = latest.high - Math.max(latest.open, latest.close);
   const lowerWick = Math.min(latest.open, latest.close) - latest.low;
@@ -61,13 +61,13 @@ export function calculateRVOL(candles: Candle[], lookback: number = 20): VolumeM
   // Calculate Cumulative Volume Delta (CVD) proxy over the last 20 bars
   let cvdDelta = 0;
   for (const c of candles.slice(-20)) {
-    const barRange = Math.max(0.0001, c.high - c.low);
+    const barRange = Math.max(1e-7, c.high - c.low);
     const barDeltaRatio = (c.close - c.open) / barRange; // -1.0 to +1.0
     cvdDelta += (c.volume || 1) * barDeltaRatio;
   }
 
   // Calculate Point of Control (POC) - price bin with maximum tick volume
-  const pocPrice = calculatePOC(candles.slice(-20));
+  const pocPrice = calculatePOC(candles.slice(-20), 15, digits);
 
   return {
     currentVolume: curVol,
@@ -84,7 +84,7 @@ export function calculateRVOL(candles: Candle[], lookback: number = 20): VolumeM
 /**
  * Calculates the Point of Control (POC) price level where maximum volume occurred.
  */
-function calculatePOC(candles: Candle[], bins: number = 15): number | undefined {
+function calculatePOC(candles: Candle[], bins: number = 15, digits: number = 2): number | undefined {
   if (candles.length < 5) return undefined;
   let minPrice = Infinity;
   let maxPrice = -Infinity;
@@ -114,7 +114,7 @@ function calculatePOC(candles: Candle[], bins: number = 15): number | undefined 
     }
   }
 
-  return Number((minPrice + (maxVolIdx + 0.5) * binSize).toFixed(2));
+  return Number((minPrice + (maxVolIdx + 0.5) * binSize).toFixed(digits));
 }
 
 export interface VolumeConfluenceResult {
@@ -128,9 +128,10 @@ export interface VolumeConfluenceResult {
  */
 export function evaluateVolumeConfluence(
   candles: Candle[],
-  direction: 'BUY' | 'SELL'
+  direction: 'BUY' | 'SELL',
+  digits: number = 2
 ): VolumeConfluenceResult {
-  const metrics = calculateRVOL(candles, 20);
+  const metrics = calculateRVOL(candles, 20, digits);
   const reasons: string[] = [];
   let scoreBonus = 0;
 
@@ -153,11 +154,13 @@ export function evaluateVolumeConfluence(
     reasons.push('Institutional Absorption: High-volume rejection wick shows limit orders soaking up counter-liquidity (+0.5)');
   }
 
-  // CVD alignment check
+  // Relative CVD alignment check (works on both low-tick FX brokers and high-volume metals)
+  const totalVol20 = Math.max(1, candles.slice(-20).reduce((sum, c) => sum + (c.volume || 1), 0));
+  const cvdRatio = Math.abs(metrics.cvdDelta) / totalVol20;
   const cvdAligned = (direction === 'BUY' && metrics.cvdDelta > 0) || (direction === 'SELL' && metrics.cvdDelta < 0);
-  if (cvdAligned && Math.abs(metrics.cvdDelta) > 500) {
+  if (cvdAligned && (cvdRatio >= 0.12 || Math.abs(metrics.cvdDelta) > 500)) {
     scoreBonus += 0.25;
-    reasons.push(`Cumulative Volume Delta (+${metrics.cvdDelta > 0 ? '+' : ''}${metrics.cvdDelta}) aligns with ${direction} momentum (+0.25)`);
+    reasons.push(`Cumulative Volume Delta (${metrics.cvdDelta > 0 ? '+' : ''}${metrics.cvdDelta}, ${(cvdRatio * 100).toFixed(0)}% net bias) aligns with ${direction} momentum (+0.25)`);
   }
 
   return {

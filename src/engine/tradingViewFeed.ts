@@ -50,17 +50,11 @@ class TradingViewFeedService {
   private pollInterval: any = null;
   private isFetching = false;
 
-  constructor() {
-    this.startFeed();
-  }
-
   public startFeed() {
     if (typeof window === 'undefined') return;
 
-    // Immediate first fetch
     this.fetchTradingViewData();
 
-    // Regular polling every 5 seconds to keep signals in sync with TradingView
     if (!this.pollInterval) {
       this.pollInterval = setInterval(() => {
         this.fetchTradingViewData();
@@ -93,7 +87,6 @@ class TradingViewFeedService {
     this.isFetching = true;
 
     try {
-      // 1. Fetch Forex pairs (EURUSD, GBPUSD, USDJPY) from TradingView forex scanner
       const forexPromise = fetch('https://scanner.tradingview.com/forex/scan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -103,7 +96,6 @@ class TradingViewFeedService {
         }),
       }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
 
-      // 2. Fetch Gold (XAUUSD) from TradingView CFD/Metals scanner
       const goldPromise = fetch('https://scanner.tradingview.com/cfd/scan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -118,22 +110,21 @@ class TradingViewFeedService {
       const now = Date.now();
       let updatedAny = false;
 
-      // Parse Gold
       if (goldData && Array.isArray(goldData.data) && goldData.data.length > 0) {
         const item = goldData.data[0];
         if (item && Array.isArray(item.d)) {
           const [close, change, bid, ask, high, low, volume] = item.d;
-          if (typeof close === 'number' && close > 0) {
+          if (typeof close === 'number' && close > 0 && typeof bid === 'number' && bid > 0 && typeof ask === 'number' && ask >= bid) {
             this.state.quotes.XAUUSD = {
               symbol: 'XAUUSD',
               ticker: item.s || 'OANDA:XAUUSD',
               price: close,
-              bid: typeof bid === 'number' && bid > 0 ? bid : close - 0.15,
-              ask: typeof ask === 'number' && ask > 0 ? ask : close + 0.15,
-              high24h: high || close + 15,
-              low24h: low || close - 15,
-              volume: volume || 10000,
-              changePercent: change || 0,
+              bid,
+              ask,
+              high24h: typeof high === 'number' ? high : close,
+              low24h: typeof low === 'number' ? low : close,
+              volume: typeof volume === 'number' ? volume : 0,
+              changePercent: typeof change === 'number' ? change : 0,
               timestamp: now,
               source: 'tradingview_scanner',
             };
@@ -142,7 +133,6 @@ class TradingViewFeedService {
         }
       }
 
-      // Parse Forex
       if (forexData && Array.isArray(forexData.data)) {
         for (const item of forexData.data) {
           if (!item || !Array.isArray(item.d)) continue;
@@ -154,17 +144,17 @@ class TradingViewFeedService {
           else if (item.s?.includes('GBPUSD')) targetSym = 'GBPUSD';
           else if (item.s?.includes('USDJPY')) targetSym = 'USDJPY';
 
-          if (targetSym) {
+          if (targetSym && typeof bid === 'number' && bid > 0 && typeof ask === 'number' && ask >= bid) {
             this.state.quotes[targetSym] = {
               symbol: targetSym,
               ticker: item.s,
               price: close,
-              bid: typeof bid === 'number' && bid > 0 ? bid : close,
-              ask: typeof ask === 'number' && ask > 0 ? ask : close,
-              high24h: high || close * 1.005,
-              low24h: low || close * 0.995,
-              volume: volume || 50000,
-              changePercent: change || 0,
+              bid,
+              ask,
+              high24h: typeof high === 'number' ? high : close,
+              low24h: typeof low === 'number' ? low : close,
+              volume: typeof volume === 'number' ? volume : 0,
+              changePercent: typeof change === 'number' ? change : 0,
               timestamp: now,
               source: 'tradingview_scanner',
             };
@@ -192,7 +182,7 @@ class TradingViewFeedService {
   }
 
   /**
-   * Fetches real M1/M5/M15 candlestick bars from verified interbank feeds matching TradingView's prices.
+   * Fetches real M1/M5/M15 candlestick bars from liquid public feeds where exact symbol mapping exists.
    */
   public async fetchHistoricalCandles(
     symbol: SupportedSymbol,
@@ -208,10 +198,11 @@ class TradingViewFeedService {
     };
     const binanceInterval = intervalMap[timeframe] || '5m';
 
-    // Pair mapping to liquid interbank markets
-    let pairCode = 'PAXGUSDT';
-    if (symbol === 'EURUSD') pairCode = 'EURUSDT';
+    let pairCode: string | null = null;
+    if (symbol === 'XAUUSD') pairCode = 'PAXGUSDT';
+    else if (symbol === 'EURUSD') pairCode = 'EURUSDT';
     else if (symbol === 'GBPUSD') pairCode = 'GBPUSDT';
+    if (!pairCode) return null;
 
     try {
       const res = await fetch(

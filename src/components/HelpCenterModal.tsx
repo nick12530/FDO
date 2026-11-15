@@ -94,10 +94,10 @@ export const HelpCenterModal: React.FC<HelpCenterModalProps> = ({
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-[170] flex items-center justify-center p-3 sm:p-5 bg-black/80 backdrop-blur-xs font-mono text-xs select-none animate-in fade-in duration-150">
-      <div className="w-full max-w-4xl max-h-[90dvh] rounded-2xl bg-white dark:bg-[#0f1118] border border-slate-200 dark:border-[#1e2230] shadow-2xl flex flex-col overflow-hidden transition-colors">
+    <div className="fixed inset-0 z-[170] flex justify-end bg-black/55 backdrop-blur-xs text-xs select-none">
+      <div className="w-full max-w-3xl h-full ws-surface border-l shadow-2xl flex flex-col overflow-hidden">
         {/* Header */}
-        <div className="px-5 py-3.5 border-b border-slate-200 dark:border-[#1e2230] flex items-center justify-between bg-slate-50/60 dark:bg-[#141722]/80 shrink-0 gap-3">
+        <div className="px-5 py-4 ws-subtle border-b flex items-center justify-between shrink-0 gap-3">
           <div className="flex items-center gap-2">
             <BookOpen className="w-4 h-4 text-slate-700 dark:text-slate-300" />
             <div>

@@ -1,93 +1,36 @@
 /**
  * newsSentimentEngine.ts - Real-Time Financial News & Market Catalyst Engine
  *
- * Fetches real-time financial news from live API / RSS endpoints (MarketWatch, Dow Jones, Financial Feeds).
- * Evaluates market sentiment and catalyst classification via high-speed, deterministic
- * rule-based NLP dictionary scoring (zero external LLM dependencies or API key limits).
+ * Fetches real-time financial news exclusively from live RSS / backend endpoints
+ * (Vite /api/live-news relay and MT5 bridge /api/live-news).
+ * Starts empty with zero mock/hardcoded headlines.
  */
 
 import { NewsSentimentItem } from '../types/smc';
 import { SupportedSymbol } from './instrumentConfig';
 import { mt5Bridge } from './mt5Bridge';
 
-// Initial verified live institutional headlines
-export const INITIAL_HEADLINES: NewsSentimentItem[] = [
-  {
-    id: 'news-init-1',
-    title: 'Federal Reserve Reiterates Data-Dependent Path as Core Inflation Stays Sticky',
-    source: 'MarketWatch / Dow Jones',
-    publishedAt: new Date(Date.now() - 15 * 60 * 1000).toISOString(),
-    sentimentScore: 0.45,
-    urgency: 'BREAKING',
-    catalystType: 'CENTRAL_BANK',
-    affectedAssets: ['USD', 'XAUUSD', 'EURUSD'],
-    summary: 'Fed officials signal rates may remain elevated longer to combat persistent services inflation, supporting the US dollar index.',
-    link: 'https://www.marketwatch.com',
-  },
-  {
-    id: 'news-init-2',
-    title: 'Middle East Geopolitical Tensions Escalate; Safe-Haven Inflows Drive Gold Bid',
-    source: 'Financial Feeds',
-    publishedAt: new Date(Date.now() - 32 * 60 * 1000).toISOString(),
-    sentimentScore: 0.75,
-    urgency: 'FLASH',
-    catalystType: 'GEOPOLITICAL',
-    affectedAssets: ['XAUUSD', 'USD'],
-    summary: 'Increased regional tensions trigger sovereign accumulation in Gold bullion and precious metals safe-haven hedges.',
-    link: 'https://www.marketwatch.com',
-  },
-  {
-    id: 'news-init-3',
-    title: 'ECB Monitors Disinflationary Trend Amid Sluggish European Manufacturing PMI',
-    source: 'Dow Jones Wires',
-    publishedAt: new Date(Date.now() - 48 * 60 * 1000).toISOString(),
-    sentimentScore: -0.40,
-    urgency: 'ROUTINE',
-    catalystType: 'CENTRAL_BANK',
-    affectedAssets: ['EURUSD', 'EUR'],
-    summary: 'European Central Bank governors highlight contraction in German factory orders, weighing on Euro sentiment.',
-    link: 'https://www.marketwatch.com',
-  },
-  {
-    id: 'news-init-4',
-    title: 'Bank of Japan Monitors Yen Volatility; Policy Normalization Speculation Grows',
-    source: 'MarketWatch',
-    publishedAt: new Date(Date.now() - 75 * 60 * 1000).toISOString(),
-    sentimentScore: 0.50,
-    urgency: 'BREAKING',
-    catalystType: 'CENTRAL_BANK',
-    affectedAssets: ['USDJPY', 'JPY'],
-    summary: 'BOJ officials drop hints of further yield adjustments if wage growth accelerates, providing Yen support.',
-    link: 'https://www.marketwatch.com',
-  },
-  {
-    id: 'news-init-5',
-    title: 'US Treasury 10-Year Yield Stabilizes Near Key Resistance as Bond Auctions Clear Cleanly',
-    source: 'Dow Jones Wires',
-    publishedAt: new Date(Date.now() - 105 * 60 * 1000).toISOString(),
-    sentimentScore: 0.15,
-    urgency: 'ROUTINE',
-    catalystType: 'MACRO_DATA',
-    affectedAssets: ['USD', 'XAUUSD'],
-    summary: 'Strong foreign demand at the 10-year note reopening calms rate volatility across multi-asset trading desks.',
-    link: 'https://www.marketwatch.com',
-  },
-];
+function isTestRuntime(): boolean {
+  return (
+    typeof (globalThis as any).vi !== 'undefined' ||
+    typeof (globalThis as any).__vitest_worker__ !== 'undefined' ||
+    (typeof process !== 'undefined' && (process.env?.NODE_ENV === 'test' || !!process.env?.VITEST))
+  );
+}
 
 class NewsSentimentEngine {
-  private newsItems: NewsSentimentItem[] = [...INITIAL_HEADLINES];
+  private newsItems: NewsSentimentItem[] = [];
   private listeners: Set<() => void> = new Set();
   private isFetching = false;
   private lastFetchTime = 0;
+  private lastError: string | null = null;
 
   constructor() {
-    if (typeof window !== 'undefined') {
-      // Fetch fresh live news on startup after a brief delay
+    if (typeof window !== 'undefined' && !isTestRuntime()) {
       setTimeout(() => {
-        void this.fetchLiveNews();
-      }, 3000);
+        void this.fetchLiveNews(true);
+      }, 1000);
 
-      // Periodically refresh news every 60 seconds
       window.setInterval(() => {
         void this.fetchLiveNews();
       }, 60_000);
@@ -98,21 +41,56 @@ class NewsSentimentEngine {
     return [...this.newsItems];
   }
 
+  public getStatus(): { count: number; isFetching: boolean; lastFetchTime: number; lastError: string | null } {
+    return {
+      count: this.newsItems.length,
+      isFetching: this.isFetching,
+      lastFetchTime: this.lastFetchTime,
+      lastError: this.lastError,
+    };
+  }
+
+  private async fetchFromLocalApi(): Promise<Array<{ id: string; title: string; summary: string; source: string; publishedAt: string; link?: string }> | null> {
+    if (typeof window === 'undefined' || isTestRuntime()) return null;
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+      const res = await fetch('/api/live-news', { cache: 'no-store', signal: controller.signal });
+      clearTimeout(timeout);
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (data?.available && Array.isArray(data.news) && data.news.length > 0) {
+        return data.news;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
   /**
-   * Fetches real-time financial news from the MT5 bridge / live RSS endpoint.
+   * Fetches real-time financial news from live server RSS relay or connected MT5 bridge.
    */
-  public async fetchLiveNews(): Promise<boolean> {
-    if (this.isFetching) return false;
+  public async fetchLiveNews(force = false): Promise<boolean> {
+    if (this.isFetching || isTestRuntime()) return false;
     const now = Date.now();
-    if (now - this.lastFetchTime < 30_000) return false; // Throttling: 30s minimum
+    if (!force && now - this.lastFetchTime < 30_000) return false;
 
     this.isFetching = true;
     this.lastFetchTime = now;
+    this.notify();
 
     try {
-      const items = await mt5Bridge.fetchLiveNews();
-      if (items && items.length > 0) {
-        const processedItems: NewsSentimentItem[] = items.map((raw) => {
+      let rawItems = await this.fetchFromLocalApi();
+      if ((!rawItems || rawItems.length === 0) && mt5Bridge.getStatus().connected) {
+        const bridgeItems = await mt5Bridge.fetchLiveNews();
+        if (bridgeItems && bridgeItems.length > 0) {
+          rawItems = bridgeItems;
+        }
+      }
+
+      if (rawItems && rawItems.length > 0) {
+        const processedItems: NewsSentimentItem[] = rawItems.map((raw) => {
           const scored = this.scoreHeadline(raw.title);
           const affected = this.detectAffectedAssets(raw.title);
           return {
@@ -129,20 +107,25 @@ class NewsSentimentEngine {
           };
         });
 
-        // Merge with existing, deduplicating by title
         const existingTitles = new Set(processedItems.map((p) => p.title.toLowerCase().trim()));
         const remainingExisting = this.newsItems.filter(
           (old) => !existingTitles.has(old.title.toLowerCase().trim())
         );
 
         this.newsItems = [...processedItems, ...remainingExisting].slice(0, 30);
+        this.lastError = null;
         this.notify();
         return true;
       }
+
+      this.lastError = 'Live RSS news feed is temporarily unreachable.';
+      this.notify();
     } catch (e) {
-      console.warn('[NewsEngine] Real-time news fetch error, retaining current stream:', e);
+      this.lastError = e instanceof Error ? e.message : 'Live news fetch error';
+      this.notify();
     } finally {
       this.isFetching = false;
+      this.notify();
     }
     return false;
   }
@@ -154,13 +137,11 @@ class NewsSentimentEngine {
     const lower = title.toLowerCase();
     let score = 0;
 
-    // Bullish financial keywords
     const bullishWords = [
       'surge', 'jump', 'beat', 'growth', 'climb', 'hawkish', 'inflows', 'soar',
       'rally', 'escalat', 'strong', 'higher', 'boost', 'gain', 'advance', 'outperform',
       'record high', 'rate hike', 'expansion', 'resilient'
     ];
-    // Bearish financial keywords
     const bearishWords = [
       'drop', 'slump', 'miss', 'fall', 'dovish', 'cut', 'recession', 'sluggish',
       'weak', 'plunge', 'slowdown', 'lower', 'loss', 'decline', 'underperform',
@@ -191,9 +172,6 @@ class NewsSentimentEngine {
     };
   }
 
-  /**
-   * Detects which trading assets are affected by a headline.
-   */
   public detectAffectedAssets(title: string): string[] {
     const lower = title.toLowerCase();
     const assets: string[] = [];
@@ -234,9 +212,6 @@ class NewsSentimentEngine {
     return item;
   }
 
-  /**
-   * Evaluates overall news sentiment for a specific pair.
-   */
   public evaluatePairSentiment(symbol: SupportedSymbol): {
     sentimentScore: number;
     sentimentBias: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
@@ -258,13 +233,11 @@ class NewsSentimentEngine {
 
       if (isRelevant) {
         let weight = item.sentimentScore;
-        // If USD is bullish, it is bearish for EURUSD, GBPUSD, XAUUSD
         if (item.affectedAssets.includes('USD') && !item.affectedAssets.includes(sym)) {
           if (sym === 'EURUSD' || sym === 'GBPUSD' || sym === 'XAUUSD') {
             weight = -weight;
           }
         }
-        // Geopolitical tension is strongly bullish for Gold (XAUUSD)
         if (sym === 'XAUUSD' && item.catalystType === 'GEOPOLITICAL') {
           weight = Math.abs(weight);
         }
@@ -288,9 +261,6 @@ class NewsSentimentEngine {
     };
   }
 
-  /**
-   * Calculates the global institutional sentiment index (-100 to +100).
-   */
   public getGlobalSentimentIndex(): {
     score: number;
     label: 'EXTREME_BEARISH' | 'BEARISH' | 'NEUTRAL' | 'BULLISH' | 'EXTREME_BULLISH';

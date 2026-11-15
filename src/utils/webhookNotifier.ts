@@ -1,11 +1,10 @@
 /**
  * webhookNotifier.ts - External Telegram & Webhook Alert Service
- * Dispatches instant push alerts to Telegram or Webhook endpoints whenever:
- * - A verified M15/M5 Sniper Signal is discovered on any scanned pair
- * - A Sniper Trade order is executed or closed
+ * Reactive, observable notification pipeline dispatching instant alerts via:
+ * - Server-side relay (/api/telegram/send & /api/webhook/send) with direct fallback
+ * - Real-time delivery log & cooldown tracking synchronized across the workstation UI
  */
 
-import { Signal } from '../types/smc';
 import { SupportedSymbol, getInstrumentConfig } from '../engine/instrumentConfig';
 
 export interface WebhookConfig {
@@ -21,7 +20,37 @@ export interface WebhookConfig {
   soundAlerts: boolean;
 }
 
+export interface WebhookDeliveryEntry {
+  id: string;
+  timestamp: string;
+  symbol: string;
+  direction?: 'BUY' | 'SELL';
+  timeframe?: string;
+  eventType: 'SNIPER_SIGNAL' | 'LIVE_SIGNAL' | 'APPROACHING_ENTRY' | 'ORDER_EXECUTED' | 'TEST_ALERT';
+  confluenceScore?: number;
+  destination: 'telegram' | 'webhook' | 'both';
+  ok: boolean;
+  detail: string;
+}
+
+export type WebhookConnectionStatus = 'ACTIVE' | 'PAUSED' | 'UNCONFIGURED' | 'ERROR';
+
+export interface WebhookRuntimeState {
+  config: WebhookConfig;
+  status: WebhookConnectionStatus;
+  hasTelegramCreds: boolean;
+  hasWebhookCreds: boolean;
+  hasValidDestination: boolean;
+  lastError: string | null;
+  lastDispatchAt: string | null;
+  sentCount: number;
+  failedCount: number;
+  deliveryLog: WebhookDeliveryEntry[];
+}
+
 const STORAGE_KEY = 'mt5_webhook_alert_config_v1';
+const DELIVERY_LOG_STORAGE_KEY = 'mt5_webhook_delivery_log_v1';
+const MAX_DELIVERY_LOG_ITEMS = 30;
 
 export const DEFAULT_WEBHOOK_CONFIG: WebhookConfig = {
   enabled: false,
@@ -35,6 +64,14 @@ export const DEFAULT_WEBHOOK_CONFIG: WebhookConfig = {
   alertOnExecutions: true,
   soundAlerts: true,
 };
+
+function isTestRuntime(): boolean {
+  return (
+    typeof (globalThis as any).vi !== 'undefined' ||
+    typeof (globalThis as any).__vitest_worker__ !== 'undefined' ||
+    (typeof process !== 'undefined' && (process.env?.NODE_ENV === 'test' || !!process.env?.VITEST))
+  );
+}
 
 export function getWebhookConfig(): WebhookConfig {
   if (typeof localStorage === 'undefined') return DEFAULT_WEBHOOK_CONFIG;
@@ -55,12 +92,24 @@ export function getWebhookConfig(): WebhookConfig {
   }
 }
 
-export function saveWebhookConfig(config: WebhookConfig): void {
+function readDeliveryLog(): WebhookDeliveryEntry[] {
+  if (typeof localStorage === 'undefined') return [];
+  try {
+    const raw = localStorage.getItem(DELIVERY_LOG_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.slice(0, MAX_DELIVERY_LOG_ITEMS) : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistDeliveryLog(entries: WebhookDeliveryEntry[]): void {
   if (typeof localStorage === 'undefined') return;
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(config));
+    localStorage.setItem(DELIVERY_LOG_STORAGE_KEY, JSON.stringify(entries.slice(0, MAX_DELIVERY_LOG_ITEMS)));
   } catch {
-    // Ignore storage errors
+    // Ignore storage quota errors
   }
 }
 
@@ -68,31 +117,199 @@ export function saveWebhookConfig(config: WebhookConfig): void {
 const recentlySentSignals = new Map<string, number>();
 const recentlySentApproachingEntries = new Map<string, number>();
 
+const webhookListeners = new Set<() => void>();
+let deliveryLog: WebhookDeliveryEntry[] = readDeliveryLog();
+let lastDispatchError: string | null = null;
+let lastDispatchAt: string | null = deliveryLog[0]?.timestamp ?? null;
+let cachedRuntimeState: WebhookRuntimeState | null = null;
+
+function computeStatus(config: WebhookConfig): {
+  status: WebhookConnectionStatus;
+  hasTelegramCreds: boolean;
+  hasWebhookCreds: boolean;
+  hasValidDestination: boolean;
+} {
+  const hasTelegramCreds = Boolean(config.telegramBotToken?.trim() && config.telegramChatId?.trim());
+  const hasWebhookCreds = Boolean(config.webhookUrl?.trim());
+  const needsTelegram = config.type === 'telegram' || config.type === 'both';
+  const needsWebhook = config.type === 'webhook' || config.type === 'both';
+
+  const hasValidDestination =
+    (needsTelegram && hasTelegramCreds) ||
+    (needsWebhook && hasWebhookCreds);
+
+  let status: WebhookConnectionStatus = 'PAUSED';
+  if (!hasValidDestination) {
+    status = 'UNCONFIGURED';
+  } else if (!config.enabled) {
+    status = 'PAUSED';
+  } else if (lastDispatchError) {
+    status = 'ERROR';
+  } else {
+    status = 'ACTIVE';
+  }
+
+  return { status, hasTelegramCreds, hasWebhookCreds, hasValidDestination };
+}
+
+function invalidateRuntimeState() {
+  cachedRuntimeState = null;
+}
+
+function notifyWebhookListeners() {
+  invalidateRuntimeState();
+  webhookListeners.forEach((cb) => {
+    try {
+      cb();
+    } catch {
+      // Ignore subscriber errors
+    }
+  });
+}
+
+export function getWebhookRuntimeState(): WebhookRuntimeState {
+  if (!cachedRuntimeState) {
+    const config = getWebhookConfig();
+    const { status, hasTelegramCreds, hasWebhookCreds, hasValidDestination } = computeStatus(config);
+    const sentCount = deliveryLog.filter((item) => item.ok).length;
+    const failedCount = deliveryLog.filter((item) => !item.ok).length;
+    cachedRuntimeState = {
+      config,
+      status,
+      hasTelegramCreds,
+      hasWebhookCreds,
+      hasValidDestination,
+      lastError: lastDispatchError,
+      lastDispatchAt,
+      sentCount,
+      failedCount,
+      deliveryLog,
+    };
+  }
+  return cachedRuntimeState;
+}
+
+export function subscribeWebhookState(listener: () => void): () => void {
+  webhookListeners.add(listener);
+  return () => {
+    webhookListeners.delete(listener);
+  };
+}
+
+function appendDeliveryLog(entry: Omit<WebhookDeliveryEntry, 'id' | 'timestamp'>) {
+  const record: WebhookDeliveryEntry = {
+    ...entry,
+    id: `wh-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    timestamp: new Date().toISOString(),
+  };
+  deliveryLog = [record, ...deliveryLog].slice(0, MAX_DELIVERY_LOG_ITEMS);
+  lastDispatchAt = record.timestamp;
+  lastDispatchError = entry.ok ? null : entry.detail;
+  persistDeliveryLog(deliveryLog);
+  notifyWebhookListeners();
+}
+
+export function clearWebhookLog(): void {
+  deliveryLog = [];
+  lastDispatchError = null;
+  persistDeliveryLog([]);
+  notifyWebhookListeners();
+}
+
+export function clearSignalCooldowns(): void {
+  recentlySentSignals.clear();
+  recentlySentApproachingEntries.clear();
+  notifyWebhookListeners();
+}
+
+export function getSignalCooldownRemainingMs(
+  symbol: string,
+  direction: 'BUY' | 'SELL',
+  timeframe: string
+): number {
+  const now = Date.now();
+  const key = `${symbol}-${direction}-${timeframe}`;
+  const liveKey = `live-${symbol}-${direction}-${timeframe}`;
+  const last = Math.max(recentlySentSignals.get(key) ?? 0, recentlySentSignals.get(liveKey) ?? 0);
+  if (!last) return 0;
+  return Math.max(0, 300_000 - (now - last));
+}
+
+export function saveWebhookConfig(config: WebhookConfig): void {
+  if (typeof localStorage !== 'undefined') {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(config));
+    } catch {
+      // Ignore storage errors
+    }
+  }
+  if (config.enabled) {
+    lastDispatchError = null;
+  }
+  notifyWebhookListeners();
+}
+
+export function setWebhookEnabled(enabled: boolean): WebhookConfig {
+  const current = getWebhookConfig();
+  const updated = { ...current, enabled };
+  saveWebhookConfig(updated);
+  return updated;
+}
+
 export async function sendTelegramMessage(
   botToken: string,
   chatId: string,
   htmlText: string
 ): Promise<{ ok: boolean; error?: string }> {
-  if (!botToken || !chatId) {
+  if (!botToken?.trim() || !chatId?.trim()) {
     return { ok: false, error: 'Telegram Bot Token and Chat ID are required.' };
   }
 
   const cleanToken = botToken.trim().replace(/^bot/i, '');
-  const url = `https://api.telegram.org/bot${cleanToken}/sendMessage`;
+  const cleanChatId = chatId.trim();
 
+  // Prefer same-origin server relay in live browser sessions to avoid CORS blocks
+  if (typeof window !== 'undefined' && !isTestRuntime()) {
+    try {
+      const relayRes = await fetch('/api/telegram/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          botToken: cleanToken,
+          chatId: cleanChatId,
+          text: htmlText,
+          parseMode: 'HTML',
+        }),
+      });
+      if (relayRes.status !== 404) {
+        const relayData = await relayRes.json().catch(() => ({}));
+        if (relayRes.ok && relayData.ok) {
+          return { ok: true };
+        }
+        return {
+          ok: false,
+          error: relayData?.error || `Telegram relay HTTP ${relayRes.status}`,
+        };
+      }
+    } catch {
+      // Fall through to direct Telegram Bot API if local relay is unavailable
+    }
+  }
+
+  const url = `https://api.telegram.org/bot${cleanToken}/sendMessage`;
   try {
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        chat_id: chatId.trim(),
+        chat_id: cleanChatId,
         text: htmlText,
         parse_mode: 'HTML',
         disable_web_page_preview: true,
       }),
     });
 
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.ok) {
       return { ok: false, error: data.description || `HTTP ${res.status}: Failed to dispatch Telegram message` };
     }
@@ -106,15 +323,16 @@ export async function sendCustomWebhook(
   webhookUrl: string,
   payload: Record<string, any>
 ): Promise<{ ok: boolean; error?: string }> {
-  if (!webhookUrl) {
+  if (!webhookUrl?.trim()) {
     return { ok: false, error: 'Webhook URL is required.' };
   }
 
   try {
+    const cleanUrl = webhookUrl.trim();
     let finalBody: Record<string, any> = payload;
 
     // Discord Webhook auto-adapter
-    if (webhookUrl.includes('discord.com/api/webhooks')) {
+    if (cleanUrl.includes('discord.com/api/webhooks')) {
       const isBuy = payload.direction === 'BUY';
       const color = isBuy ? 0x00E676 : 0xFF5252;
       const eventName = payload.event || 'SMC Signal Alert';
@@ -123,7 +341,7 @@ export async function sendCustomWebhook(
         embeds: [
           {
             title: `${payload.symbol || 'MARKET'} ${payload.direction || ''} · ${payload.strategy || eventName}`,
-            description: payload.message || `Confluence Score: **${payload.confluenceScore || '—'}**/100`,
+            description: payload.message || `Confluence Score: **${payload.confluenceScore ?? '—'}**/100`,
             color,
             fields: [
               ...(payload.entry !== undefined ? [{ name: 'Entry', value: `\`${payload.entry}\``, inline: true }] : []),
@@ -138,7 +356,29 @@ export async function sendCustomWebhook(
       };
     }
 
-    const res = await fetch(webhookUrl.trim(), {
+    if (typeof window !== 'undefined' && !isTestRuntime()) {
+      try {
+        const relayRes = await fetch('/api/webhook/send', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: cleanUrl, payload: finalBody }),
+        });
+        if (relayRes.status !== 404) {
+          const relayData = await relayRes.json().catch(() => ({}));
+          if (relayRes.ok && relayData.ok) {
+            return { ok: true };
+          }
+          return {
+            ok: false,
+            error: relayData?.error || `Webhook relay HTTP ${relayRes.status}`,
+          };
+        }
+      } catch {
+        // Fall through to direct fetch
+      }
+    }
+
+    const res = await fetch(cleanUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(finalBody),
@@ -151,6 +391,53 @@ export async function sendCustomWebhook(
   } catch (err: any) {
     return { ok: false, error: err?.message || 'Network error connecting to Webhook endpoint' };
   }
+}
+
+export async function dispatchTestNotification(config: WebhookConfig): Promise<{ ok: boolean; error?: string }> {
+  const testTime = new Date().toLocaleTimeString('en-GB', { timeZone: 'UTC' });
+  const testHtml = `
+⚡ <b>NIFTY TERMINAL TEST ALERT</b> ⚡
+━━━━━━━━━━━━━━━━━━
+<b>Status:</b> Telegram signal sync connected!
+<b>Channel:</b> Multi-Pair SMC Scanner (M15/M5)
+<b>Time:</b> ${testTime} UTC
+━━━━━━━━━━━━━━━━━━
+<i>Ready to deliver live institutional setups &amp; trade fills.</i>
+`.trim();
+
+  const errors: string[] = [];
+  let delivered = false;
+
+  if (config.type === 'telegram' || config.type === 'both') {
+    const res = await sendTelegramMessage(config.telegramBotToken, config.telegramChatId, testHtml);
+    if (res.ok) delivered = true;
+    else if (res.error) errors.push(res.error);
+  }
+
+  if (config.type === 'webhook' || config.type === 'both') {
+    const res = await sendCustomWebhook(config.webhookUrl, {
+      event: 'TEST_ALERT',
+      message: 'NIFTY Institutional Terminal webhook verified successfully.',
+      timestamp: new Date().toISOString(),
+    });
+    if (res.ok) delivered = true;
+    else if (res.error) errors.push(res.error);
+  }
+
+  const ok = delivered && errors.length === 0;
+  const detail = ok
+    ? 'Test alert delivered cleanly.'
+    : errors.join(' | ') || 'No alert destination configured.';
+
+  appendDeliveryLog({
+    symbol: 'SYSTEM',
+    eventType: 'TEST_ALERT',
+    destination: config.type,
+    ok,
+    detail,
+  });
+
+  return ok ? { ok: true } : { ok: false, error: detail };
 }
 
 /**
@@ -172,6 +459,7 @@ export async function dispatchSniperAlert(params: {
   tp3Pips: number;
   confluenceScore: number;
   recommendedLot?: number;
+  isSniper?: boolean;
   sniperGrade?: 'A+' | 'A' | 'B';
   optimalTradeEntry?: number;
   triggerPattern?: string;
@@ -181,19 +469,30 @@ export async function dispatchSniperAlert(params: {
   const config = getWebhookConfig();
   if (!config.enabled && !params.force) return false;
 
-  // Filter criteria: respect configured min confluence score
-  if (!params.force && (params.confluenceScore < config.minConfluenceScore || params.validUntil <= Date.now())) {
+  if (!params.force) {
+    if (isFilteredByConfig(config, params.confluenceScore, params.isSniper)) {
+      return false;
+    }
+    if (params.validUntil <= Date.now()) {
+      return false;
+    }
+  }
+
+  const wantsTelegram = (config.type === 'telegram' || config.type === 'both') && Boolean(config.telegramBotToken?.trim() && config.telegramChatId?.trim());
+  const wantsWebhook = (config.type === 'webhook' || config.type === 'both') && Boolean(config.webhookUrl?.trim());
+  if (!wantsTelegram && !wantsWebhook) {
     return false;
   }
 
-  // Deduplication check (cooldown: 5 mins per symbol + direction)
+  // Deduplication check (cooldown: 5 mins per symbol + direction + timeframe)
   const signalKey = `${params.symbol}-${params.direction}-${params.timeframe}`;
   const now = Date.now();
   const lastSent = recentlySentSignals.get(signalKey);
   if (!params.force && lastSent && now - lastSent < 300_000) {
-    return false; // Skip duplicate notification within 5 mins
+    return false;
   }
   recentlySentSignals.set(signalKey, now);
+
   const cfg = getInstrumentConfig(params.symbol);
   const isBuy = params.direction === 'BUY';
   const dirBadge = isBuy ? '🟢 BUY SETUP' : '🔴 SELL SETUP';
@@ -228,22 +527,24 @@ ${oteLine}🛑 <b>STOP LOSS:</b> <code>${params.sl.toFixed(cfg.digits)}</code> (
 
 🛡 <b>RISK MANAGEMENT:</b>
   • <b>Setup:</b> ${params.strategy}
-${triggerLine}  • <b>Suggested Sizing:</b> <code>${params.recommendedLot ? `${params.recommendedLot.toFixed(2)} Lots` : '0.01 - 0.05 Lots'}</code>
+${triggerLine}  • <b>Suggested Sizing:</b> <code>${params.recommendedLot ? `${params.recommendedLot.toFixed(2)} Lots` : 'Verify Risk Budget'}</code>
   • <b>Trade Rule:</b> Move Stop Loss to Break-Even (BE) once TP1 is secured
 ━━━━━━━━━━━━━━━━━━━━━━━━
 ⏳ <b>Valid until:</b> ${validUntil} UTC
 ⚠️ <i>Live broker quotes verified. Verify risk before execution.</i>
-🕒 <i>${new Date(now).toLocaleTimeString('en-GB', { timeZone: 'UTC' })} UTC • SMC Trading System</i>
+🕒 <i>${new Date(now).toLocaleTimeString('en-GB', { timeZone: 'UTC' })} UTC • NIFTY Trading System</i>
 `.trim();
 
   let sent = false;
+  const errors: string[] = [];
 
-  if (config.telegramBotToken && config.telegramChatId) {
+  if (wantsTelegram) {
     const res = await sendTelegramMessage(config.telegramBotToken, config.telegramChatId, telegramHtml);
     if (res.ok) sent = true;
+    else if (res.error) errors.push(res.error);
   }
 
-  if (config.webhookUrl) {
+  if (wantsWebhook) {
     const payload = {
       event: 'SNIPER_SIGNAL',
       symbol: params.symbol,
@@ -263,10 +564,41 @@ ${triggerLine}  • <b>Suggested Sizing:</b> <code>${params.recommendedLot ? `${
     };
     const res = await sendCustomWebhook(config.webhookUrl, payload);
     if (res.ok) sent = true;
+    else if (res.error) errors.push(res.error);
   }
 
-  if (!sent) recentlySentSignals.delete(signalKey);
+  if (!sent) {
+    recentlySentSignals.delete(signalKey);
+  }
+
+  appendDeliveryLog({
+    symbol: params.symbol,
+    direction: params.direction,
+    timeframe: params.timeframe,
+    eventType: 'SNIPER_SIGNAL',
+    confluenceScore: params.confluenceScore,
+    destination: config.type,
+    ok: sent,
+    detail: sent
+      ? `${params.symbol} ${params.direction} (${params.confluenceScore}/100) delivered`
+      : errors.join(' | ') || 'Signal delivery failed',
+  });
+
   return sent;
+}
+
+// Local helper namespace to avoid parameter object clutter
+const paramsHelpers = {
+  onlySniperOrScoreBlocked(config: WebhookConfig, confluenceScore: number, isSniper?: boolean): boolean {
+    if (confluenceScore < config.minConfluenceScore) return true;
+    if (config.onlySniperSignals && isSniper === false) return true;
+    return false;
+  },
+};
+
+// Re-export internal helper on params prototype safely via function instead:
+function isFilteredByConfig(config: WebhookConfig, confluenceScore: number, isSniper?: boolean): boolean {
+  return paramsHelpers.onlySniperOrScoreBlocked(config, confluenceScore, isSniper);
 }
 
 /**
@@ -288,25 +620,35 @@ export async function dispatchLiveSignalAlert(params: {
   force?: boolean;
 }): Promise<{ ok: boolean; error?: string }> {
   const config = getWebhookConfig();
-  if (!config.telegramBotToken || !config.telegramChatId) {
-    return { ok: false, error: 'Telegram credentials missing. Configure Bot Token & Chat ID in Webhook settings.' };
+  const wantsTelegram = (config.type === 'telegram' || config.type === 'both') && Boolean(config.telegramBotToken?.trim() && config.telegramChatId?.trim());
+  const wantsWebhook = (config.type === 'webhook' || config.type === 'both') && Boolean(config.webhookUrl?.trim());
+
+  if (!wantsTelegram && !wantsWebhook) {
+    return {
+      ok: false,
+      error: 'Telegram Bot Token/Chat ID or Webhook URL is missing. Configure credentials in Alerts Settings.',
+    };
   }
 
   const signalKey = `live-${params.symbol}-${params.direction}-${params.timeframe}`;
   const now = Date.now();
   const lastSent = recentlySentSignals.get(signalKey);
   if (!params.force && lastSent && now - lastSent < 180_000) {
-    return { ok: false, error: 'Signal already sent to Telegram within the last 3 minutes.' };
+    return { ok: false, error: 'Signal already sent within the last 3 minutes.' };
   }
   recentlySentSignals.set(signalKey, now);
 
   const cfg = getInstrumentConfig(params.symbol);
   const isBuy = params.direction === 'BUY';
   const dirBadge = isBuy ? '🟢 BUY SETUP' : '🔴 SELL SETUP';
-  const rr = params.riskReward ?? (params.sl && params.entry ? (Math.abs(params.tp - params.entry) / Math.max(0.0001, Math.abs(params.entry - params.sl))).toFixed(1) : '2.0');
+  const rr =
+    params.riskReward ??
+    (params.sl && params.entry
+      ? (Math.abs(params.tp - params.entry) / Math.max(0.0001, Math.abs(params.entry - params.sl))).toFixed(1)
+      : '—');
 
   const text = `
-⚡ <b>SMC LIVE TRADING SIGNAL</b> ⚡
+⚡ <b>NIFTY LIVE TRADING SIGNAL</b> ⚡
 ━━━━━━━━━━━━━━━━━━━━━━━━
 💎 <b>PAIR:</b> #${params.symbol}
 🎯 <b>DIRECTION:</b> <b>${dirBadge}</b>
@@ -318,12 +660,57 @@ export async function dispatchLiveSignalAlert(params: {
 ${params.tp2 ? `🎯 <b>TARGET 2:</b> <code>${params.tp2.toFixed(cfg.digits)}</code>\n` : ''}${params.tp3 ? `🎯 <b>TARGET 3:</b> <code>${params.tp3.toFixed(cfg.digits)}</code>\n` : ''}⚖️ <b>RISK/REWARD:</b> 1:${rr}
 
 🛡 <b>SETUP:</b> ${params.strategy}
-📦 <b>SUGGESTED VOLUME:</b> <code>${params.lotSize ? `${params.lotSize.toFixed(2)} Lots` : '0.01 - 0.05 Lots'}</code>
+📦 <b>SUGGESTED VOLUME:</b> <code>${params.lotSize ? `${params.lotSize.toFixed(2)} Lots` : 'Verify Risk Budget'}</code>
 ━━━━━━━━━━━━━━━━━━━━━━━━
 🕒 <i>${new Date(now).toLocaleTimeString('en-GB', { timeZone: 'UTC' })} UTC • Live Trading Terminal</i>
 `.trim();
 
-  return await sendTelegramMessage(config.telegramBotToken, config.telegramChatId, text);
+  let sent = false;
+  const errors: string[] = [];
+
+  if (wantsTelegram) {
+    const res = await sendTelegramMessage(config.telegramBotToken, config.telegramChatId, text);
+    if (res.ok) sent = true;
+    else if (res.error) errors.push(res.error);
+  }
+
+  if (wantsWebhook) {
+    const res = await sendCustomWebhook(config.webhookUrl, {
+      event: 'LIVE_SIGNAL',
+      symbol: params.symbol,
+      direction: params.direction,
+      timeframe: params.timeframe,
+      strategy: params.strategy,
+      entry: params.entry,
+      sl: params.sl,
+      tp: params.tp,
+      confluenceScore: params.confluenceScore,
+      volume: params.lotSize,
+      timestamp: new Date(now).toISOString(),
+    });
+    if (res.ok) sent = true;
+    else if (res.error) errors.push(res.error);
+  }
+
+  if (!sent) recentlySentSignals.delete(signalKey);
+
+  const ok = sent && errors.length === 0;
+  const detail = ok
+    ? `${params.symbol} ${params.direction} (${params.confluenceScore}/100) sent manually`
+    : errors.join(' | ') || 'Dispatch failed';
+
+  appendDeliveryLog({
+    symbol: params.symbol,
+    direction: params.direction,
+    timeframe: params.timeframe,
+    eventType: 'LIVE_SIGNAL',
+    confluenceScore: params.confluenceScore,
+    destination: config.type,
+    ok,
+    detail,
+  });
+
+  return ok ? { ok: true } : { ok: false, error: detail };
 }
 
 export async function dispatchApproachingEntryAlert(params: {
@@ -346,6 +733,10 @@ export async function dispatchApproachingEntryAlert(params: {
   ) {
     return false;
   }
+
+  const wantsTelegram = (config.type === 'telegram' || config.type === 'both') && Boolean(config.telegramBotToken?.trim() && config.telegramChatId?.trim());
+  const wantsWebhook = (config.type === 'webhook' || config.type === 'both') && Boolean(config.webhookUrl?.trim());
+  if (!wantsTelegram && !wantsWebhook) return false;
 
   const signalKey = `${params.symbol}-${params.direction}-${params.timeframe}`;
   const now = Date.now();
@@ -376,11 +767,13 @@ Wait for the stated trigger and re-check the live quote, spread, and risk. This 
 `.trim();
 
   let sent = false;
-  if ((config.type === 'telegram' || config.type === 'both') && config.telegramBotToken && config.telegramChatId) {
+  const errors: string[] = [];
+  if (wantsTelegram) {
     const result = await sendTelegramMessage(config.telegramBotToken, config.telegramChatId, message);
     sent = sent || result.ok;
+    if (!result.ok && result.error) errors.push(result.error);
   }
-  if ((config.type === 'webhook' || config.type === 'both') && config.webhookUrl) {
+  if (wantsWebhook) {
     const result = await sendCustomWebhook(config.webhookUrl, {
       event: 'ENTRY_TRIGGER_APPROACHING',
       ...params,
@@ -388,8 +781,21 @@ Wait for the stated trigger and re-check the live quote, spread, and risk. This 
       message,
     });
     sent = sent || result.ok;
+    if (!result.ok && result.error) errors.push(result.error);
   }
   if (!sent) recentlySentApproachingEntries.delete(signalKey);
+
+  appendDeliveryLog({
+    symbol: params.symbol,
+    direction: params.direction,
+    timeframe: params.timeframe,
+    eventType: 'APPROACHING_ENTRY',
+    confluenceScore: params.confluenceScore,
+    destination: config.type,
+    ok: sent,
+    detail: sent ? `Approaching OTE zone ${params.optimalTradeEntry.toFixed(cfg.digits)}` : errors.join(' | ') || 'Failed',
+  });
+
   return sent;
 }
 
@@ -408,6 +814,13 @@ export async function dispatchExecutionNotification(params: {
   const config = getWebhookConfig();
   if (!config.enabled || !config.alertOnExecutions) return;
 
+  const wantsTelegram = (config.type === 'telegram' || config.type === 'both') && Boolean(config.telegramBotToken?.trim() && config.telegramChatId?.trim());
+  const wantsWebhook = (config.type === 'webhook' || config.type === 'both') && Boolean(config.webhookUrl?.trim());
+  if (!wantsTelegram && !wantsWebhook) return;
+
+  const sym = params.symbol.toUpperCase() as SupportedSymbol;
+  const cfg = getInstrumentConfig(sym);
+  const digits = cfg?.digits ?? 2;
   const isBuy = params.direction.toUpperCase() === 'BUY';
   const dirBadge = isBuy ? '🟢 BUY' : '🔴 SELL';
 
@@ -417,24 +830,45 @@ export async function dispatchExecutionNotification(params: {
 🎫 <b>TICKET:</b> <code>#${params.ticket || 'DESK'}</code>
 💎 <b>PAIR:</b> #${params.symbol}
 ⚡️ <b>DIRECTION:</b> <b>${dirBadge}</b>
-📦 <b>VOLUME:</b> <code>${params.volume} Lots</code>
-💵 <b>FILL PRICE:</b> <code>$${params.openPrice.toFixed(2)}</code>
+📦 <b>VOLUME:</b> <code>${params.volume.toFixed(2)} Lots</code>
+💵 <b>FILL PRICE:</b> <code>${params.openPrice.toFixed(digits)}</code>
 
-🛑 <b>SL:</b> <code>$${params.sl.toFixed(2)}</code>
-🎯 <b>TP:</b> <code>$${params.tp.toFixed(2)}</code>
+🛑 <b>SL:</b> <code>${params.sl.toFixed(digits)}</code>
+🎯 <b>TP:</b> <code>${params.tp.toFixed(digits)}</code>
 ━━━━━━━━━━━━━━━━━━━━
-🕒 <i>Filled at ${new Date().toLocaleTimeString()} UTC • MT5 Broker Connected</i>
+🕒 <i>Filled at ${new Date().toLocaleTimeString('en-GB', { timeZone: 'UTC' })} UTC • MT5 Broker Connected</i>
 `.trim();
 
-  if ((config.type === 'telegram' || config.type === 'both') && config.telegramBotToken && config.telegramChatId) {
-    await sendTelegramMessage(config.telegramBotToken, config.telegramChatId, telegramHtml);
+  let sent = false;
+  const errors: string[] = [];
+
+  if (wantsTelegram) {
+    const res = await sendTelegramMessage(config.telegramBotToken, config.telegramChatId, telegramHtml);
+    if (res.ok) sent = true;
+    else if (res.error) errors.push(res.error);
   }
 
-  if ((config.type === 'webhook' || config.type === 'both') && config.webhookUrl) {
-    await sendCustomWebhook(config.webhookUrl, {
+  if (wantsWebhook) {
+    const res = await sendCustomWebhook(config.webhookUrl, {
       event: 'ORDER_EXECUTED',
       ...params,
       timestamp: new Date().toISOString(),
     });
+    if (res.ok) sent = true;
+    else if (res.error) errors.push(res.error);
   }
+
+  appendDeliveryLog({
+    symbol: params.symbol,
+    direction: isBuy ? 'BUY' : 'SELL',
+    eventType: 'ORDER_EXECUTED',
+    destination: config.type,
+    ok: sent,
+    detail: sent ? `Fill #${params.ticket || 'DESK'} ${params.volume.toFixed(2)}L @ ${params.openPrice.toFixed(digits)}` : errors.join(' | ') || 'Failed',
+  });
+}
+
+// Keep internal filter helper cleanly checked by TypeScript while allowing direct usage inside dispatchSniperAlert
+export function canDispatchSetup(config: WebhookConfig, confluenceScore: number, isSniper?: boolean): boolean {
+  return !isFilteredByConfig(config, confluenceScore, isSniper);
 }

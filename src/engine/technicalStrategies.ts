@@ -1,6 +1,7 @@
-import type { Candle, InstrumentType, Signal, TradeDirection } from '../types/smc';
+import type { Candle, InstrumentType, Signal, TradeDirection, VolumeMetrics } from '../types/smc';
 import { calculateATR, hasRecentCandleGap } from './smcCore';
 import { getInstrumentConfig } from './instrumentConfig';
+import { calculateRVOL } from './volumeEngine';
 
 const EMA_FAST = 20;
 const EMA_SLOW = 50;
@@ -16,6 +17,12 @@ function ema(values: number[], period: number): number[] {
   return result;
 }
 
+function getTimeframeRRMultipliers(timeframe: 'M1' | 'M5' | 'M15'): { rr1: number; rr2: number; rr3: number } {
+  if (timeframe === 'M1') return { rr1: 1.2, rr2: 2.0, rr3: 3.2 };
+  if (timeframe === 'M5') return { rr1: 1.5, rr2: 2.5, rr3: 4.0 };
+  return { rr1: 1.8, rr2: 3.2, rr3: 5.5 };
+}
+
 function createSignal(
   strategy: Signal['strategy'],
   direction: TradeDirection,
@@ -26,7 +33,9 @@ function createSignal(
   reasons: string[],
   digits: number,
   tickSize?: number,
-  symbol?: string
+  symbol?: string,
+  oteTarget?: number,
+  volumeMetrics?: VolumeMetrics
 ): Signal {
   const normalizePrice = (price: number) => Number(
     (tickSize && tickSize > 0
@@ -35,13 +44,14 @@ function createSignal(
   );
   const entry = normalizePrice(candle.close);
 
-  // Safe minimum stop loss distance: prevents 1-pip suicide stops eaten alive by broker spreads
+  // Safe minimum stop loss distance: scaled slightly tighter on M1 scalps when ATR permits
   let minStopDistance = digits === 3 ? 0.08 : digits === 5 ? 0.00080 : 1.5;
   let pipSize = digits === 3 || digits === 2 ? 0.01 : 0.0001;
   if (symbol) {
     try {
       const cfg = getInstrumentConfig(symbol);
-      minStopDistance = cfg.minPracticalStopPips * cfg.pipSize;
+      const tfStopFactor = timeframe === 'M1' ? 0.75 : 1.0;
+      minStopDistance = cfg.minPracticalStopPips * tfStopFactor * cfg.pipSize;
       pipSize = cfg.pipSize;
     } catch {
       // fallback
@@ -51,12 +61,13 @@ function createSignal(
   // Use the larger of ATR or the instrument's minimum safe stop floor
   const effectiveStopDistance = Math.max(atr, minStopDistance);
   const stopPips = Number((effectiveStopDistance / pipSize).toFixed(1));
+  const { rr1, rr2, rr3 } = getTimeframeRRMultipliers(timeframe);
 
   const sl = normalizePrice(direction === 'BUY' ? entry - effectiveStopDistance : entry + effectiveStopDistance);
-  const tp1 = normalizePrice(direction === 'BUY' ? entry + effectiveStopDistance * 1.8 : entry - effectiveStopDistance * 1.8);
-  const tp2 = normalizePrice(direction === 'BUY' ? entry + effectiveStopDistance * 3.2 : entry - effectiveStopDistance * 3.2);
-  const tp3 = normalizePrice(direction === 'BUY' ? entry + effectiveStopDistance * 5.5 : entry - effectiveStopDistance * 5.5);
-  const tp = tp2; // Primary targets high-pip 3.2R expansion
+  const tp1 = normalizePrice(direction === 'BUY' ? entry + effectiveStopDistance * rr1 : entry - effectiveStopDistance * rr1);
+  const tp2 = normalizePrice(direction === 'BUY' ? entry + effectiveStopDistance * rr2 : entry - effectiveStopDistance * rr2);
+  const tp3 = normalizePrice(direction === 'BUY' ? entry + effectiveStopDistance * rr3 : entry - effectiveStopDistance * rr3);
+  const tp = tp2;
 
   const targetPips1 = Number((Math.abs(tp1 - entry) / pipSize).toFixed(1));
   const targetPips2 = Number((Math.abs(tp2 - entry) / pipSize).toFixed(1));
@@ -68,7 +79,14 @@ function createSignal(
   const candleTimeMs = candle.time < 1_000_000_000_000 ? candle.time * 1000 : candle.time;
   const expiryTimestamp = candleTimeMs + timeframeMs + validityDurationMs;
   const validitySeconds = Math.max(0, Math.round((expiryTimestamp - Date.now()) / 1000));
-  const isSniper = (timeframe === 'M15' || timeframe === 'M5') && score >= 4.2;
+  const isSniper =
+    timeframe === 'M1'
+      ? score >= 6.4
+      : (timeframe === 'M15' || timeframe === 'M5') && score >= 4.2;
+
+  const optimalTradeEntry = oteTarget !== undefined ? normalizePrice(oteTarget) : entry;
+  const executionMode: Signal['executionMode'] =
+    Math.abs(entry - optimalTradeEntry) > atr * 0.25 ? 'PULLBACK_LIMIT' : 'MARKET';
 
   return {
     strategy,
@@ -89,11 +107,14 @@ function createSignal(
     expiryTimestamp,
     validitySeconds,
     isSniper,
+    optimalTradeEntry,
+    executionMode,
+    volumeMetrics,
     reasons,
     atr: effectiveStopDistance,
     timestamp: new Date(Math.min(candleTimeMs, Date.now())).toISOString(),
-    actionReason: `${strategy} ${direction} (${stopPips} pips safe stop beyond spread noise)`,
-    perfectEntryReason: `Closed-candle setup with 1:3.2 high-yield risk/reward using ${stopPips} pips protective stop distance.`,
+    actionReason: `${strategy} ${direction} (${stopPips} pips safe stop · 1:${rr2} ${timeframe} scalp profile)`,
+    perfectEntryReason: `Closed-candle ${timeframe} setup with 1:${rr2} risk/reward using ${stopPips} pips protective stop distance.`,
   };
 }
 
@@ -124,6 +145,7 @@ export function evaluateTechnicalStrategies(
   const atr = atrValues[atrValues.length - 1];
   if (!Number.isFinite(atr) || atr <= 0) return [];
 
+  const volMetrics = calculateRVOL(executionCandles, 20, digits);
   const executionCloses = executionCandles.map((candle) => candle.close);
   const higherCloses = higherTimeframeCandles.map((candle) => candle.close);
   const fast = ema(executionCloses, EMA_FAST);
@@ -159,6 +181,9 @@ export function evaluateTechnicalStrategies(
       : false;
   if (trendDirection && trendRetest) {
     const trendScore = higherTrend === trendDirection ? 6.8 : higherTrend === null ? 6.2 : 5.8;
+    const pullbackOte = trendDirection === 'BUY'
+      ? Math.min(latest.close, lastFast + atr * 0.1)
+      : Math.max(latest.close, lastFast - atr * 0.1);
     signals.push(createSignal(
       'Trend Pullback',
       trendDirection,
@@ -176,12 +201,16 @@ export function evaluateTechnicalStrategies(
       ],
       digits,
       tickSize,
-      symbol
+      symbol,
+      pullbackOte,
+      volMetrics
     ));
   }
 
   const lookback = executionCandles.slice(-21, -1);
-  if (lookback.length === 20) {
+  // Gate thin dead-volume breakout fakeouts on live standard pairs while keeping rvol >= 0.65 active
+  const isDeadVolumeChop = instrumentType === 'standard' && volMetrics.rvol < 0.65;
+  if (lookback.length === 20 && !isDeadVolumeChop) {
     const resistance = Math.max(...lookback.map((candle) => candle.high));
     const support = Math.min(...lookback.map((candle) => candle.low));
     const body = latestBody;
@@ -190,6 +219,7 @@ export function evaluateTechnicalStrategies(
     const breakoutDirection: TradeDirection | null = bullishBreakout ? 'BUY' : bearishBreakout ? 'SELL' : null;
     if (breakoutDirection) {
       const breakoutScore = higherTrend === breakoutDirection ? 6.5 : higherTrend === null ? 6.2 : 5.8;
+      const retestLevel = breakoutDirection === 'BUY' ? resistance : support;
       signals.push(createSignal(
         'Volatility Breakout',
         breakoutDirection,
@@ -207,7 +237,9 @@ export function evaluateTechnicalStrategies(
         ],
         digits,
         tickSize,
-        symbol
+        symbol,
+        retestLevel,
+        volMetrics
       ));
     }
   }

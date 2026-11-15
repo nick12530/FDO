@@ -8,6 +8,99 @@ const TRADE_ORDER_BLOCKS_STORAGE_KEY = 'smc.trade-order-blocks.v1';
 const JOURNAL_SIGNALS_STORAGE_KEY = 'smc.journal-signals.v1';
 const JOURNAL_TRADES_STORAGE_KEY = 'smc.journal-trades.v1';
 const SIGNAL_VALIDATION_STORAGE_KEY = 'smc.signal-validation.v1';
+const ACCOUNT_LEDGER_META_PREFIX = 'smc.account-meta.v1';
+const LINKED_ACCOUNTS_KEY = 'smc.linked-mt5-accounts.v1';
+
+let activeAccountScopeKey = 'standalone';
+
+export interface AccountLedgerMeta {
+  accountKey: string;
+  login: string;
+  server: string;
+  broker: string;
+  accountMode?: 'demo' | 'live' | 'contest' | 'unknown' | null;
+  initialBalance: number;
+  dailyStartBalance: number;
+  dailyRiskDate: string;
+  lastBalance: number;
+  lastEquity: number;
+  lastSyncedAt: string;
+}
+
+export function buildAccountScopeKey(login?: string | number | null, server?: string | null): string {
+  const cleanLogin = login !== undefined && login !== null ? String(login).trim() : '';
+  const cleanServer = server ? String(server).trim() : '';
+  if (!cleanLogin || cleanLogin === '0' || !cleanServer) return 'standalone';
+  return `${cleanServer}::${cleanLogin}`;
+}
+
+export function getActiveJournalAccountKey(): string {
+  return activeAccountScopeKey;
+}
+
+export function setActiveJournalAccount(login?: string | number | null, server?: string | null): string {
+  const nextKey = buildAccountScopeKey(login, server);
+  if (nextKey !== activeAccountScopeKey) {
+    activeAccountScopeKey = nextKey;
+    notifyJournalChanged();
+  }
+  return activeAccountScopeKey;
+}
+
+function scopedKey(baseKey: string, scopeKey: string = activeAccountScopeKey): string {
+  return scopeKey === 'standalone' ? baseKey : `${baseKey}::${scopeKey}`;
+}
+
+export function readAccountLedgerMeta(scopeKey: string = activeAccountScopeKey): AccountLedgerMeta | null {
+  if (scopeKey === 'standalone' || typeof window === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(scopedKey(ACCOUNT_LEDGER_META_PREFIX, scopeKey));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<AccountLedgerMeta>;
+    if (!parsed || typeof parsed !== 'object' || !parsed.login || !parsed.server) return null;
+    return {
+      accountKey: parsed.accountKey || scopeKey,
+      login: String(parsed.login),
+      server: String(parsed.server),
+      broker: String(parsed.broker || parsed.server),
+      accountMode: parsed.accountMode ?? null,
+      initialBalance: Number(parsed.initialBalance) || 0,
+      dailyStartBalance: Number(parsed.dailyStartBalance) || 0,
+      dailyRiskDate: String(parsed.dailyRiskDate || ''),
+      lastBalance: Number(parsed.lastBalance) || 0,
+      lastEquity: Number(parsed.lastEquity) || 0,
+      lastSyncedAt: String(parsed.lastSyncedAt || ''),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function persistAccountLedgerMeta(meta: AccountLedgerMeta): void {
+  if (meta.accountKey === 'standalone' || typeof window === 'undefined') return;
+  try {
+    localStorage.setItem(scopedKey(ACCOUNT_LEDGER_META_PREFIX, meta.accountKey), JSON.stringify(meta));
+    const listRaw = localStorage.getItem(LINKED_ACCOUNTS_KEY);
+    const list: AccountLedgerMeta[] = listRaw ? JSON.parse(listRaw) : [];
+    const safeList = Array.isArray(list) ? list.filter((a) => a && a.accountKey !== meta.accountKey) : [];
+    safeList.unshift(meta);
+    localStorage.setItem(LINKED_ACCOUNTS_KEY, JSON.stringify(safeList.slice(0, 12)));
+  } catch (error) {
+    console.error('[Trade Journal] Could not persist account ledger metadata:', error);
+  }
+}
+
+export function readLinkedAccountProfiles(): AccountLedgerMeta[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = localStorage.getItem(LINKED_ACCOUNTS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
 
 export type TradeRationales = Record<string, string>;
 export type TradeOrderBlocks = Record<string, Zone>;
@@ -63,7 +156,7 @@ export function notifyJournalChanged(): void {
 
 export function readStoredClosedTrades(): ClosedTrade[] {
   try {
-    const stored = localStorage.getItem(CLOSED_TRADES_STORAGE_KEY);
+    const stored = localStorage.getItem(scopedKey(CLOSED_TRADES_STORAGE_KEY));
     if (!stored) return [];
     const parsed: unknown = JSON.parse(stored);
     if (!Array.isArray(parsed)) throw new Error('Stored closed trades are not an array.');
@@ -76,7 +169,7 @@ export function readStoredClosedTrades(): ClosedTrade[] {
 
 export function persistClosedTrades(trades: ClosedTrade[]): void {
   try {
-    localStorage.setItem(CLOSED_TRADES_STORAGE_KEY, JSON.stringify(trades));
+    localStorage.setItem(scopedKey(CLOSED_TRADES_STORAGE_KEY), JSON.stringify(trades));
   } catch (error) {
     console.error('[Trade Journal] Could not save closed trades:', error);
   }
@@ -88,7 +181,7 @@ export function persistClosedTrades(trades: ClosedTrade[]): void {
 
 export function readStoredJournalSignals(): JournalSignalRecord[] {
   try {
-    const stored = localStorage.getItem(JOURNAL_SIGNALS_STORAGE_KEY);
+    const stored = localStorage.getItem(scopedKey(JOURNAL_SIGNALS_STORAGE_KEY));
     if (!stored) return [];
     const parsed = JSON.parse(stored);
     if (!Array.isArray(parsed)) return [];
@@ -103,7 +196,7 @@ export function persistJournalSignals(signals: JournalSignalRecord[]): void {
   try {
     // Keep up to 300 recent signals
     const trimmed = signals.slice(-300);
-    localStorage.setItem(JOURNAL_SIGNALS_STORAGE_KEY, JSON.stringify(trimmed));
+    localStorage.setItem(scopedKey(JOURNAL_SIGNALS_STORAGE_KEY), JSON.stringify(trimmed));
   } catch (error) {
     console.error('[Trade Journal] Could not persist journal signals:', error);
   }
@@ -151,7 +244,7 @@ export function recordJournalSignal(
 
 export function readSignalValidations(): SignalValidationRecord[] {
   try {
-    const stored = localStorage.getItem(SIGNAL_VALIDATION_STORAGE_KEY);
+    const stored = localStorage.getItem(scopedKey(SIGNAL_VALIDATION_STORAGE_KEY));
     if (!stored) return [];
     const parsed: unknown = JSON.parse(stored);
     if (!Array.isArray(parsed)) throw new Error('Stored signal validation journal is not an array.');
@@ -173,7 +266,7 @@ function isSignalValidationRecord(value: unknown): value is SignalValidationReco
     Number.isFinite(record.expiresAt) &&
     typeof record.symbol === 'string' &&
     (record.direction === 'BUY' || record.direction === 'SELL') &&
-    (record.timeframe === 'M5' || record.timeframe === 'M15') &&
+    (record.timeframe === 'M1' || record.timeframe === 'M5' || record.timeframe === 'M15') &&
     Number.isFinite(record.triggerPrice) &&
     Number.isFinite(record.stopLoss) &&
     Number.isFinite(record.takeProfit) &&
@@ -186,7 +279,7 @@ function isSignalValidationRecord(value: unknown): value is SignalValidationReco
 
 function persistSignalValidations(records: SignalValidationRecord[]): void {
   try {
-    localStorage.setItem(SIGNAL_VALIDATION_STORAGE_KEY, JSON.stringify(records.slice(-300)));
+    localStorage.setItem(scopedKey(SIGNAL_VALIDATION_STORAGE_KEY), JSON.stringify(records.slice(-300)));
   } catch (error) {
     console.error('[Trade Journal] Could not persist signal validation records:', error);
   }
@@ -224,7 +317,7 @@ export function advanceSignalValidations(
 
 export function readStoredJournalTrades(): JournalTradeRecord[] {
   try {
-    const stored = localStorage.getItem(JOURNAL_TRADES_STORAGE_KEY);
+    const stored = localStorage.getItem(scopedKey(JOURNAL_TRADES_STORAGE_KEY));
     if (!stored) return [];
     const parsed = JSON.parse(stored);
     return Array.isArray(parsed) ? parsed : [];
@@ -236,8 +329,8 @@ export function readStoredJournalTrades(): JournalTradeRecord[] {
 
 export function persistJournalTrades(trades: JournalTradeRecord[]): void {
   try {
-    const trimmed = trades.slice(-300);
-    localStorage.setItem(JOURNAL_TRADES_STORAGE_KEY, JSON.stringify(trimmed));
+    const trimmed = trades.slice(-1000);
+    localStorage.setItem(scopedKey(JOURNAL_TRADES_STORAGE_KEY), JSON.stringify(trimmed));
   } catch (error) {
     console.error('[Trade Journal] Could not persist journal trades:', error);
   }
@@ -341,10 +434,38 @@ export function reconcileRunningJournalTrades(activeTickets: number[]): void {
   }
 }
 
+export function reconcileBrokerClosedTradesInJournal(closedTrades: ClosedTrade[]): void {
+  if (!closedTrades.length) return;
+  const existing = readStoredJournalTrades();
+  const byTicket = new Map<number, JournalTradeRecord>(existing.map((t) => [t.ticket, t]));
+  let changed = false;
+
+  for (const trade of closedTrades) {
+    const prev = byTicket.get(trade.ticket) ?? (trade.positionTicket ? byTicket.get(trade.positionTicket) : undefined);
+    const nextRecord: JournalTradeRecord = {
+      ...prev,
+      ...trade,
+      status: 'CLOSED',
+    };
+    if (!prev || JSON.stringify(prev) !== JSON.stringify(nextRecord)) {
+      byTicket.set(trade.ticket, nextRecord);
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    const sorted = [...byTicket.values()].sort((a, b) =>
+      (b.closedAt || '').localeCompare(a.closedAt || '')
+    );
+    persistJournalTrades(sorted);
+    notifyJournalChanged();
+  }
+}
+
 export function clearJournalSignals(): void {
   try {
-    localStorage.removeItem(JOURNAL_SIGNALS_STORAGE_KEY);
-    localStorage.removeItem(SIGNAL_VALIDATION_STORAGE_KEY);
+    localStorage.removeItem(scopedKey(JOURNAL_SIGNALS_STORAGE_KEY));
+    localStorage.removeItem(scopedKey(SIGNAL_VALIDATION_STORAGE_KEY));
     notifyJournalChanged();
   } catch (e) {
     console.error('[Trade Journal] Could not clear signals:', e);
@@ -353,8 +474,8 @@ export function clearJournalSignals(): void {
 
 export function clearJournalTrades(): void {
   try {
-    localStorage.removeItem(JOURNAL_TRADES_STORAGE_KEY);
-    localStorage.removeItem(CLOSED_TRADES_STORAGE_KEY);
+    localStorage.removeItem(scopedKey(JOURNAL_TRADES_STORAGE_KEY));
+    localStorage.removeItem(scopedKey(CLOSED_TRADES_STORAGE_KEY));
     notifyJournalChanged();
   } catch (e) {
     console.error('[Trade Journal] Could not clear trades:', e);
@@ -368,7 +489,7 @@ export function clearAllJournal(): void {
 
 export function readTradeRationales(): TradeRationales {
   try {
-    const stored = localStorage.getItem(TRADE_RATIONALES_STORAGE_KEY);
+    const stored = localStorage.getItem(scopedKey(TRADE_RATIONALES_STORAGE_KEY));
     if (!stored) return {};
     const parsed: unknown = JSON.parse(stored);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -387,7 +508,7 @@ export function readTradeRationales(): TradeRationales {
 
 export function persistTradeRationales(rationales: TradeRationales): void {
   try {
-    localStorage.setItem(TRADE_RATIONALES_STORAGE_KEY, JSON.stringify(rationales));
+    localStorage.setItem(scopedKey(TRADE_RATIONALES_STORAGE_KEY), JSON.stringify(rationales));
   } catch (error) {
     console.error('[Trade Journal] Could not save trade rationales:', error);
   }
@@ -395,7 +516,7 @@ export function persistTradeRationales(rationales: TradeRationales): void {
 
 export function readTradeOrderBlocks(): TradeOrderBlocks {
   try {
-    const stored = localStorage.getItem(TRADE_ORDER_BLOCKS_STORAGE_KEY);
+    const stored = localStorage.getItem(scopedKey(TRADE_ORDER_BLOCKS_STORAGE_KEY));
     if (!stored) return {};
     const parsed: unknown = JSON.parse(stored);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -414,7 +535,7 @@ export function readTradeOrderBlocks(): TradeOrderBlocks {
 
 export function persistTradeOrderBlocks(orderBlocks: TradeOrderBlocks): void {
   try {
-    localStorage.setItem(TRADE_ORDER_BLOCKS_STORAGE_KEY, JSON.stringify(orderBlocks));
+    localStorage.setItem(scopedKey(TRADE_ORDER_BLOCKS_STORAGE_KEY), JSON.stringify(orderBlocks));
   } catch (error) {
     console.error('[Trade Journal] Could not save trade order blocks:', error);
   }

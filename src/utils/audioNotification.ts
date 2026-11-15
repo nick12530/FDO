@@ -110,7 +110,7 @@ class SignalAudioNotifier {
    */
   public playSignalAlert(
     direction: 'BUY' | 'SELL' = 'BUY',
-    price: number = 4188.5,
+    price: number = 0,
     notifyListeners: boolean = true
   ) {
     if (notifyListeners) {
@@ -306,7 +306,7 @@ class SignalAudioNotifier {
   public playTestChime(type: 'signal' | 'trade' | 'precision' | 'profit' | 'loss' = 'signal') {
     const wasMuted = this.isMuted;
     this.isMuted = false;
-    if (type === 'signal') this.playSignalAlert('BUY', 4188.5, false);
+    if (type === 'signal') this.playSignalAlert('BUY', 0, false);
     else if (type === 'trade') this.playTradeExecutionAlert('BUY');
     else if (type === 'precision') this.playPrecisionEntryAlert();
     else if (type === 'profit') this.playProfitAlert(25.5);
