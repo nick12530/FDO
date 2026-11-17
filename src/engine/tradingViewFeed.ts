@@ -40,7 +40,6 @@ class TradingViewFeedService {
       XAUUSD: null,
       EURUSD: null,
       GBPUSD: null,
-      USDJPY: null,
     },
     syncCount: 0,
     error: null,
@@ -91,7 +90,7 @@ class TradingViewFeedService {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          symbols: { tickers: ['FX:EURUSD', 'FX:GBPUSD', 'FX:USDJPY'] },
+          symbols: { tickers: ['FX:EURUSD', 'FX:GBPUSD'] },
           columns: ['close', 'change', 'bid', 'ask', 'high', 'low', 'volume'],
         }),
       }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
@@ -142,8 +141,6 @@ class TradingViewFeedService {
           let targetSym: SupportedSymbol | null = null;
           if (item.s?.includes('EURUSD')) targetSym = 'EURUSD';
           else if (item.s?.includes('GBPUSD')) targetSym = 'GBPUSD';
-          else if (item.s?.includes('USDJPY')) targetSym = 'USDJPY';
-
           if (targetSym && typeof bid === 'number' && bid > 0 && typeof ask === 'number' && ask >= bid) {
             this.state.quotes[targetSym] = {
               symbol: targetSym,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { calculateRiskBasedVolume, RISK_CONFIG } from './riskConfig';
+import { calculateRiskBasedVolume, isAdaptiveMicroFloorAllowed, RISK_CONFIG } from './riskConfig';
 
 const spec = {
   tickSize: 0.01,
@@ -30,5 +30,12 @@ describe('broker risk-based position sizing', () => {
   it('allows the broker minimum for the previously blocked small-account EURUSD risk estimate', () => {
     const eurUsdSpec = { ...spec, tickSize: 1, tickValue: 94 };
     expect(calculateRiskBasedVolume(89.92, RISK_CONFIG.riskPercentPerTrade, 1, eurUsdSpec)).toBe(0.01);
+  });
+
+  it('limits adaptive minimum-lot risk to the configured dollar or equity cap', () => {
+    expect(isAdaptiveMicroFloorAllowed(332, 2.37)).toBe(true);
+    expect(isAdaptiveMicroFloorAllowed(100, 15.01)).toBe(false);
+    expect(isAdaptiveMicroFloorAllowed(100, 3.5)).toBe(true);
+    expect(isAdaptiveMicroFloorAllowed(100, 3.51)).toBe(false);
   });
 });

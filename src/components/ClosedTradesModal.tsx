@@ -22,7 +22,7 @@ import {
 } from '../engine/tradeJournal';
 import { tradingEngine } from '../engine/tradingEngine';
 import { mt5Bridge } from '../engine/mt5Bridge';
-import { getInstrumentConfig, SupportedSymbol } from '../engine/instrumentConfig';
+import { getInstrumentConfig, getSupportedSymbol, SupportedSymbol } from '../engine/instrumentConfig';
 import {
   CalendarDays,
   ChevronLeft,
@@ -168,8 +168,9 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
           trade.pips = matchingPos.pips;
           trade.closePrice = matchingPos.type === 'BUY' ? ticker.bid : ticker.ask;
         } else {
-          const sym = (trade.symbol || ticker.symbol || 'XAUUSD') as SupportedSymbol;
-          const pairQuote = tradingEngine.pairData[sym];
+          const sym = trade.symbol || ticker.symbol || 'XAUUSD';
+          const pairSymbol = getSupportedSymbol(sym);
+          const pairQuote = pairSymbol ? tradingEngine.pairData[pairSymbol] : undefined;
           const curBid = sym === ticker.symbol ? ticker.bid : (pairQuote?.bid ?? trade.openPrice);
           const curAsk = sym === ticker.symbol ? ticker.ask : (pairQuote?.ask ?? trade.openPrice);
           const curPrice = trade.type === 'BUY' ? curBid : curAsk;
@@ -177,7 +178,7 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
           const pts = trade.type === 'BUY' ? curPrice - trade.openPrice : trade.openPrice - curPrice;
           const pips = Number((pts / cfg.pipSize).toFixed(1));
           const profit =
-            sym === 'USDJPY'
+            String(sym) === 'USDJPY'
               ? Number(((pts * trade.volume * cfg.contractSize) / Math.max(1, curPrice)).toFixed(2))
               : Number((pts * trade.volume * cfg.contractSize).toFixed(2));
           trade.profit = profit;

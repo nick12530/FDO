@@ -111,6 +111,11 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
   const sizingInfo = rawSig
     ? tradingEngine.getRiskSizingInfo(rawSig.sl, rawSig.direction, ticker.symbol as SupportedSymbol)
     : null;
+  const isAdaptiveMicroFloor = Boolean(
+    sizingInfo &&
+    sizingInfo.safeVolume === sizingInfo.minimumLot &&
+    sizingInfo.minimumLotRisk > sizingInfo.riskBudget
+  );
   const hasSafeLot = typeof riskLimitedLotSize === 'number' && riskLimitedLotSize > 0;
   const slPrice = rawSig?.sl ?? null;
   const tpPrice = rawSig?.tp ?? null;
@@ -167,9 +172,6 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
       if (config.category === 'metals') {
         riskDollar = Number((riskPts * totalLots * config.contractSize).toFixed(2));
         rewardDollar = Number((rewardPts * totalLots * config.contractSize).toFixed(2));
-      } else if (ticker.symbol === 'USDJPY') {
-        riskDollar = Number(((riskPts * totalLots * config.contractSize) / Math.max(1, currentSpot || 150)).toFixed(2));
-        rewardDollar = Number(((rewardPts * totalLots * config.contractSize) / Math.max(1, currentSpot || 150)).toFixed(2));
       } else {
         riskDollar = Number((riskPts * totalLots * config.contractSize).toFixed(2));
         rewardDollar = Number((rewardPts * totalLots * config.contractSize).toFixed(2));
@@ -308,7 +310,7 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
                 <span>Broker Trade Disabled ({ticker.symbol} · 10017)</span>
               </div>
               <p className="text-[11px] leading-relaxed">
-                Execution is disabled for <strong>{ticker.symbol}</strong> on this account. Switch to XAUUSD or EURUSD to execute live orders.
+                Execution is disabled for <strong>{ticker.symbol}</strong> on this account. Check its MT5 permissions; only use another supported symbol if your broker enables it.
               </p>
             </div>
           )}
@@ -454,6 +456,11 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
                 1:{tradeMetrics.rrRatio} · {riskLimitedLotSize && riskLimitedLotSize > 0 ? `${riskLimitedLotSize.toFixed(2)}L safe` : 'Sizing hold'}
               </span>
             </div>
+            {isAdaptiveMicroFloor && sizingInfo && (
+              <p className="text-[10px] font-semibold text-amber-700 dark:text-amber-300">
+                Minimum-lot risk ${sizingInfo.minimumLotRisk.toFixed(2)} exceeds the ${sizingInfo.riskBudget.toFixed(2)} budget; adaptive cap applies.
+              </p>
+            )}
 
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-1">

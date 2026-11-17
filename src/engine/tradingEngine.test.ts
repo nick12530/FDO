@@ -11,6 +11,7 @@ import { TradingEngine, getDefaultSymbolSpec } from './tradingEngine';
 import { Candle } from '../types/smc';
 import { calculateRiskBasedVolume } from './riskConfig';
 import { mt5Bridge } from './mt5Bridge';
+import { SUPPORTED_SYMBOLS } from './instrumentConfig';
 
 describe('risk-based position sizing', () => {
   it('sizes a known XAU-style contract from equity, stop, tick value, and broker lot step', () => {
@@ -96,6 +97,31 @@ describe('risk-based position sizing', () => {
     });
     expect(engine.getRiskBasedVolume(100, 0.01, 'BUY')).toBeNull();
   });
+
+  it('keeps adaptive broker-minimum sizing consistent through execution validation', () => {
+    const engine = new TradingEngine();
+    engine.stopEngineLoops();
+    engine.activeSymbol = 'XAUUSD';
+    engine.account.equity = 332;
+    engine.account.risk_pct = 0.5;
+    engine.bid = 2000;
+    engine.ask = 2000;
+    const spec = {
+      tickSize: 0.01,
+      tickValue: 1,
+      contractSize: 100,
+      volumeMin: 0.01,
+      volumeMax: 100,
+      volumeStep: 0.01,
+    };
+    (engine as any).symbolSpec = spec;
+
+    expect(engine.getRiskSizingInfo(1997.63, 'BUY')?.safeVolume).toBe(0.01);
+    expect(engine.getRiskBasedVolume(1997.63, 0.01, 'BUY')).toBe(0.01);
+    expect((engine as any).getExecutionRiskVolume(0.01, 1997.63, 2000, 'XAUUSD')).toEqual({
+      volume: 0.01,
+    });
+  });
 });
 
 describe('broker-only signal availability', () => {
@@ -120,6 +146,43 @@ describe('broker-only signal availability', () => {
 
     expect(engine.getScannerAnalyses()).toEqual([]);
     expect(engine.getBestOpportunity()).toBeNull();
+  });
+
+  it('shows stale broker pairs as blocked instead of leaving the connected scanner blank', () => {
+    const engine = new TradingEngine();
+    engine.stopEngineLoops();
+    engine.connected = true;
+    engine.mt5Account.connected = true;
+    for (const symbol of SUPPORTED_SYMBOLS) {
+      const stale = (intervalMs: number) =>
+        candles(80, intervalMs).map((candle) => ({
+          ...candle,
+          time: candle.time - 60 * 60_000,
+        }));
+      engine.pairData[symbol] = {
+        candlesM1: stale(60_000),
+        candlesM5: stale(5 * 60_000),
+        candlesM15: stale(15 * 60_000),
+        candlesH1: stale(60 * 60_000),
+        bid: 2000,
+        ask: 2000.1,
+        spread: 10,
+        marketDataAt: Date.now(),
+        symbolSpec: getDefaultSymbolSpec(symbol),
+      };
+    }
+
+    engine.refreshScanner();
+
+    const analyses = engine.getScannerAnalyses();
+    expect(analyses).toHaveLength(SUPPORTED_SYMBOLS.length);
+    expect(analyses.every((analysis) =>
+      analysis.status === 'BLOCKED' &&
+      analysis.price > 0 &&
+      analysis.safeLotSize === null &&
+      analysis.rejectionReason === 'BROKER_CANDLES_STALE_WAITING_FOR_FRESH_BARS'
+    )).toBe(true);
+    engine.stopEngineLoops();
   });
 
   it('refreshes the scanner after failed pair-data requests so stale analyses are rechecked', async () => {
@@ -368,6 +431,47 @@ describe('final execution-boundary risk validation', () => {
 
     await engine.evaluateAutoExecution();
 
+    expect(sendTrade).toHaveBeenCalledTimes(1);
+  });
+
+  it('pauses auto-trade after MT5 reports trading disabled and does not retry', async () => {
+    engine.account.equity = 10_000;
+    engine.account.risk_pct = 0.5;
+    engine.activeSymbol = 'XAUUSD';
+    engine.instrumentType = 'synthetic';
+    engine.bid = 2000;
+    engine.ask = 2000.1;
+    (engine as any).symbolSpec = getDefaultSymbolSpec('XAUUSD');
+    engine.autoTrade = true;
+    vi.spyOn(mt5Bridge, 'getSymbol').mockReturnValue('XAUUSD');
+    const sendTrade = vi.spyOn(mt5Bridge, 'sendTrade').mockRejectedValue(
+      new Error('MT5 has disabled trading for XAUUSD (retcode 10017).')
+    );
+    const setAutoTrade = vi.spyOn(mt5Bridge, 'setAutoTrade').mockResolvedValue();
+    const signal = {
+      direction: 'BUY' as const,
+      entry: 2000,
+      sl: 1990,
+      tp: 2032,
+      score: 6.8,
+      strategy: 'Trend Pullback' as const,
+      timeframe: 'M5' as const,
+      timestamp: new Date().toISOString(),
+      expiryTimestamp: Date.now() + 60_000,
+    };
+    vi.spyOn(engine, 'getMarketSnapshot').mockReturnValue({
+      brokerMarketData: true,
+      zones: [],
+      signals: [signal],
+      signal,
+    } as any);
+
+    await engine.evaluateAutoExecution();
+    await Promise.resolve();
+
+    expect(engine.autoTrade).toBe(false);
+    expect(setAutoTrade).toHaveBeenCalledWith(false);
+    await engine.evaluateAutoExecution();
     expect(sendTrade).toHaveBeenCalledTimes(1);
   });
 

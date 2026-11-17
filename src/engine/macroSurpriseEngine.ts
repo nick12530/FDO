@@ -4,7 +4,7 @@
  * Quantifies economic releases (CPI, NFP, GDP, Central Bank Rate Decisions):
  * - Computes Surprise Delta: (Actual - Forecast)
  * - Identifies Post-News Institutional Drift windows (5m - 60m post-print)
- * - Maps macroeconomic surprises to instrument bias (XAUUSD, EURUSD, GBPUSD, USDJPY)
+ * - Maps macroeconomic surprises to instrument bias (XAUUSD, EURUSD, GBPUSD)
  * - Scores macro confluence bonus (+1.5) or warns against macro headwinds (-2.0)
  */
 
@@ -58,7 +58,7 @@ export function getCurrencySurpriseBias(event: EconomicEvent): 'BULLISH' | 'BEAR
 
 /**
  * Maps a currency bias to the expected direction for a given trading pair.
- * E.g., USD BULLISH -> EURUSD SELL, GBPUSD SELL, USDJPY BUY, XAUUSD SELL.
+ * E.g., USD BULLISH -> EURUSD SELL, GBPUSD SELL, XAUUSD SELL.
  */
 export function mapCurrencyBiasToPair(
   symbol: SupportedSymbol,
@@ -70,15 +70,11 @@ export function mapCurrencyBiasToPair(
   if (currency === 'USD') {
     if (symbol === 'EURUSD' || symbol === 'GBPUSD' || symbol === 'XAUUSD') {
       return currencyBias === 'BULLISH' ? 'SELL' : 'BUY';
-    } else if (symbol === 'USDJPY') {
-      return currencyBias === 'BULLISH' ? 'BUY' : 'SELL';
     }
   } else if (currency === 'EUR' && symbol === 'EURUSD') {
     return currencyBias === 'BULLISH' ? 'BUY' : 'SELL';
   } else if (currency === 'GBP' && symbol === 'GBPUSD') {
     return currencyBias === 'BULLISH' ? 'BUY' : 'SELL';
-  } else if (currency === 'JPY' && symbol === 'USDJPY') {
-    return currencyBias === 'BULLISH' ? 'SELL' : 'BUY'; // JPY strong -> USDJPY drops
   }
 
   return 'NEUTRAL';

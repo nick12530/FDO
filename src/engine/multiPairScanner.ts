@@ -1,6 +1,6 @@
 /**
  * multiPairScanner.ts - Multi-Pair Market Scanner, Common Confluence Signal Engine & Risk Manager
- * Analyzes XAUUSD, EURUSD, USDJPY, and GBPUSD independently with:
+ * Analyzes XAUUSD, EURUSD, and GBPUSD independently with:
  * - Live price, bid/ask, spread
  * - Multi-timeframe trend (M1, M5, M15, H1)
  * - Swings, BOS, CHoCH, liquidity highs/lows, FVGs, Order Blocks
@@ -33,6 +33,7 @@ import { calculateRVOL } from './volumeEngine';
 import { evaluateMacroSurpriseConfluence } from './macroSurpriseEngine';
 import { newsSentimentEngine } from './newsSentimentEngine';
 import { intermarketEngine } from './intermarketEngine';
+import { isAdaptiveMicroFloorAllowed } from './riskConfig';
 
 export interface LiquidityLevels {
   equalHighs: number[];
@@ -297,7 +298,6 @@ function detectMultiBarSweep(candles: Candle[], lookbackBars: number = 3): 'high
  * Checks existing positions for cumulative USD exposure.
  * EURUSD BUY = short USD
  * GBPUSD BUY = short USD
- * USDJPY SELL = short USD
  * XAUUSD BUY = short USD
  */
 export function checkCorrelationExposure(
@@ -311,9 +311,8 @@ export function checkCorrelationExposure(
     if (s.includes('EURUSD') || s.includes('GBPUSD') || s.includes('XAUUSD')) {
       return dir === 'BUY' ? 'SHORT_USD' : 'LONG_USD';
     }
-    if (s.includes('USDJPY')) {
-      return dir === 'BUY' ? 'LONG_USD' : 'SHORT_USD';
-    }
+    // Include legacy USDJPY positions in exposure totals, though it is no longer tradeable here.
+    if (s.includes('USDJPY')) return dir === 'BUY' ? 'LONG_USD' : 'SHORT_USD';
     return null;
   };
 
@@ -393,8 +392,6 @@ export function calculateSmallAccountPositionSize(
     pipValuePerLot = (symbolSpec.tickValue / symbolSpec.tickSize) * config.pipSize;
     minLot = symbolSpec.volumeMin;
     lotStep = symbolSpec.volumeStep;
-  } else if (symbol === 'USDJPY') {
-    pipValuePerLot = 6.67;
   }
 
   const riskPerStandardLot = symbolSpec
@@ -402,7 +399,7 @@ export function calculateSmallAccountPositionSize(
     : (stopDistancePrice / config.pipSize) * pipValuePerLot;
   const riskPerMinLot = riskPerStandardLot * minLot;
 
-  if (riskPerMinLot > riskBudget) {
+  if (riskPerMinLot > riskBudget && !isAdaptiveMicroFloorAllowed(equity, riskPerMinLot)) {
     return {
       safeVolume: null,
       riskAmount: riskPerMinLot,

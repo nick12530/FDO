@@ -1,5 +1,6 @@
 import { Candle, ClosedTrade, EconomicEvent, InstrumentType, PendingOrder, TradeDirection, NewsSentimentItem } from '../types/smc';
 import type { SymbolRiskSpec } from './riskConfig';
+import { getSupportedSymbol } from './instrumentConfig';
 
 export interface BridgeAccountSnapshot {
   account: {
@@ -49,6 +50,7 @@ export interface BridgeStatus {
   mode: 'standalone' | 'demo' | 'live' | 'contest' | 'unknown';
   latencyMs?: number | null;
   isReconnecting?: boolean;
+  isTailscale?: boolean;
 }
 
 const DEFAULT_SERVER_URL = 'http://127.0.0.1:8000';
@@ -67,6 +69,17 @@ export function normalizeLocalBridgeUrl(input: string): string {
     if (error instanceof Error && error.message.includes('PC-local')) throw error;
     throw new Error('Enter a valid local MT5 bridge URL, such as http://127.0.0.1:8000.');
   }
+}
+
+export function normalizeTailscaleUrl(input: string): string {
+  const trimmed = input.trim();
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+    return trimmed;
+  }
+  if (trimmed.startsWith('100.') || trimmed.includes('.ts.net') || trimmed.includes('127.0.0.1')) {
+    return `http://${trimmed}`;
+  }
+  return trimmed;
 }
 
 function isDashboardBridgeProxy(url: string): boolean {
@@ -112,12 +125,17 @@ export class MT5BridgeConnector {
       const auto = localStorage.getItem('smc_mt5_auto_connect');
       if (auto === 'true') {
         const savedSymbol = localStorage.getItem('smc_mt5_symbol');
-        if (savedSymbol) this.symbol = savedSymbol.trim();
+        if (savedSymbol && !getSupportedSymbol(savedSymbol)) {
+          localStorage.removeItem('smc_mt5_auto_connect');
+          this.lastError = `Saved MT5 symbol ${savedSymbol} is no longer supported. Choose XAUUSD, EURUSD, or GBPUSD to reconnect.`;
+        } else if (savedSymbol) {
+          this.symbol = savedSymbol.trim();
+        }
         const savedType = localStorage.getItem('smc_mt5_instrument_type') as InstrumentType;
         if (savedType) this.instrumentType = savedType;
         const savedLogin = localStorage.getItem('smc_mt5_login');
         const savedServer = localStorage.getItem('smc_mt5_server');
-        if (savedLogin && savedServer) {
+        if (savedLogin && savedServer && localStorage.getItem('smc_mt5_auto_connect') === 'true') {
           this.expectedAccount = { login: Number(savedLogin), server: savedServer };
           this.isConnected = true;
           this.isReconnecting = true;
@@ -160,6 +178,7 @@ export class MT5BridgeConnector {
   }
 
   getStatus(): BridgeStatus {
+    const isTailscale = this.serverUrl.includes('100.') || this.serverUrl.includes('.ts.net');
     return {
       connected: this.isConnected,
       serverUrl: this.serverUrl,
@@ -168,6 +187,7 @@ export class MT5BridgeConnector {
       mode: this.isConnected ? this.accountMode : 'standalone',
       latencyMs: this.lastLatencyMs,
       isReconnecting: this.isReconnecting,
+      isTailscale: isTailscale,
     };
   }
 
@@ -292,6 +312,9 @@ export class MT5BridgeConnector {
     },
     isAutoReconnect = false
   ): Promise<BridgeAccountSnapshot> {
+    if (!getSupportedSymbol(credentials.symbol)) {
+      throw new Error('Unsupported instrument. Choose XAUUSD, EURUSD, or GBPUSD.');
+    }
     if (credentials.token !== undefined) {
       this.setBridgeToken(credentials.token);
     }
@@ -405,6 +428,13 @@ export class MT5BridgeConnector {
     if (auto !== 'true') return false;
     const baseUrl = localStorage.getItem('smc_mt5_base_url') || getDefaultServerUrl();
     const symbol = localStorage.getItem('smc_mt5_symbol') || 'XAUUSD';
+    if (!getSupportedSymbol(symbol)) {
+      localStorage.removeItem('smc_mt5_auto_connect');
+      this.lastError = `Saved MT5 symbol ${symbol} is no longer supported. Choose XAUUSD, EURUSD, or GBPUSD to reconnect.`;
+      this.isReconnecting = false;
+      this.onConnectionChangeCallback?.(false, this.lastError);
+      return false;
+    }
     const instrumentType = (localStorage.getItem('smc_mt5_instrument_type') as InstrumentType) || 'standard';
     try {
       await this.connectAccount({ baseUrl, symbol, instrumentType }, true);

@@ -31,6 +31,7 @@ from risk_math import is_valid_close_volume, stop_risk, volume_for_risk
 from broker_time import future_broker_clock_offset_seconds
 from signal_freshness import is_signal_stale
 from calendar_feed import normalize_finnhub_calendar, normalize_forexfactory_calendar
+from symbol_resolution import select_broker_symbol, symbol_allows_open
 
 app = FastAPI(title="Local MT5 Bridge", docs_url=None, redoc_url=None)
 
@@ -154,48 +155,52 @@ def configured_news_blackout(now: datetime) -> bool:
         return False
 
 
-def resolve_broker_symbol(symbol: str) -> str:
+def resolve_broker_symbol(
+    symbol: str,
+    direction: str | None = None,
+    require_tradeable: bool = False,
+) -> str:
     cleaned = (symbol or "").strip()
     if not cleaned:
         return cleaned
 
-    # 1. Exact match in MT5
+    upper_clean = cleaned.upper().replace("/", "")
     info = mt5.symbol_info(cleaned)
-    if info is not None:
+    if info is not None and symbol_allows_open(int(getattr(info, "trade_mode", 4)), direction):
         return cleaned
 
     try:
         all_symbols = mt5.symbols_get()
         if not all_symbols:
-            return cleaned
+            all_symbols = []
 
-        upper_clean = cleaned.upper().replace("/", "")
-
-        # 2. Case-insensitive exact match
-        for s in all_symbols:
-            if s.name.upper() == upper_clean:
-                return s.name
-
-        # 3. Match broker suffix (e.g. XAUUSD matches XAUUSD.vx, XAUUSDm, XAUUSD.r, XAUUSDpro)
-        candidates = [s.name for s in all_symbols if s.name.upper().startswith(upper_clean)]
-        if candidates:
-            visible = [c for c in candidates if (sym_info := mt5.symbol_info(c)) and getattr(sym_info, "visible", True)]
-            return visible[0] if visible else candidates[0]
-
-        # 4. Match embedded symbol (e.g. mEURUSD, pro.EURUSD)
-        contains_candidates = [s.name for s in all_symbols if upper_clean in s.name.upper()]
-        if contains_candidates:
-            visible = [c for c in contains_candidates if (sym_info := mt5.symbol_info(c)) and getattr(sym_info, "visible", True)]
-            return visible[0] if visible else contains_candidates[0]
-
-        # 5. Gold alias match (e.g. XAUUSD <-> GOLD)
-        if "XAU" in upper_clean or "GOLD" in upper_clean:
-            gold_candidates = [s.name for s in all_symbols if "XAUUSD" in s.name.upper() or "GOLD" in s.name.upper()]
-            if gold_candidates:
-                visible = [c for c in gold_candidates if (sym_info := mt5.symbol_info(c)) and getattr(sym_info, "visible", True)]
-                return visible[0] if visible else gold_candidates[0]
+        candidates: list[tuple[str, int, bool]] = []
+        for item in all_symbols:
+            candidate_info = mt5.symbol_info(item.name)
+            if candidate_info is not None:
+                candidates.append((
+                    item.name,
+                    int(getattr(candidate_info, "trade_mode", 4)),
+                    bool(getattr(candidate_info, "visible", False)),
+                ))
+        selected = select_broker_symbol(cleaned, candidates, direction)
+        if selected:
+            return selected
     except Exception:
-        pass
+        logger.exception("Could not inspect MT5 symbols while resolving %r.", cleaned)
+
+    if require_tradeable:
+        side = f" for opening {direction}" if direction else ""
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No trade-enabled MT5 symbol matching {cleaned!r}{side} was found. "
+                "Check the exact Market Watch symbol and account trading permissions."
+            ),
+        )
+
+    if info is not None:
+        return cleaned
 
     return cleaned
 
@@ -340,14 +345,12 @@ INSTRUMENT_MAX_SPREADS: dict[str, float] = {
     "XAUUSD": 40.0,
     "EURUSD": 20.0,
     "GBPUSD": 25.0,
-    "USDJPY": 25.0,
 }
 
 INSTRUMENT_MAX_DEVIATIONS: dict[str, int] = {
     "XAUUSD": 50,  # 50 points = 5.0 pips / $0.50 on Gold
     "EURUSD": 20,  # 20 points = 2.0 pips on EURUSD
     "GBPUSD": 25,  # 25 points = 2.5 pips on GBPUSD
-    "USDJPY": 20,  # 20 points = 2.0 pips on USDJPY
 }
 
 
@@ -1118,7 +1121,7 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
         raise HTTPException(status_code=423, detail="Configured high-impact news blackout window is active.")
 
     raw_symbol = payload.symbol.strip()
-    symbol = resolve_broker_symbol(raw_symbol)
+    symbol = resolve_broker_symbol(raw_symbol, payload.direction, require_tradeable=True)
     info = mt5.symbol_info(symbol)
     if info is None or not getattr(info, "visible", True):
         mt5.symbol_select(symbol, True)
@@ -1343,6 +1346,7 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
         vol_max,
         allow_micro_floor=allow_micro_floor,
         equity=account["equity"],
+        max_micro_floor_risk=float(RISK_CONFIG.get("maxMicroFloorRiskDollar", 15.0)),
     )
     if safe_volume is None:
         min_lot_risk = risk_per_lot * vol_min
@@ -1499,7 +1503,6 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
 
     magic_num = payload.magic or {
         "EURUSD": 10001,
-        "USDJPY": 10002,
         "GBPUSD": 10003,
         "XAUUSD": 20261001,
     }.get(symbol.upper(), 20261001)
@@ -1518,20 +1521,28 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
                 cur_price = entry_reference_price if use_pending_limit else ((cur_tick.ask if payload.direction == "BUY" else cur_tick.bid) if cur_tick else price)
                 current_risk_per_lot = abs(cur_price - desired_sl) / symbol_spec["tickSize"] * symbol_spec["tickValue"]
                 current_portfolio_budget = max(0.0, portfolio_risk_budget - current_portfolio_risk)
-                current_safe_volume = volume_for_risk(
-                    min(risk_budget, current_portfolio_budget),
+                current_trade_safe_volume = volume_for_risk(
+                    risk_budget,
                     current_risk_per_lot,
                     vol_min,
                     vol_step,
                     vol_max,
-                    allow_micro_floor=(allow_micro_floor and current_portfolio_budget >= risk_budget - 1e-9),
+                    allow_micro_floor=allow_micro_floor,
                     equity=account["equity"],
+                    max_micro_floor_risk=float(RISK_CONFIG.get("maxMicroFloorRiskDollar", 15.0)),
                 )
-                if current_safe_volume is None:
+                current_portfolio_safe_volume = volume_for_risk(
+                    current_portfolio_budget,
+                    current_risk_per_lot,
+                    vol_min,
+                    vol_step,
+                    vol_max,
+                )
+                if current_trade_safe_volume is None or current_portfolio_safe_volume is None:
                     min_lot_risk = current_risk_per_lot * vol_min
                     reason = (
                         "PORTFOLIO_RISK_LIMIT_EXCEEDED"
-                        if current_portfolio_budget < risk_budget
+                        if current_portfolio_safe_volume is None
                         else "MINIMUM_LOT_EXCEEDS_RISK"
                     )
                     raise HTTPException(
@@ -1542,6 +1553,7 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
                             f"available budget: ${min(risk_budget, current_portfolio_budget):.2f}) at refreshed quote."
                         ),
                     )
+                current_safe_volume = min(current_trade_safe_volume, current_portfolio_safe_volume)
                 if payload.volume > current_safe_volume + 1e-9:
                     logger.info(
                         "Reduced order volume at refreshed quote from %sL to risk-safe %sL.",

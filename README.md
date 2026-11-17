@@ -1,6 +1,6 @@
 # NIFTY Institutional SMC Trading Terminal & MT5 Bridge
 
-An algorithmic Smart Money Concepts (SMC) workstation for **Gold (XAUUSD)** and major Forex pairs (**EURUSD**, **GBPUSD**, **USDJPY**). Signal analysis and order execution require current, verified MetaTrader 5 (MT5) broker data. The TradingView chart is a separate view-only embed.
+An algorithmic Smart Money Concepts (SMC) workstation for **Gold (XAUUSD)** and major Forex pairs (**EURUSD** and **GBPUSD**). The official TradingView embed displays the chart and native technical studies; signal analysis and order execution use current, verified MetaTrader 5 (MT5) broker data.
 
 ---
 
@@ -24,7 +24,7 @@ An algorithmic Smart Money Concepts (SMC) workstation for **Gold (XAUUSD)** and 
 - **Direct Article Navigation**: Inspect source links directly from the news feed to read complete verified financial publications in your browser.
 
 ### 4. 🛡️ Risk Controls & Broker Preflight
-- **Risk-Budget Sizing**: Volume is rounded down to the broker step; if minimum lot risk exceeds the configured per-trade budget, the order is rejected.
+- **Risk-Budget Sizing**: Volume is rounded down to the broker step. The configured adaptive minimum-lot allowance permits risk above the per-trade budget only up to $15 or 3.5% of equity; larger excesses are rejected.
 - **Portfolio Stop-Risk Cap**: The MT5 bridge sums estimated downside at current stops across open positions and pending broker orders, then limits new exposure to the configured portfolio cap (3% of equity by default).
 - **Fail-Closed Exposure Checks**: Missing stops or symbol risk specifications make total exposure unknown and block new orders.
 - **Pre-Order Validation**: The bridge checks refreshed quotes, recalculates risk, and uses MT5 `order_check` before sending order requests.
@@ -49,8 +49,8 @@ An algorithmic Smart Money Concepts (SMC) workstation for **Gold (XAUUSD)** and 
 
 - **Frontend**: React 19, TypeScript, Vite, Tailwind CSS v4, Lucide Icons.
 - **State Architecture**: Fine-grained subscription channels via `useSyncExternalStore` for microsecond render stability.
-- **Charting**: Official TradingView Advanced Real-Time Chart widget + Institutional SMC SVG Engine with `SMCOverlayHUD`.
-- **Market Data**: Local MT5 bridge for signal calculations and execution. TradingView chart embed is view-only.
+- **Charting**: Official TradingView Advanced Chart embed with configurable native EMA, RSI, and MACD studies.
+- **Market Data**: TradingView supplies the displayed chart; the local MT5 bridge supplies signal calculations and execution quotes. Custom SMC drawings are not injected into the TradingView embed.
 - **Audio Engine**: Native procedural Web Audio API with oscillators, biquad lowpass filters, and exponential gain ramping.
 - **Broker Bridge**: Python 3 `MetaTrader5` socket bridge / REST bridge compatible with standard MT5 Windows installations.
 

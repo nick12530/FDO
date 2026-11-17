@@ -35,14 +35,12 @@ class IntermarketEngine {
    */
   public updateQuotes(quotes: Record<string, { bid: number; change24hPct: number }>) {
     const eurusd = quotes['EURUSD'];
-    const usdjpy = quotes['USDJPY'];
     const gbpusd = quotes['GBPUSD'];
     const xauusd = quotes['XAUUSD'];
 
     const changes: number[] = [];
     if (eurusd && Number.isFinite(eurusd.change24hPct) && eurusd.bid > 0) changes.push(Math.abs(eurusd.change24hPct));
     if (gbpusd && Number.isFinite(gbpusd.change24hPct) && gbpusd.bid > 0) changes.push(Math.abs(gbpusd.change24hPct));
-    if (usdjpy && Number.isFinite(usdjpy.change24hPct) && usdjpy.bid > 0) changes.push(Math.abs(usdjpy.change24hPct));
 
     if (changes.length === 0) {
       if (xauusd && Number.isFinite(xauusd.change24hPct) && xauusd.bid > 0) {
@@ -62,11 +60,10 @@ class IntermarketEngine {
       }
     }
 
-    // DXY proxy: inverse of EURUSD & GBPUSD, positive with USDJPY
+    // DXY proxy: inverse of EURUSD & GBPUSD
     let dxyScore = 0;
     if (eurusd && eurusd.bid > 0) dxyScore -= eurusd.change24hPct * 0.576;
     if (gbpusd && gbpusd.bid > 0) dxyScore -= gbpusd.change24hPct * 0.119;
-    if (usdjpy && usdjpy.bid > 0) dxyScore += usdjpy.change24hPct * 0.136;
 
     const dxyBias: 'bullish' | 'bearish' | 'neutral' =
       dxyScore >= 0.15 ? 'bullish' : dxyScore <= -0.15 ? 'bearish' : 'neutral';
@@ -141,11 +138,6 @@ class IntermarketEngine {
       } else if ((direction === 'BUY' && isDollarStrong) || (direction === 'SELL' && isDollarWeak)) {
         scoreBonus -= 0.5;
         reasons.push(`Intermarket warning: DXY Dollar proxy (${s.dxyBias.toUpperCase()}) creates counter-currency drag (-0.5)`);
-      }
-    } else if (symbol === 'USDJPY') {
-      if ((direction === 'BUY' && isDollarStrong) || (direction === 'SELL' && isDollarWeak)) {
-        scoreBonus += 0.5;
-        reasons.push(`Intermarket: DXY Dollar strength aligns with USDJPY ${direction} (+0.5)`);
       }
     } else if (symbol === 'XAUUSD') {
       if (direction === 'BUY' && (s.riskRegime === 'RISK_OFF' || isDollarWeak)) {

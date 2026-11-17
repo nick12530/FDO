@@ -1,7 +1,7 @@
 /**
  * HelpCenterModal.tsx - Comprehensive Multi-Pair & Technical Indicator Guide
  * Expanded and fully in sync with current system:
- * - Multi-Pair Playbook (XAUUSD, EURUSD, GBPUSD, USDJPY)
+ * - Multi-Pair Playbook (XAUUSD, EURUSD, GBPUSD)
  * - Complete Indicator Suite (SMC Order Blocks, FVGs, ATR Volatility Bands, Candlesticks, MTF M1-H4, Sessions)
  * - Real-Time Financial News & Macro Catalyst Feed (RSS / API feed integration)
  * - Pending Limit Orders & Visual Holding Countdown Timer
@@ -169,7 +169,7 @@ export const HelpCenterModal: React.FC<HelpCenterModalProps> = ({
                   <li><strong>Instantaneous Deterministic Sentiment:</strong> High-speed rule-based dictionary scoring processes headlines in under 1ms with zero LLM API rate limits, external costs, or hallucinations.</li>
                   <li><strong>Live RSS Ingestion:</strong> Refreshed automatically every 60 seconds with manual on-demand trigger (&apos;Fetch News&apos;).</li>
                   <li><strong>Direct External Article Navigation:</strong> Click any headline link to open the verified primary news article directly in your browser.</li>
-                  <li><strong>Asset Mapping:</strong> Breaking headlines are automatically mapped to XAUUSD, USD, EURUSD, GBPUSD, or USDJPY.</li>
+                  <li><strong>Asset Mapping:</strong> Breaking headlines are automatically mapped to XAUUSD, USD, EURUSD, or GBPUSD.</li>
                 </ul>
               </div>
             </div>
@@ -213,7 +213,7 @@ export const HelpCenterModal: React.FC<HelpCenterModalProps> = ({
                   </span>
                 </div>
                 <div className="p-3 rounded-xl border border-slate-200 dark:border-[#1e2230] bg-slate-50/50 dark:bg-[#141722]/50">
-                  <strong className="text-slate-900 dark:text-white block">EURUSD / GBPUSD / USDJPY</strong>
+                  <strong className="text-slate-900 dark:text-white block">EURUSD / GBPUSD</strong>
                   <span className="text-[11px] text-slate-500 dark:text-slate-400">
                     Contract: 100,000 units · London &amp; New York session order flow alignment.
                   </span>

@@ -1,15 +1,15 @@
 /**
  * instrumentConfig.ts - Multi-Instrument Specification & Configuration System
- * Central configuration structure for XAUUSD, EURUSD, USDJPY, GBPUSD.
+ * Central configuration structure for XAUUSD, EURUSD, and GBPUSD.
  * Easily extensible for AUDUSD, USDCAD, EURJPY without rewriting the trading engine.
  */
 
 import type { TradeDirection } from '../types/smc';
 
-export type SupportedSymbol = 'XAUUSD' | 'EURUSD' | 'USDJPY' | 'GBPUSD';
+export type SupportedSymbol = 'XAUUSD' | 'EURUSD' | 'GBPUSD';
 
 export interface InstrumentConfig {
-  symbol: SupportedSymbol;
+  symbol: SupportedSymbol | 'USDJPY';
   displayName: string;
   category: 'metals' | 'forex';
   baseCurrency: string;
@@ -91,33 +91,6 @@ export const INSTRUMENTS: Record<SupportedSymbol, InstrumentConfig> = {
     description: 'Primary FX pair: M1/M5 entries, M15 confirmation, H1 bias',
     volatilityRating: 'moderate',
   },
-  USDJPY: {
-    symbol: 'USDJPY',
-    displayName: 'US Dollar / Japanese Yen',
-    category: 'forex',
-    baseCurrency: 'USD',
-    quoteCurrency: 'JPY',
-    digits: 3,
-    pipSize: 0.01,
-    pointSize: 0.001,
-    contractSize: 100000,
-    minSpread: 5,
-    maxSpreadPoints: 25, // 2.5 pips
-    minRR: 2.0,
-    minScore: 65,
-    magicNumber: 10002,
-    preferredSessions: ['asian', 'london', 'new_york'],
-    tvSymbol: 'FX:USDJPY',
-    defaultRiskPct: 1.0,
-    atrPeriod: 14,
-    atrSlMultiplier: 1.2,
-    minPracticalStopPips: 8, // 8 pips minimum stop (0.08 JPY) - eliminates 1-pip suicide stops!
-    recommendedStopPips: 15, // 15 pips standard stop (0.15 JPY)
-    minTakeProfitPips: 20, // 20 pips minimum target (0.20 JPY)
-    pipValuePerMicroLot: 0.063, // ~$0.063 per pip on 0.01 lot at ~158.00 JPY
-    description: 'Asian/Tokyo session opportunities + London/NY continuation',
-    volatilityRating: 'moderate',
-  },
   GBPUSD: {
     symbol: 'GBPUSD',
     displayName: 'British Pound / US Dollar',
@@ -147,10 +120,47 @@ export const INSTRUMENTS: Record<SupportedSymbol, InstrumentConfig> = {
   },
 };
 
-export const SUPPORTED_SYMBOLS: SupportedSymbol[] = ['XAUUSD', 'EURUSD', 'USDJPY', 'GBPUSD'];
+const LEGACY_POSITION_CONFIGS: Record<string, InstrumentConfig> = {
+  USDJPY: {
+    symbol: 'USDJPY',
+    displayName: 'US Dollar / Japanese Yen',
+    category: 'forex',
+    baseCurrency: 'USD',
+    quoteCurrency: 'JPY',
+    digits: 3,
+    pipSize: 0.01,
+    pointSize: 0.001,
+    contractSize: 100000,
+    minSpread: 5,
+    maxSpreadPoints: 25,
+    minRR: 2.0,
+    minScore: 65,
+    magicNumber: 10002,
+    preferredSessions: ['asian', 'london', 'new_york'],
+    tvSymbol: 'FX:USDJPY',
+    defaultRiskPct: 1.0,
+    atrPeriod: 14,
+    atrSlMultiplier: 1.2,
+    minPracticalStopPips: 8,
+    recommendedStopPips: 15,
+    minTakeProfitPips: 20,
+    pipValuePerMicroLot: 0.063,
+    description: 'Legacy position data only',
+    volatilityRating: 'moderate',
+  },
+};
+
+export const SUPPORTED_SYMBOLS: SupportedSymbol[] = ['XAUUSD', 'EURUSD', 'GBPUSD'];
+
+export function getSupportedSymbol(symbol: string): SupportedSymbol | null {
+  const normalized = symbol.toUpperCase().trim();
+  if (normalized.includes('GOLD')) return 'XAUUSD';
+  return SUPPORTED_SYMBOLS.find((supported) => normalized.includes(supported)) ?? null;
+}
 
 export function getInstrumentConfig(symbol: string): InstrumentConfig {
   const normalized = (symbol || '').toUpperCase().trim();
+  if (LEGACY_POSITION_CONFIGS[normalized]) return LEGACY_POSITION_CONFIGS[normalized];
   if (normalized in INSTRUMENTS) {
     return INSTRUMENTS[normalized as SupportedSymbol];
   }

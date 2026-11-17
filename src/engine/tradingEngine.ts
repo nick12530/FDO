@@ -31,7 +31,12 @@ import {
   TimeframeIndicatorData,
   MultiTimeframeAlignment,
 } from '../types/smc';
-import { RISK_CONFIG, calculateRiskBasedVolume, isWithinConfiguredNewsBlackout } from './riskConfig';
+import {
+  RISK_CONFIG,
+  calculateRiskBasedVolume,
+  isAdaptiveMicroFloorAllowed,
+  isWithinConfiguredNewsBlackout,
+} from './riskConfig';
 import {
   calculateATR,
   MarketStructureEngine,
@@ -74,7 +79,7 @@ import {
   reconcileBrokerClosedTradesInJournal,
 } from './tradeJournal';
 import type { JournalSignalRecord, JournalTradeRecord } from '../types/smc';
-import { INSTRUMENTS, SUPPORTED_SYMBOLS, SupportedSymbol, getInstrumentConfig } from './instrumentConfig';
+import { INSTRUMENTS, SUPPORTED_SYMBOLS, SupportedSymbol, getInstrumentConfig, getSupportedSymbol } from './instrumentConfig';
 import { evaluateNewsRisk, getGlobalSessionStatus } from './sessionTimezones';
 import {
   PairAnalysis,
@@ -215,7 +220,7 @@ export function getDefaultSymbolSpec(symbol: SupportedSymbol): SymbolTradingSpec
     volumeMax: 100.0,
     volumeStep: 0.01,
     tickSize: cfg.pointSize,
-    tickValue: cfg.category === 'metals' ? 1.0 : symbol === 'USDJPY' ? 0.67 : 1.0,
+    tickValue: 1.0,
     tradeStopsLevel: 0,
     tradeFreezeLevel: 0,
   };
@@ -303,7 +308,6 @@ export class TradingEngine {
   > = {
     XAUUSD: { candlesM1: [], candlesM5: [], candlesM15: [], candlesH1: [], bid: 0, ask: 0, spread: 0, marketDataAt: 0, symbolSpec: null },
     EURUSD: { candlesM1: [], candlesM5: [], candlesM15: [], candlesH1: [], bid: 0, ask: 0, spread: 0, marketDataAt: 0, symbolSpec: null },
-    USDJPY: { candlesM1: [], candlesM5: [], candlesM15: [], candlesH1: [], bid: 0, ask: 0, spread: 0, marketDataAt: 0, symbolSpec: null },
     GBPUSD: { candlesM1: [], candlesM5: [], candlesM15: [], candlesH1: [], bid: 0, ask: 0, spread: 0, marketDataAt: 0, symbolSpec: null },
   };
 
@@ -663,16 +667,18 @@ export class TradingEngine {
     }
     this.instrumentType = snapshot.instrumentType;
     const symUpper = (snapshot.symbol || '').toUpperCase().trim();
-    this.activeSymbol = (SUPPORTED_SYMBOLS.includes(symUpper as any) ? symUpper : 'XAUUSD') as SupportedSymbol;
+    this.activeSymbol = getSupportedSymbol(symUpper) ?? 'XAUUSD';
     this.brokerAccountMode = snapshot.accountMode;
-    const hasFreshData =
+    const hasUsableData =
       snapshot.candlesM1.length >= 25 &&
       snapshot.candlesM5.length >= 20 &&
       snapshot.candlesM15.length >= 25 &&
       snapshot.candlesH1.length >= 20 &&
       snapshot.bid > 0 &&
       snapshot.ask >= snapshot.bid &&
-      hasValidBrokerSymbolSpec(snapshot.symbolSpec) &&
+      hasValidBrokerSymbolSpec(snapshot.symbolSpec);
+    const hasFreshData =
+      hasUsableData &&
       hasFreshBrokerCandles(snapshot.candlesM1, 60_000) &&
       hasFreshBrokerCandles(snapshot.candlesM5, 5 * 60_000) &&
       hasFreshBrokerCandles(snapshot.candlesM15, 15 * 60_000) &&
@@ -689,15 +695,15 @@ export class TradingEngine {
     this.candlesM15 = hasFreshData ? snapshot.candlesM15 : [];
     this.candlesH1 = hasFreshData ? snapshot.candlesH1 : [];
     this.pairData[this.activeSymbol] = {
-      candlesM1: this.candlesM1,
-      candlesM5: this.candlesM5,
-      candlesM15: this.candlesM15,
-      candlesH1: this.candlesH1,
-      bid: this.bid,
-      ask: this.ask,
-      spread: this.spread,
-      marketDataAt: hasFreshData ? Date.now() : 0,
-      symbolSpec: this.symbolSpec,
+      candlesM1: hasUsableData ? snapshot.candlesM1 : [],
+      candlesM5: hasUsableData ? snapshot.candlesM5 : [],
+      candlesM15: hasUsableData ? snapshot.candlesM15 : [],
+      candlesH1: hasUsableData ? snapshot.candlesH1 : [],
+      bid: hasUsableData ? snapshot.bid : 0,
+      ask: hasUsableData ? snapshot.ask : 0,
+      spread: hasUsableData ? snapshot.spread : 0,
+      marketDataAt: hasUsableData ? Date.now() : 0,
+      symbolSpec: hasUsableData ? snapshot.symbolSpec : null,
     };
     const activeTicketSet = new Set(positions.map((p) => p.ticket));
     for (const oldTicket of this.initialSlByTicket.keys()) {
@@ -795,9 +801,10 @@ export class TradingEngine {
     const now = Date.now();
     for (const p of this.positions) {
       if (this.liveManagementInFlight.has(p.ticket)) continue;
-      const posSym = (p.symbol || this.activeSymbol) as SupportedSymbol;
+      const posSym = p.symbol || this.activeSymbol;
       const cfg = getInstrumentConfig(posSym);
-      const pairQuote = this.pairData[posSym];
+      const pairSymbol = getSupportedSymbol(posSym);
+      const pairQuote = pairSymbol ? this.pairData[pairSymbol] : undefined;
       const curPrice = posSym === this.activeSymbol
         ? (p.type === 'BUY' ? this.bid : this.ask)
         : (p.type === 'BUY' ? pairQuote?.bid ?? 0 : pairQuote?.ask ?? 0);
@@ -1086,19 +1093,28 @@ export class TradingEngine {
           snapshot.candlesM1.length >= 25 &&
           snapshot.candlesM5.length >= 20 &&
           snapshot.candlesM15.length >= 25 &&
-          snapshot.candlesH1.length >= 20 &&
-          hasFreshBrokerCandles(snapshot.candlesM1, 60_000) &&
-          hasFreshBrokerCandles(snapshot.candlesM5, 5 * 60_000) &&
-          hasFreshBrokerCandles(snapshot.candlesM15, 15 * 60_000) &&
-          hasFreshBrokerCandles(snapshot.candlesH1, 60 * 60_000);
+          snapshot.candlesH1.length >= 20;
         if (!validData) {
           allDataValid = false;
-          const message = `Incomplete or stale broker candles for ${symbol}.`;
+          const message = `Incomplete broker snapshot for ${symbol}.`;
           if (message !== this.lastPairDataError) {
             this.lastPairDataError = message;
             this.slog(message, 'warn');
           }
           continue;
+        }
+        const candlesAreFresh =
+          hasFreshBrokerCandles(snapshot.candlesM1, 60_000) &&
+          hasFreshBrokerCandles(snapshot.candlesM5, 5 * 60_000) &&
+          hasFreshBrokerCandles(snapshot.candlesM15, 15 * 60_000) &&
+          hasFreshBrokerCandles(snapshot.candlesH1, 60 * 60_000);
+        if (!candlesAreFresh) {
+          allDataValid = false;
+          const message = 'Broker candles are stale; scanner rows are blocked until fresh bars arrive.';
+          if (message !== this.lastPairDataError) {
+            this.lastPairDataError = message;
+            this.slog(message, 'warn');
+          }
         }
         this.pairData[symbol] = {
           candlesM1: snapshot.candlesM1,
@@ -1763,25 +1779,32 @@ export class TradingEngine {
     for (const sym of SUPPORTED_SYMBOLS) {
       const data = this.pairData[sym];
       const isCurrent = this.activeSymbol === sym;
-      const marketDataIsFresh =
+      const marketDataIsUsable =
         data.marketDataAt > 0 &&
         hasValidBrokerSymbolSpec(data.symbolSpec) &&
+        data.bid > 0 &&
+        data.ask >= data.bid &&
+        data.candlesM1.length >= 25 &&
+        data.candlesM5.length >= 20 &&
+        data.candlesM15.length >= 25 &&
+        data.candlesH1.length >= 20;
+      if (!marketDataIsUsable) continue;
+      const marketDataIsFresh =
         Date.now() - data.marketDataAt <= 45_000 &&
         hasFreshBrokerCandles(data.candlesM1, 60_000) &&
         hasFreshBrokerCandles(data.candlesM5, 5 * 60_000) &&
         hasFreshBrokerCandles(data.candlesM15, 15 * 60_000) &&
         hasFreshBrokerCandles(data.candlesH1, 60 * 60_000);
-      if (!marketDataIsFresh) continue;
       const cM1 = isCurrent && this.candlesM1.length ? this.candlesM1 : data.candlesM1;
       const cM5 = isCurrent && this.candlesM5.length ? this.candlesM5 : data.candlesM5;
       const cM15 = isCurrent && this.candlesM15.length ? this.candlesM15 : data.candlesM15;
       const cH1 = isCurrent && this.candlesH1.length ? this.candlesH1 : data.candlesH1;
-      const curBid = isCurrent ? this.bid : data.bid;
-      const curAsk = isCurrent ? this.ask : data.ask;
-      const curSpread = isCurrent ? this.spread : data.spread;
+      const curBid = isCurrent && this.bid > 0 ? this.bid : data.bid;
+      const curAsk = isCurrent && this.ask > 0 ? this.ask : data.ask;
+      const curSpread = isCurrent && this.bid > 0 ? this.spread : data.spread;
 
       const ref24hCandle = cH1.length >= 24 ? cH1[cH1.length - 24] : cM15[Math.max(0, cM15.length - 96)];
-      if (ref24hCandle && ref24hCandle.open > 0 && curBid > 0) {
+      if (marketDataIsFresh && ref24hCandle && ref24hCandle.open > 0 && curBid > 0) {
         liveQuotes[sym] = {
           bid: curBid,
           change24hPct: Number((((curBid - ref24hCandle.open) / ref24hCandle.open) * 100).toFixed(2)),
@@ -1803,8 +1826,9 @@ export class TradingEngine {
         events,
         data.symbolSpec
       );
-      advanceSignalValidations(sym, cM1);
+      if (marketDataIsFresh) advanceSignalValidations(sym, cM1);
       if (
+        marketDataIsFresh &&
         analysis.status === 'READY' &&
         analysis.signal &&
         analysis.optimalTradeEntry &&
@@ -1835,7 +1859,17 @@ export class TradingEngine {
           });
         }
       }
-      analyses.push(analysis);
+      analyses.push(
+        marketDataIsFresh
+          ? analysis
+          : {
+              ...analysis,
+              status: 'BLOCKED',
+              rejectionReason: 'BROKER_CANDLES_STALE_WAITING_FOR_FRESH_BARS',
+              safeLotSize: null,
+              estimatedRiskUsd: null,
+            }
+      );
     }
 
     intermarketEngine.updateQuotes(liveQuotes);
@@ -1986,7 +2020,8 @@ export class TradingEngine {
       this.account.equity,
       this.account.risk_pct,
       Math.abs(entryPrice - stopLoss),
-      spec
+      spec,
+      RISK_CONFIG.adaptiveMicroFloorEnabled
     );
     if (riskVolume === null || requestedVolume === undefined) return riskVolume;
     const cappedVolume = Math.min(riskVolume, requestedVolume);
@@ -2028,7 +2063,8 @@ export class TradingEngine {
         this.account.equity,
         this.account.risk_pct,
         stopDistance,
-        spec
+        spec,
+        RISK_CONFIG.adaptiveMicroFloorEnabled
       ),
     };
   }
@@ -2058,7 +2094,7 @@ export class TradingEngine {
       return { volume: null, rejectionReason: 'TRADE_REJECTED: INVALID_POSITION_SIZING_INPUT' };
     }
     // Recheck the broker minimum against the configured risk budget at execution.
-    const isMicroFloorAllowed = minLotRisk <= 15.0 || (minLotRisk / Math.max(1, this.account.equity)) * 100 <= 3.5;
+    const isMicroFloorAllowed = isAdaptiveMicroFloorAllowed(this.account.equity, minLotRisk);
     if (minLotRisk > riskBudget && !isMicroFloorAllowed) return rejectMinimumLot();
 
     const maxSafeVolume = calculateRiskBasedVolume(
@@ -2066,7 +2102,7 @@ export class TradingEngine {
       this.account.risk_pct,
       stopDistance,
       spec,
-      true
+      RISK_CONFIG.adaptiveMicroFloorEnabled
     );
     if (maxSafeVolume === null) return rejectMinimumLot();
 
@@ -2076,7 +2112,13 @@ export class TradingEngine {
     const steps = Math.floor((capped - spec.volumeMin) / spec.volumeStep + 1e-9);
     const volume = Number((spec.volumeMin + Math.max(0, steps) * spec.volumeStep).toFixed(precision));
     const actualRisk = riskPerLot * volume;
-    if (volume < spec.volumeMin || actualRisk > riskBudget + 1e-9) return rejectMinimumLot();
+    const isAllowedMicroFloor =
+      volume === spec.volumeMin &&
+      actualRisk > riskBudget + 1e-9 &&
+      isMicroFloorAllowed;
+    if (volume < spec.volumeMin || (actualRisk > riskBudget + 1e-9 && !isAllowedMicroFloor)) {
+      return rejectMinimumLot();
+    }
     return { volume };
   }
 
@@ -2612,7 +2654,7 @@ export class TradingEngine {
         let profit = 0;
         if (cfg.category === 'metals') {
           profit = Number((pts * p.volume * cfg.contractSize).toFixed(2));
-        } else if (posSym === 'USDJPY') {
+        } else if (String(posSym) === 'USDJPY') {
           profit = Number(((pts * p.volume * cfg.contractSize) / Math.max(1, curPrice)).toFixed(2));
         } else {
           profit = Number((pts * p.volume * cfg.contractSize).toFixed(2));
@@ -2640,7 +2682,7 @@ export class TradingEngine {
             let partialProfit = 0;
             if (cfg.category === 'metals') {
               partialProfit = Number((pts * halfVolume * cfg.contractSize).toFixed(2));
-            } else if (posSym === 'USDJPY') {
+            } else if (String(posSym) === 'USDJPY') {
               partialProfit = Number(((pts * halfVolume * cfg.contractSize) / Math.max(1, curPrice)).toFixed(2));
             } else {
               partialProfit = Number((pts * halfVolume * cfg.contractSize).toFixed(2));
@@ -3212,6 +3254,16 @@ export class TradingEngine {
           const errMsg = error instanceof Error ? error.message : 'Unknown bridge error';
           this.slog(`MT5 auto-order rejected: ${errMsg}`, 'error');
           this.recordRejectedSignal(sig, errMsg, this.activeSymbol);
+          if (
+            this.autoTrade &&
+            (errMsg.includes('10017') || errMsg.toLowerCase().includes('trade disabled'))
+          ) {
+            this.toggleAutoTrade();
+            this.slog(
+              'Auto-trade paused because MT5 has disabled trading. Enable account and symbol trading in MT5 before turning auto-trade back on.',
+              'warn'
+            );
+          }
           this.entryHistory.push({
             at: Date.now(),
             direction: sig.direction,
@@ -3458,7 +3510,7 @@ export class TradingEngine {
       return;
     }
 
-    const posSym = (pos.symbol || this.activeSymbol) as SupportedSymbol;
+    const posSym = pos.symbol || this.activeSymbol;
     const cfg = getInstrumentConfig(posSym);
     const closePrice = pos.type === 'BUY' ? this.bid : this.ask;
     const pts = pos.type === 'BUY' ? closePrice - pos.price_open : pos.price_open - closePrice;
@@ -3466,7 +3518,7 @@ export class TradingEngine {
     let profit = 0;
     if (cfg.category === 'metals') {
       profit = Number((pts * pos.volume * cfg.contractSize).toFixed(2));
-    } else if (posSym === 'USDJPY') {
+    } else if (String(posSym) === 'USDJPY') {
       profit = Number(((pts * pos.volume * cfg.contractSize) / Math.max(1, closePrice)).toFixed(2));
     } else {
       profit = Number((pts * pos.volume * cfg.contractSize).toFixed(2));
@@ -3558,9 +3610,10 @@ export class TradingEngine {
   async scaleOutPosition(ticket: number, fraction = 0.5): Promise<boolean> {
     const pos = this.positions.find((p) => p.ticket === ticket);
     if (!pos || !Number.isFinite(fraction) || fraction <= 0 || fraction >= 1) return false;
-    const posSym = (pos.symbol || this.activeSymbol) as SupportedSymbol;
+    const posSym = pos.symbol || this.activeSymbol;
     const cfg = getInstrumentConfig(posSym);
-    const pairQuote = this.pairData[posSym];
+    const pairSymbol = getSupportedSymbol(posSym);
+    const pairQuote = pairSymbol ? this.pairData[pairSymbol] : undefined;
     const curPrice = posSym === this.activeSymbol
       ? pos.type === 'BUY' ? this.bid : this.ask
       : pos.type === 'BUY' ? pairQuote?.bid ?? 0 : pairQuote?.ask ?? 0;
@@ -3644,7 +3697,7 @@ export class TradingEngine {
     let partialProfit = 0;
     if (cfg.category === 'metals') {
       partialProfit = Number((pts * closeVol * cfg.contractSize).toFixed(2));
-    } else if (posSym === 'USDJPY') {
+    } else if (String(posSym) === 'USDJPY') {
       partialProfit = Number(((pts * closeVol * cfg.contractSize) / Math.max(1, curPrice)).toFixed(2));
     } else {
       partialProfit = Number((pts * closeVol * cfg.contractSize).toFixed(2));

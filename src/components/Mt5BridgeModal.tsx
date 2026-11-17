@@ -89,7 +89,7 @@ export const Mt5BridgeModal: React.FC<Mt5BridgeModalProps> = ({ isOpen, onClose 
         snapshot.account.equity
       );
       setStatus('connected');
-      setMessage(`Connected to ${snapshot.accountMode.toUpperCase()} #${snapshot.account.login} on ${snapshot.account.server}. Trade history synced.`);
+      setMessage(`Connected to ${snapshot.accountMode.toUpperCase()} #${snapshot.account.login} on ${snapshot.account.server} using ${snapshot.symbol}. Trade history synced.`);
     } catch (error) {
       setStatus('error');
       const errText = error instanceof Error ? error.message : 'Unable to connect to the MT5 bridge.';
@@ -242,10 +242,13 @@ export const Mt5BridgeModal: React.FC<Mt5BridgeModalProps> = ({ isOpen, onClose 
                   value={symbol}
                   onChange={(event) => setSymbol(event.target.value)}
                   disabled={isConnected}
-                  placeholder="XAUUSD"
+                  placeholder="XAUUSD, EURUSD, or GBPUSD"
                   autoComplete="off"
                   className="mt-1.5 min-h-9 w-full rounded-lg border border-slate-300 dark:border-[#2b3b59] bg-slate-50 dark:bg-[#0b111d] px-3 py-1.5 font-mono text-xs text-slate-950 dark:text-white outline-none focus:border-sky-500 disabled:opacity-60"
                 />
+                <span className="mt-1 block font-normal text-[10px] text-slate-500 dark:text-slate-400">
+                  Base symbols automatically match an enabled broker suffix when available.
+                </span>
               </label>
 
               <label className="block text-[11px] font-bold text-slate-700 dark:text-slate-200">

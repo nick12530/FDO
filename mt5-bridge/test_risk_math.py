@@ -17,7 +17,13 @@ class RiskMathTests(unittest.TestCase):
         self.assertIsNone(volume_for_risk(0.1, 20, 0.01, 0.01, 1))
         self.assertEqual(volume_for_risk(1, 20, 0.01, 0.01, 1), 0.05)
         # Adaptive micro-floor permits 0.01 if dollar risk <= $15
-        self.assertEqual(volume_for_risk(0.1, 20, 0.01, 0.01, 1, allow_micro_floor=True), 0.01)
+        self.assertEqual(
+            volume_for_risk(1.66, 237, 0.01, 0.01, 1, allow_micro_floor=True, equity=332),
+            0.01,
+        )
+        self.assertIsNone(
+            volume_for_risk(1, 1501, 0.01, 0.01, 1, allow_micro_floor=True, equity=100)
+        )
 
     def test_volume_rounds_down_to_step_and_caps_at_broker_max(self) -> None:
         self.assertEqual(volume_for_risk(0.97, 10, 0.01, 0.01, 1), 0.09)

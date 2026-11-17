@@ -53,6 +53,7 @@ export const TradingViewWidget: React.FC<TradingViewWidgetProps> = memo(({
   const [selectedTf, setSelectedTf] = useState<ChartTimeframe>(() => market.currentTimeframe || initialTimeframe);
   const [showConfigMenu, setShowConfigMenu] = useState(false);
   const [chartKey, setChartKey] = useState(0);
+  const [macdEnabled, setMacdEnabled] = useState(true);
   const menuRef = useRef<HTMLDivElement>(null);
 
   // Sync chart timeframe bidirectionally with tradingEngine
@@ -97,8 +98,9 @@ export const TradingViewWidget: React.FC<TradingViewWidgetProps> = memo(({
     if (indicatorConfig.tvEma) list.push('MAExp@tv-basicstudies');
     if (indicatorConfig.tvVwap) list.push('VWAP@tv-basicstudies');
     if (indicatorConfig.tvRsi) list.push('RSI@tv-basicstudies');
+    if (macdEnabled) list.push('MACD@tv-basicstudies');
     return list;
-  }, [showIndicators, indicatorConfig.tvEma, indicatorConfig.tvVwap, indicatorConfig.tvRsi]);
+  }, [showIndicators, indicatorConfig.tvEma, indicatorConfig.tvVwap, indicatorConfig.tvRsi, macdEnabled]);
 
   const rawSymbol = symbol.includes(':') ? symbol.split(':').pop() || symbol : symbol;
   const instrumentCfg = getInstrumentConfig(ticker.symbol);
@@ -211,6 +213,15 @@ export const TradingViewWidget: React.FC<TradingViewWidgetProps> = memo(({
                       />
                     </label>
                   ))}
+                  <label className="flex items-center justify-between gap-2 p-1 rounded hover:bg-slate-100 dark:hover:bg-[#1e2d48] cursor-pointer text-slate-700 dark:text-slate-200 font-semibold">
+                    <span>MACD</span>
+                    <input
+                      type="checkbox"
+                      checked={macdEnabled}
+                      onChange={() => setMacdEnabled((enabled) => !enabled)}
+                      className="rounded border-slate-400 text-sky-500 focus:ring-sky-500"
+                    />
+                  </label>
                 </div>
 
                 <div className="space-y-1">

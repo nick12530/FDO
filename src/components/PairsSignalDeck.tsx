@@ -1,6 +1,6 @@
 /**
  * PairsSignalDeck.tsx - Minimalist Multi-Pair Signal Deck
- * Elegantly displays all 4 currency pairs (XAUUSD, EURUSD, USDJPY, GBPUSD)
+ * Elegantly displays all 3 supported instruments (XAUUSD, EURUSD, GBPUSD)
  * with zero unnecessary visual clutter:
  * - High-contrast, clean typography (no nested cards or garish badges)
  * - Clear direction (BUY/SELL), confluence %, and key SMC target level
@@ -129,7 +129,7 @@ export const PairsSignalDeck: React.FC<PairsSignalDeckProps> = React.memo(({
               >
                 <span>{item.symbol === 'XAUUSD' ? 'GOLD' : item.symbol}</span>
                 <span className="tabular-nums font-bold">
-                  {item.price.toFixed(item.symbol === 'XAUUSD' ? 2 : item.symbol === 'USDJPY' ? 3 : 5)}
+                  {item.price.toFixed(item.symbol === 'XAUUSD' ? 2 : 5)}
                 </span>
                 <span
                   className={`text-[10px] font-bold ${
@@ -188,7 +188,7 @@ export const PairsSignalDeck: React.FC<PairsSignalDeckProps> = React.memo(({
                     )}
                   </div>
                   <span className="tabular-nums font-bold text-slate-900 dark:text-white">
-                    {item.price.toFixed(item.symbol === 'XAUUSD' ? 2 : item.symbol === 'USDJPY' ? 3 : 5)}
+                    {item.price.toFixed(item.symbol === 'XAUUSD' ? 2 : 5)}
                   </span>
                 </div>
 

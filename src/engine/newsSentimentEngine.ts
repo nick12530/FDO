@@ -188,10 +188,6 @@ class NewsSentimentEngine {
     if (lower.includes('pound') || lower.includes('sterling') || lower.includes('boe') || lower.includes('uk ') || lower.includes('britain')) {
       assets.push('GBPUSD');
     }
-    if (lower.includes('yen') || lower.includes('boj') || lower.includes('japan')) {
-      assets.push('USDJPY');
-    }
-
     if (assets.length === 0) {
       assets.push('USD', 'XAUUSD');
     }

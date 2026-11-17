@@ -90,8 +90,6 @@ export function getCurrenciesForPair(symbol: SupportedSymbol): string[] {
       return ['EUR', 'USD'];
     case 'GBPUSD':
       return ['GBP', 'USD'];
-    case 'USDJPY':
-      return ['USD', 'JPY'];
     case 'XAUUSD':
     default:
       return ['USD'];
