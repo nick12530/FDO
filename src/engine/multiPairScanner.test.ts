@@ -195,6 +195,39 @@ describe('Multi-Pair Market Scanner & Instrument System', () => {
     }
   });
 
+  it('uses the injected replay clock and blocks SMC candidates when historical news is unavailable', () => {
+    const data = generatePairCandles('EURUSD', 80);
+    const analysisTime = Date.now();
+    const analysis = analyzeInstrument(
+      'EURUSD',
+      data.candlesM1,
+      data.candlesM5,
+      data.candlesM15,
+      data.candlesH1,
+      data.currentBid,
+      data.currentAsk,
+      data.spreadPoints,
+      0,
+      0,
+      [],
+      null,
+      null,
+      {
+        mode: 'replay',
+        nowMs: analysisTime,
+        historicalEvents: null,
+        sendAlerts: false,
+        skipAccountSizing: true,
+      }
+    );
+
+    expect(analysis.sessionName).toBe(
+      getGlobalSessionStatus(new Date(analysisTime)).activeSessionName
+    );
+    expect(analysis.newsStatus).toBe('NEWS FILTER: DATA UNAVAILABLE');
+    expect(analysis.status).not.toBe('READY');
+  });
+
   it('ranks trade opportunities by score, setup quality and risk/reward', () => {
     const dataGold = generatePairCandles('XAUUSD', 60);
     const dataEur = generatePairCandles('EURUSD', 60);

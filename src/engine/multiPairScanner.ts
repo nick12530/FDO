@@ -136,6 +136,14 @@ export interface PairAnalysis {
   rank: number;
 }
 
+export interface InstrumentAnalysisContext {
+  nowMs?: number;
+  mode?: 'live' | 'replay';
+  historicalEvents?: EconomicEvent[] | null;
+  sendAlerts?: boolean;
+  skipAccountSizing?: boolean;
+}
+
 export type PrecisionEntryCandidate = Pick<
   PairAnalysis,
   'symbol' | 'price' | 'bid' | 'ask' | 'atr' | 'spreadAcceptable' | 'confluenceScore' | 'scoreBreakdown' |
@@ -476,8 +484,11 @@ export function analyzeInstrument(
   riskPct: number,
   openPositions: Position[],
   economicEvents: EconomicEvent[] | null = null,
-  symbolSpec?: SymbolTradingSpec | null
+  symbolSpec?: SymbolTradingSpec | null,
+  context: InstrumentAnalysisContext = {}
 ): PairAnalysis {
+  const analysisTime = context.nowMs ?? Date.now();
+  const isReplay = context.mode === 'replay';
   const config = getInstrumentConfig(symbol);
   const price = (liveBid + liveAsk) / 2;
   const spreadPips = Number((spreadPoints / (config.pipSize / config.pointSize)).toFixed(1));
@@ -525,11 +536,17 @@ export function analyzeInstrument(
   const premiumDiscountPct = Math.min(100, Math.max(0, Math.round(((price - dr.low) / rangeSpan) * 100)));
 
   // 5. Session Status
-  const sessions = getGlobalSessionStatus();
+  const sessions = getGlobalSessionStatus(new Date(analysisTime));
   const isPreferredSession = isSessionPreferredForPair(symbol, sessions);
 
   // 6. News Risk
-  const newsRisk = evaluateNewsRisk(symbol, economicEvents);
+  const eventsForAnalysis = isReplay
+    ? context.historicalEvents?.map((event) => ({
+        ...event,
+        minutesRemaining: (Date.parse(event.time) - analysisTime) / 60_000,
+      })) ?? null
+    : economicEvents;
+  const newsRisk = evaluateNewsRisk(symbol, eventsForAnalysis);
 
   // 7. Structural events
   const lastBOS = msM15.events.filter((e) => e.kind === 'BOS').slice(-1)[0] || null;
@@ -676,10 +693,12 @@ export function analyzeInstrument(
 
   // 8c. Macroeconomic Surprise & Headline Sentiment Analysis
   const macroConfluence = tentativeBias !== 'WAITING'
-    ? evaluateMacroSurpriseConfluence(symbol, tentativeBias, economicEvents)
+    ? evaluateMacroSurpriseConfluence(symbol, tentativeBias, eventsForAnalysis)
     : { scoreBonus: 0, macroBias: 'NEUTRAL' as const, postNewsDriftActive: false, reasons: [] };
 
-  const sentiment = newsSentimentEngine.evaluatePairSentiment(symbol);
+  const sentiment = isReplay
+    ? { sentimentBias: 'NEUTRAL' as const, sentimentScore: 0 }
+    : newsSentimentEngine.evaluatePairSentiment(symbol);
   let scoreMacro = 0;
   if (macroConfluence.scoreBonus > 0) scoreMacro += 6;
   else if (macroConfluence.scoreBonus < 0) scoreMacro -= 8;
@@ -765,15 +784,17 @@ export function analyzeInstrument(
   const targetPips = targetPips2;
 
   // 10. Position sizing & Correlation checks
-  const sizingResult = calculateSmallAccountPositionSize(
-    equity,
-    riskPct,
-    stopDistance,
-    symbol,
-    symbolSpec?.volumeMin ?? 0.01,
-    symbolSpec?.volumeStep ?? 0.01,
-    symbolSpec
-  );
+  const sizingResult = context.skipAccountSizing
+    ? { safeVolume: null, riskAmount: null, rejectionReason: null }
+    : calculateSmallAccountPositionSize(
+        equity,
+        riskPct,
+        stopDistance,
+        symbol,
+        symbolSpec?.volumeMin ?? 0.01,
+        symbolSpec?.volumeStep ?? 0.01,
+        symbolSpec
+      );
   const correlationResult = checkCorrelationExposure(symbol, tentativeBias === 'BUY' ? 'BUY' : 'SELL', openPositions);
 
   let status: 'READY' | 'WAITING' | 'BLOCKED' = 'WAITING';
@@ -797,7 +818,7 @@ export function analyzeInstrument(
     } else if (!correlationResult.allowed && confluenceScore < 70) {
       status = 'BLOCKED';
       rejectionReason = correlationResult.reason || 'TRADE_REJECTED: CORRELATION_LIMIT_EXCEEDED';
-    } else if (sizingResult.rejectionReason) {
+    } else if (!context.skipAccountSizing && sizingResult.rejectionReason) {
       status = 'BLOCKED';
       rejectionReason = sizingResult.rejectionReason;
     } else {
@@ -812,17 +833,17 @@ export function analyzeInstrument(
     : signalTimeframe === 'M1'
     ? candlesM1[candlesM1.length - 1]
     : candlesM5[candlesM5.length - 1];
-  const rawCandleTime = signalCandle?.time ?? Date.now();
+  const rawCandleTime = signalCandle?.time ?? analysisTime;
   const signalCandleTime = rawCandleTime < 1_000_000_000_000 ? rawCandleTime * 1000 : rawCandleTime;
   const signalCandleDurationMs =
     signalTimeframe === 'M15' ? 15 * 60_000 : signalTimeframe === 'M5' ? 5 * 60_000 : 60_000;
-  const signalGeneratedAt = new Date().toISOString();
+  const signalGeneratedAt = new Date(analysisTime).toISOString();
   const expiryTimestamp = signalCandleTime + validityDurationMs * 2;
-  if (status === 'READY' && expiryTimestamp <= Date.now()) {
+  if (status === 'READY' && expiryTimestamp <= analysisTime) {
     status = 'BLOCKED';
     rejectionReason = 'TRADE_REJECTED: SIGNAL_EXPIRED';
   }
-  const validitySeconds = Math.max(0, Math.round((expiryTimestamp - Date.now()) / 1000));
+  const validitySeconds = Math.max(0, Math.round((expiryTimestamp - analysisTime) / 1000));
   const isSniper = confluenceScore >= 70 && (scoreLiquidity >= 10 || scoreObFvg >= 5);
   const sniperQualityIndex = confluenceScore;
   const sniperGrade: 'A+' | 'A' | 'B' = confluenceScore >= 88 ? 'A+' : confluenceScore >= 75 ? 'A' : 'B';
@@ -899,7 +920,7 @@ export function analyzeInstrument(
       recommendedLot: sizingResult.safeVolume || undefined,
       reasons,
       atr: execAtr,
-      timestamp: new Date(Math.min(signalCandleTime, Date.now())).toISOString(),
+      timestamp: new Date(Math.min(signalCandleTime, analysisTime)).toISOString(),
       actionReason: `${symbol} ${tentativeBias} (${confluenceScore}/100 Confluence) - 1:${riskRewardRatio} RR · Targets: TP1 (${targetPips1}p), TP2 (${targetPips2}p), TP3 (${targetPips3}p)`,
       perfectEntryReason: `SMC ${signalTimeframe} ${tentativeBias} confluence with ${reasons.slice(0, 2).join(' + ')}`,
       strategy: 'SMC POI Retest',
@@ -984,7 +1005,12 @@ export function analyzeInstrument(
     rank: 4, // assigned below in rankOpportunities
   };
 
-  if (analysis.signal && (isPrecisionEntryReady(analysis) || (analysis.status === 'READY' && analysis.spreadAcceptable))) {
+  if (
+    context.sendAlerts !== false &&
+    analysis.signal &&
+    (isPrecisionEntryReady(analysis, analysisTime) ||
+      (analysis.status === 'READY' && analysis.spreadAcceptable))
+  ) {
     void dispatchSniperAlert({
       symbol,
       direction: analysis.signal.direction,
@@ -1008,7 +1034,7 @@ export function analyzeInstrument(
       validUntil: expiryTimestamp,
     });
   }
-  if (analysis.signal && isPrecisionEntryImminent(analysis)) {
+  if (context.sendAlerts !== false && analysis.signal && isPrecisionEntryImminent(analysis, analysisTime)) {
     void dispatchApproachingEntryAlert({
       symbol,
       direction: analysis.signal.direction,

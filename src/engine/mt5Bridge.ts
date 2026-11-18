@@ -53,6 +53,53 @@ export interface BridgeStatus {
   isTailscale?: boolean;
 }
 
+export interface HistoricalCandle {
+  openTime: number;
+  closeTime: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  tickVolume: number;
+  spreadPoints: number;
+  realVolume: number;
+}
+
+export interface HistoricalTick {
+  timeMs: number;
+  bid: number | null;
+  ask: number | null;
+  last: number | null;
+  volume: number | null;
+  flags: number;
+}
+
+export interface HistoricalResearchResponse {
+  source: 'MetaTrader5';
+  accountLogin: number;
+  accountServer: string;
+  symbol: string;
+  symbolSpec?: {
+    digits: number | null;
+    point: number | null;
+    tickSize: number | null;
+    tickValue: number | null;
+    contractSize: number | null;
+    volumeMin: number | null;
+    volumeMax: number | null;
+    volumeStep: number | null;
+    tradeStopsLevel: number | null;
+    tradeFreezeLevel: number | null;
+    tradeMode: number | null;
+    tradeDisabled: boolean | null;
+  };
+  requestedStart: number;
+  requestedEnd: number;
+  count: number;
+  candles?: HistoricalCandle[];
+  ticks?: HistoricalTick[];
+}
+
 const DEFAULT_SERVER_URL = 'http://127.0.0.1:8000';
 export const getDefaultServerUrl = () =>
   typeof window === 'undefined' ? DEFAULT_SERVER_URL : `${window.location.origin}/mt5-bridge`;
@@ -189,6 +236,34 @@ export class MT5BridgeConnector {
       isReconnecting: this.isReconnecting,
       isTailscale: isTailscale,
     };
+  }
+
+  getHistoricalCandles(
+    symbol: string,
+    timeframe: 'M1' | 'M5' | 'M15' | 'H1' | 'H4',
+    start: number,
+    end: number
+  ): Promise<HistoricalResearchResponse> {
+    const query = new URLSearchParams({
+      symbol,
+      timeframe,
+      start: String(start),
+      end: String(end),
+    });
+    return this.request(`/api/research/candles?${query}`, { method: 'GET' }, 60_000);
+  }
+
+  getHistoricalTicks(
+    symbol: string,
+    start: number,
+    end: number
+  ): Promise<HistoricalResearchResponse> {
+    const query = new URLSearchParams({
+      symbol,
+      start: String(start),
+      end: String(end),
+    });
+    return this.request(`/api/research/ticks?${query}`, { method: 'GET' }, 60_000);
   }
 
   /**
@@ -817,10 +892,10 @@ export class MT5BridgeConnector {
     }
   }
 
-  private async request<T>(path: string, init: RequestInit): Promise<T> {
+  private async request<T>(path: string, init: RequestInit, timeoutMs = 12_000): Promise<T> {
     const controller = new AbortController();
     // Bound local bridge requests so a stopped process cannot stall the terminal.
-    const timeout = setTimeout(() => controller.abort(), 12_000);
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
     const start = performance.now();
     const baseUrl = this.serverUrl.replace(/\/+$/, '');
     try {

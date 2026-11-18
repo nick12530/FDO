@@ -1068,6 +1068,168 @@ def history(
     return read_closed_trades(days, symbol.strip())
 
 
+def _research_timeframe(name: str) -> tuple[int, int]:
+    timeframes = {
+        "M1": (mt5.TIMEFRAME_M1, 60),
+        "M5": (mt5.TIMEFRAME_M5, 300),
+        "M15": (mt5.TIMEFRAME_M15, 900),
+        "H1": (mt5.TIMEFRAME_H1, 3600),
+        "H4": (mt5.TIMEFRAME_H4, 14400),
+    }
+    try:
+        return timeframes[name.upper()]
+    except KeyError as error:
+        raise HTTPException(status_code=400, detail="Unsupported research timeframe.") from error
+
+
+def _finite_research_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _research_symbol_spec(login: int, server: str, symbol: str, info: Any) -> dict:
+    spec = get_symbol_spec(login, server, symbol, info)
+    if getattr(info, "digits", None) is None:
+        raise HTTPException(status_code=503, detail="MT5 did not provide symbol price precision.")
+    return {**spec, "digits": int(info.digits)}
+
+
+@app.get("/api/research/candles")
+def research_candles(
+    request: Request,
+    symbol: str = Query(min_length=1, max_length=32),
+    timeframe: str = Query(default="M1", min_length=2, max_length=3),
+    start: int = Query(gt=0),
+    end: int = Query(gt=0),
+) -> dict:
+    """Return broker-sourced closed bars for read-only historical research."""
+    require_bridge_token(request)
+    if end <= start or end - start > 366 * 24 * 60 * 60:
+        raise HTTPException(status_code=400, detail="Research range must be positive and no longer than 366 days.")
+    account = require_account()
+    broker_symbol = resolve_broker_symbol(symbol)
+    symbol_info = mt5.symbol_info(broker_symbol) if broker_symbol else None
+    if symbol_info is None:
+        raise HTTPException(status_code=404, detail=f"MT5 symbol {symbol!r} is unavailable.")
+    mt5_timeframe, interval_seconds = _research_timeframe(timeframe)
+    if end - start > 150_000 * interval_seconds:
+        raise HTTPException(status_code=400, detail="Research range exceeds the 150,000-candle limit for this timeframe.")
+    start_time = datetime.fromtimestamp(start, tz=timezone.utc)
+    end_time = datetime.fromtimestamp(end, tz=timezone.utc)
+    rates = mt5.copy_rates_range(broker_symbol, mt5_timeframe, start_time, end_time)
+    if rates is None:
+        raise HTTPException(status_code=503, detail=f"MT5 candle history unavailable: {mt5.last_error()}")
+    now_seconds = int(time.time())
+    candles = []
+    for rate in rates:
+        open_time = int(rate["time"])
+        close_time = open_time + interval_seconds
+        if open_time < start or close_time > end or close_time > now_seconds:
+            continue
+        open_price = _finite_research_number(rate["open"])
+        high_price = _finite_research_number(rate["high"])
+        low_price = _finite_research_number(rate["low"])
+        close_price = _finite_research_number(rate["close"])
+        if (
+            open_price is None
+            or high_price is None
+            or low_price is None
+            or close_price is None
+            or high_price < low_price
+            or high_price < max(open_price, close_price)
+            or low_price > min(open_price, close_price)
+        ):
+            continue
+        candles.append({
+            "openTime": open_time,
+            "closeTime": close_time,
+            "open": open_price,
+            "high": high_price,
+            "low": low_price,
+            "close": close_price,
+            "tickVolume": int(rate["tick_volume"]),
+            "spreadPoints": int(rate["spread"]),
+            "realVolume": int(rate["real_volume"]),
+        })
+    candles.sort(key=lambda candle: candle["openTime"])
+    return {
+        "source": "MetaTrader5",
+        "accountLogin": account["login"],
+        "accountServer": account["server"],
+        "symbol": broker_symbol,
+        "symbolSpec": _research_symbol_spec(
+            account["login"], account["server"], broker_symbol, symbol_info
+        ),
+        "timeframe": timeframe.upper(),
+        "requestedStart": start,
+        "requestedEnd": end,
+        "count": len(candles),
+        "candles": candles,
+    }
+
+
+@app.get("/api/research/ticks")
+def research_ticks(
+    request: Request,
+    symbol: str = Query(min_length=1, max_length=32),
+    start: int = Query(gt=0),
+    end: int = Query(gt=0),
+) -> dict:
+    """Return genuine bid/ask tick history; never substitute bars or generated quotes."""
+    require_bridge_token(request)
+    if end <= start or end - start > 7 * 24 * 60 * 60:
+        raise HTTPException(status_code=400, detail="Tick research range must be positive and no longer than 7 days.")
+    account = require_account()
+    broker_symbol = resolve_broker_symbol(symbol)
+    symbol_info = mt5.symbol_info(broker_symbol) if broker_symbol else None
+    if symbol_info is None:
+        raise HTTPException(status_code=404, detail=f"MT5 symbol {symbol!r} is unavailable.")
+    copy_flags = getattr(mt5, "COPY_TICKS_ALL", None)
+    if copy_flags is None or not callable(getattr(mt5, "copy_ticks_range", None)):
+        raise HTTPException(status_code=501, detail="This MT5 adapter does not provide historical tick data.")
+    ticks = mt5.copy_ticks_range(
+        broker_symbol,
+        datetime.fromtimestamp(start, tz=timezone.utc),
+        datetime.fromtimestamp(end, tz=timezone.utc),
+        copy_flags,
+    )
+    if ticks is None:
+        raise HTTPException(status_code=503, detail=f"MT5 tick history unavailable: {mt5.last_error()}")
+    if len(ticks) > 500_000:
+        raise HTTPException(status_code=413, detail="Tick range exceeds the 500,000-record research limit.")
+    rows = []
+    latest_available_ms = min(end * 1000, int(time.time() * 1000))
+    for tick in ticks:
+        timestamp = int(tick["time_msc"])
+        if timestamp < start * 1000 or timestamp > latest_available_ms:
+            continue
+        rows.append({
+            "timeMs": timestamp,
+            "bid": _finite_research_number(tick["bid"]),
+            "ask": _finite_research_number(tick["ask"]),
+            "last": _finite_research_number(tick["last"]),
+            "volume": _finite_research_number(tick["volume"]),
+            "flags": int(tick["flags"]),
+        })
+    rows.sort(key=lambda tick: tick["timeMs"])
+    return {
+        "source": "MetaTrader5",
+        "accountLogin": account["login"],
+        "accountServer": account["server"],
+        "symbol": broker_symbol,
+        "symbolSpec": _research_symbol_spec(
+            account["login"], account["server"], broker_symbol, symbol_info
+        ),
+        "requestedStart": start,
+        "requestedEnd": end,
+        "count": len(rows),
+        "ticks": rows,
+    }
+
+
 def resolve_filling_mode(info) -> int:
     """Safely determine MT5 order filling mode from symbol info filling_mode bitmask.
     Uses mt5.ORDER_FILLING_IOC instead of non-existent mt5.SYMBOL_FILLING_IOC attribute.

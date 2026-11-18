@@ -3,18 +3,66 @@ import gc
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from contextlib import closing
 from types import SimpleNamespace
 
 
 class FakeMT5Adapter:
+    TIMEFRAME_M1 = 1
+    TIMEFRAME_M5 = 5
+    TIMEFRAME_M15 = 15
+    TIMEFRAME_H1 = 60
+    TIMEFRAME_H4 = 240
+    COPY_TICKS_ALL = 0
+
     def __init__(self):
         self.calls = []
+        self.rates = []
+        self.ticks = []
 
     def symbol_info(self, symbol):
         self.calls.append(("symbol_info", symbol))
-        return SimpleNamespace(trade_mode=4)
+        return SimpleNamespace(
+            trade_mode=4,
+            visible=True,
+            point=0.00001,
+            trade_tick_size=0.00001,
+            trade_tick_value=1.0,
+            trade_contract_size=100000.0,
+            volume_min=0.01,
+            volume_max=100.0,
+            volume_step=0.01,
+            trade_stops_level=0,
+            trade_freeze_level=0,
+            digits=5,
+        )
+
+    def terminal_info(self):
+        return object()
+
+    def account_info(self):
+        return SimpleNamespace(
+            login=12345,
+            server="Broker-Demo",
+            balance=1000,
+            equity=1000,
+            margin_free=1000,
+            trade_mode=0,
+            leverage=100,
+        )
+
+    def copy_rates_range(self, symbol, timeframe, start, end):
+        self.calls.append(("copy_rates_range", symbol, timeframe, start, end))
+        return self.rates
+
+    def copy_ticks_range(self, symbol, start, end, flags):
+        self.calls.append(("copy_ticks_range", symbol, start, end, flags))
+        return self.ticks
+
+    def last_error(self):
+        return "fake adapter error"
 
 
 class TestServerTestDependencies(unittest.TestCase):
@@ -89,6 +137,62 @@ class TestServerTestDependencies(unittest.TestCase):
                 SimpleNamespace(bid=1.1000, ask=1.1006), "BUY", 0.0001, 5, "EURUSD"
             )
         self.assertEqual(error.exception.status_code, 423)
+
+    def test_research_candles_are_broker_sourced_and_only_include_closed_bars(self):
+        adapter = FakeMT5Adapter()
+        self.server.configure_mt5_adapter(adapter)
+        now = int(time.time())
+        adapter.rates = [
+            {"time": now - 180, "open": 1.1, "high": 1.2, "low": 1.0, "close": 1.15,
+             "tick_volume": 10, "spread": 2, "real_volume": 0},
+            {"time": now - 30, "open": 1.1, "high": 1.2, "low": 1.0, "close": 1.15,
+             "tick_volume": 10, "spread": 2, "real_volume": 0},
+        ]
+        request = SimpleNamespace(
+            headers={},
+            query_params={},
+            client=SimpleNamespace(host="testclient"),
+        )
+
+        result = self.server.research_candles(
+            request, "EURUSD", "M1", now - 300, now
+        )
+
+        self.assertEqual(result["source"], "MetaTrader5")
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["candles"][0]["openTime"], now - 180)
+        self.assertEqual(result["symbolSpec"]["digits"], 5)
+        self.assertEqual(result["symbolSpec"]["tickSize"], 0.00001)
+        self.assertEqual(adapter.calls[-1][0], "copy_rates_range")
+
+    def test_research_ticks_returns_only_real_quotes_and_rejects_unsupported_adapter(self):
+        adapter = FakeMT5Adapter()
+        self.server.configure_mt5_adapter(adapter)
+        now = int(time.time())
+        adapter.ticks = [
+            {"time_msc": (now - 2) * 1000, "bid": 1.1, "ask": 1.1002, "last": 0,
+             "volume": 0, "flags": 6},
+            {"time_msc": (now - 30) * 1000, "bid": 1.1, "ask": 1.1002, "last": 0,
+             "volume": 0, "flags": 6},
+        ]
+        request = SimpleNamespace(
+            headers={},
+            query_params={},
+            client=SimpleNamespace(host="testclient"),
+        )
+
+        result = self.server.research_ticks(request, "EURUSD", now - 10, now)
+
+        self.assertEqual(result["source"], "MetaTrader5")
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["ticks"][0]["bid"], 1.1)
+        self.assertEqual(result["symbolSpec"]["volumeStep"], 0.01)
+        self.assertEqual(adapter.calls[-1][0], "copy_ticks_range")
+
+        adapter.COPY_TICKS_ALL = None
+        with self.assertRaises(self.server.HTTPException) as error:
+            self.server.research_ticks(request, "EURUSD", now - 10, now)
+        self.assertEqual(error.exception.status_code, 501)
 
 
 if __name__ == "__main__":

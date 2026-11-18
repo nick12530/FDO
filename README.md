@@ -46,6 +46,13 @@ An algorithmic Smart Money Concepts (SMC) workstation for **Gold (XAUUSD)** and 
 - **Compact Account Scanner**: Broker balance, equity, and free margin remain visible on narrow screens; scanner cards start compact and expand on demand.
 - **Volume Source Clarity**: Volume and candle-direction delta are broker tick-volume proxies; they do not identify institutional participants or exchange-side buy/sell flow.
 
+### Read-only historical research
+- The local bridge exposes `GET /api/research/candles` and `GET /api/research/ticks`. Both require an attached MT5 account and return MT5-sourced records with symbol/account provenance; neither endpoint can place or modify an order.
+- Candle responses contain only fully closed bars and are capped at 150,000 records. Tick history is capped at seven days and 500,000 records; unavailable tick history is reported, never replaced with generated quotes.
+- `src/engine/historicalReplay.ts` discovers existing technical strategy signals using only candles available at each close and evaluates entries/exits on executable historical bid/ask ticks. It reports gross R outcomes separately; net expectancy, net profit factor, and net drawdown remain unavailable unless an explicit transaction-cost schedule is supplied.
+- The **Strategy Performance** tab loads the most recent seven days explicitly on request, verifies all responses belong to the same MT5 account and broker symbol, and hides gross summary figures until resolved-sample and out-of-sample minimums are met.
+- Historical economic-calendar and headline sentiment archives are not exposed by the bridge. SMC replay requiring those inputs and live-vs-historical policy comparisons must therefore be reported as unavailable. No historical performance figures are synthesized.
+
 ---
 
 ## 🏗️ Architecture & Tech Stack

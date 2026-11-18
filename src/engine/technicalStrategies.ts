@@ -36,7 +36,8 @@ function createSignal(
   tickSize?: number,
   symbol?: string,
   oteTarget?: number,
-  volumeMetrics?: VolumeMetrics
+  volumeMetrics?: VolumeMetrics,
+  nowMs = Date.now()
 ): Signal {
   const normalizePrice = (price: number) => Number(
     (tickSize && tickSize > 0
@@ -78,9 +79,9 @@ function createSignal(
   const timeframeMs = timeframe === 'M15' ? 15 * 60_000 : timeframe === 'M5' ? 5 * 60_000 : 60_000;
   const validityDurationMs = timeframe === 'M1' ? 90_000 : timeframeMs;
   const candleTimeMs = candle.time < 1_000_000_000_000 ? candle.time * 1000 : candle.time;
-  const generatedAt = new Date().toISOString();
+  const generatedAt = new Date(nowMs).toISOString();
   const expiryTimestamp = candleTimeMs + timeframeMs + validityDurationMs;
-  const validitySeconds = Math.max(0, Math.round((expiryTimestamp - Date.now()) / 1000));
+  const validitySeconds = Math.max(0, Math.round((expiryTimestamp - nowMs) / 1000));
   const normalizedScore = normalizeRawStrategyScore(score);
   const isSniper =
     timeframe === 'M1'
@@ -133,12 +134,13 @@ export function evaluateTechnicalStrategies(
   instrumentType: InstrumentType,
   digits: number = 2,
   tickSize?: number,
-  symbol?: string
+  symbol?: string,
+  nowMs = Date.now()
 ): Signal[] {
   if (executionCandles.length < EMA_SLOW + 2 || higherTimeframeCandles.length < EMA_SLOW + 2) return [];
   const intervalMs = timeframe === 'M1' ? 60_000 : timeframe === 'M5' ? 300_000 : 900_000;
   const htfIntervalMs = timeframe === 'M1' ? 300_000 : timeframe === 'M5' ? 900_000 : 3600_000;
-  const now = Date.now();
+  const now = nowMs;
   const latest = executionCandles[executionCandles.length - 1];
   const higherLatest = higherTimeframeCandles[higherTimeframeCandles.length - 1];
   const toMs = (time: number) => time < 1_000_000_000_000 ? time * 1000 : time;
@@ -211,7 +213,8 @@ export function evaluateTechnicalStrategies(
       tickSize,
       symbol,
       pullbackOte,
-      volMetrics
+      volMetrics,
+      nowMs
     ));
   }
 
@@ -248,7 +251,8 @@ export function evaluateTechnicalStrategies(
         tickSize,
         symbol,
         retestLevel,
-        volMetrics
+        volMetrics,
+        nowMs
       ));
     }
   }

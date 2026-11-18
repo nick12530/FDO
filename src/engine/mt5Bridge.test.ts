@@ -41,6 +41,39 @@ describe('PC-local MT5 Bridge', () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it('fetches broker history through authenticated read-only GET requests', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      json: async () => ({
+        source: 'MetaTrader5',
+        accountLogin: 12345,
+        accountServer: 'Broker-Demo',
+        symbol: 'EURUSD',
+        requestedStart: 100,
+        requestedEnd: 200,
+        count: 0,
+        ticks: [],
+      }),
+    });
+    global.fetch = fetchSpy;
+    const connector = new MT5BridgeConnector();
+    connector.setBridgeToken('read-only-test-token');
+
+    await connector.getHistoricalTicks('EURUSD', 100, 200);
+
+    expect(fetchSpy).toHaveBeenCalledWith(
+      expect.stringContaining('/api/research/ticks?symbol=EURUSD&start=100&end=200'),
+      expect.objectContaining({
+        method: 'GET',
+        headers: expect.objectContaining({
+          Authorization: 'Bearer read-only-test-token',
+        }),
+      })
+    );
+  });
+
   describe('ping reachability', () => {
     it('returns ok: true when bridge server responds with HTTP 200', async () => {
       global.fetch = vi.fn().mockResolvedValue({

@@ -48,8 +48,9 @@ import {
 } from '../utils/webhookNotifier';
 import type { NewsSentimentItem, EconomicEvent } from '../types/smc';
 import type { PairAnalysis } from '../engine/multiPairScanner';
+import { HistoricalReplayPanel } from './HistoricalReplayPanel';
 
-type WorkbenchTab = 'positions' | 'macro' | 'telegram' | 'health';
+type WorkbenchTab = 'positions' | 'macro' | 'telegram' | 'health' | 'strategyPerformance';
 
 interface BottomWorkbenchProps {
   onOpenTradeStation: () => void;
@@ -299,6 +300,21 @@ export const BottomWorkbench: React.FC<BottomWorkbenchProps> = React.memo(({
             <ShieldCheck className={`w-3.5 h-3.5 shrink-0 ${feedHealthy ? 'text-emerald-500' : 'text-amber-500'}`} />
             <span>Health &amp; Risk</span>
           </button>
+
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activeTab === 'strategyPerformance'}
+            onClick={() => setActiveTab('strategyPerformance')}
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
+              activeTab === 'strategyPerformance'
+                ? 'bg-white dark:bg-[#090b10] text-slate-900 dark:text-white border border-slate-200 dark:border-[#2a3347]'
+                : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white border border-transparent'
+            }`}
+          >
+            <Activity className="w-3.5 h-3.5 text-sky-500 shrink-0" />
+            <span>Strategy Performance</span>
+          </button>
         </div>
 
         {/* Contextual Right Summary */}
@@ -533,6 +549,7 @@ export const BottomWorkbench: React.FC<BottomWorkbenchProps> = React.memo(({
                 </div>
               </div>
             )}
+
           </div>
         )}
 
@@ -1029,8 +1046,16 @@ export const BottomWorkbench: React.FC<BottomWorkbenchProps> = React.memo(({
                   ))}
                 </div>
               )}
+
             </div>
           </div>
+        )}
+
+        {activeTab === 'strategyPerformance' && (
+          <HistoricalReplayPanel
+            symbol={ticker.symbol}
+            instrumentType={market.instrumentType}
+          />
         )}
       </div>
     </section>
