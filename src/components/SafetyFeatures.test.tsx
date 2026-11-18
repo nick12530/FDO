@@ -14,10 +14,16 @@ import { tradingEngine, MAX_SPREAD_POINTS } from '../engine/tradingEngine';
 describe('Trading Safety UX Components', () => {
   beforeEach(() => {
     tradingEngine.stopEngineLoops();
+    (tradingEngine as any).connected = false;
+    tradingEngine.mt5Account.connected = false;
+    (tradingEngine as any).hasBrokerMarketData = false;
+    (tradingEngine as any).lastBrokerQuoteAt = 0;
     if (tradingEngine.killSwitch) {
       tradingEngine.toggleKillSwitch();
     }
     tradingEngine.spread = 18; // normal spread
+    (tradingEngine as any).invalidateTicker();
+    (tradingEngine as any).emit('ticker');
   });
 
   it('proves KillSwitchBanner appears when engine state arms', () => {
@@ -40,6 +46,10 @@ describe('Trading Safety UX Components', () => {
   });
 
   it('blocks orders without a validated signal and reports wide spreads', () => {
+    (tradingEngine as any).connected = true;
+    tradingEngine.mt5Account.connected = true;
+    (tradingEngine as any).hasBrokerMarketData = true;
+    (tradingEngine as any).lastBrokerQuoteAt = Date.now();
     const { rerender } = render(<SignalEngineCard onExecuteSignal={() => {}} />);
 
     let button = screen.getByRole('button', { name: /WAITING FOR CONFIRMED SETUP/i });
@@ -58,5 +68,13 @@ describe('Trading Safety UX Components', () => {
     expect((button as HTMLButtonElement).disabled).toBe(true);
     expect(screen.getByText(/45 PTS/)).toBeDefined();
     expect(MAX_SPREAD_POINTS).toBe(40);
+  });
+
+  it('labels broker spread unavailable instead of displaying a zero placeholder', () => {
+    render(<SignalEngineCard onExecuteSignal={() => {}} />);
+
+    expect(screen.getByText('Spread unavailable')).toBeDefined();
+    expect(screen.queryByText('0 PTS')).toBeNull();
+    expect(screen.getByRole('button', { name: /WAITING FOR MT5 QUOTE/i })).toBeDefined();
   });
 });

@@ -7,7 +7,7 @@
  * - Uncrowded lot controls and high-contrast execution button
  */
 
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { useMarket, useTicker, useEngine, useWebhookState } from '../hooks/useTradingStore';
 import { tradingEngine } from '../engine/tradingEngine';
 import {
@@ -94,6 +94,21 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
       : null;
   const maxSpreadPoints = tradingEngine.getMaxSpreadPoints();
   const isWideSpread = ticker.spread > maxSpreadPoints;
+  const quoteAgeMs = ticker.quoteUpdatedAt && ticker.quoteUpdatedAt > 0
+    ? Math.max(0, Date.now() - ticker.quoteUpdatedAt)
+    : null;
+  const quoteUnavailable = !ticker.marketDataAvailable || quoteAgeMs === null;
+  const quoteStale = quoteAgeMs !== null && quoteAgeMs > 45_000;
+  const [, setFreshnessRevision] = useState(0);
+  useEffect(() => {
+    const updatedAt = ticker.quoteUpdatedAt;
+    if (!updatedAt || updatedAt <= 0) return;
+    const timeout = window.setTimeout(
+      () => setFreshnessRevision((revision) => revision + 1),
+      Math.max(0, updatedAt + 45_000 - Date.now())
+    );
+    return () => window.clearTimeout(timeout);
+  }, [ticker.quoteUpdatedAt]);
 
   const activeDirection: TradeDirection = rawSig?.direction || (market.bias === 'bearish' ? 'SELL' : 'BUY');
   const isBull = activeDirection === 'BUY';
@@ -117,6 +132,15 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
     sizingInfo.minimumLotRisk > sizingInfo.riskBudget
   );
   const hasSafeLot = typeof riskLimitedLotSize === 'number' && riskLimitedLotSize > 0;
+  const readiness = quoteUnavailable
+    ? 'DISCONNECTED'
+    : quoteStale
+      ? 'STALE'
+      : isBrokerTradeDisabled || scannerBlockReason || isWideSpread || Boolean(rawSig && !hasSafeLot)
+        ? 'BLOCKED'
+        : rawSig
+          ? 'READY'
+          : 'WAITING';
   const slPrice = rawSig?.sl ?? null;
   const tpPrice = rawSig?.tp ?? null;
   const riskPts = rawSig ? Math.abs(entryPrice - rawSig.sl) : 0;
@@ -238,11 +262,21 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
               {ticker.symbol} Ticket
             </h2>
             <span className="font-mono text-[11px] font-bold text-slate-600 dark:text-slate-300 tabular-nums">
-              {ticker.spread} PTS
+              {!ticker.marketDataAvailable || quoteAgeMs === null
+                ? 'Spread unavailable'
+                : quoteStale
+                  ? `Stale · ${ticker.spread} PTS`
+                  : `${ticker.spread} PTS`}
             </span>
           </div>
           <p className="text-[11px] font-medium text-slate-500 dark:text-slate-400 mt-0.5">
-            {rawSig ? `${rawSig.strategy || 'SMC Setup'} · ${rawSig.timeframe}` : 'Monitoring live broker quotes'}
+            {rawSig
+              ? `${rawSig.strategy || 'SMC Setup'} · ${rawSig.timeframe}`
+              : quoteUnavailable
+                ? 'Waiting for MT5 quote'
+                : quoteStale
+                  ? `Quote stale · ${Math.round(quoteAgeMs! / 1000)}s`
+                  : 'Monitoring live broker quotes'}
           </p>
         </div>
 
@@ -345,7 +379,7 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
             <div className="flex items-center justify-between gap-2">
               <span
                 className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-bold ${
-                  rawSig
+                      rawSig
                     ? isBull
                       ? 'bg-emerald-600 text-white'
                       : 'bg-rose-600 text-white'
@@ -354,6 +388,14 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
               >
                 {isBull ? <TrendingUp className="w-3.5 h-3.5" /> : <TrendingDown className="w-3.5 h-3.5" />}
                 <span>{rawSig ? rawSig.direction : 'WAITING'}</span>
+              </span>
+              <span className={`rounded px-2 py-1 text-[9px] font-bold tracking-wide ${
+                readiness === 'READY' ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                  : readiness === 'BLOCKED' ? 'bg-rose-500/10 text-rose-700 dark:text-rose-300'
+                    : readiness === 'STALE' ? 'bg-amber-500/10 text-amber-700 dark:text-amber-300'
+                      : 'bg-slate-500/10 text-slate-600 dark:text-slate-300'
+              }`}>
+                {readiness}
               </span>
 
               {rawSig && rawSig.validitySeconds && rawSig.validitySeconds > 0 && (
@@ -533,6 +575,10 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
             <span>
               {isBrokerTradeDisabled
                 ? `Trading Disabled (${ticker.symbol})`
+                : !rawSig && quoteUnavailable
+                ? 'Waiting for MT5 Quote'
+                : !rawSig && quoteStale
+                ? 'Quote Stale — Waiting for Refresh'
                 : !rawSig
                 ? 'Waiting for Confirmed Setup'
                 : isWideSpread
