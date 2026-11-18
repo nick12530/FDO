@@ -1,33 +1,24 @@
 /**
- * DailyReportModal.tsx - Executive End-of-Day Trading Performance Report & Journal
- * Upgraded with advanced item selectors:
- * - Trade outcome filter pills (All / Wins / Losses)
- * - Direction filter pills (All / Longs / Shorts)
- * - Search by Ticket # or execution rationale
- * - Clean responsive cards and tables fitting all devices
- * - Clear Back to Terminal and Close buttons
+ * DailyReportModal.tsx - Minimalist Daily Performance Report
+ * - Strictly driven by real account-scoped closedTrades & live account state (zero mock fallbacks)
+ * - Supports date switching, outcome/direction filtering, symbol-accurate price decimals, and CSV/clipboard export
  */
 
 import React, { useEffect, useMemo, useState } from 'react';
-import { useClosedTrades, useTicker } from '../hooks/useTradingStore';
+import { useClosedTrades, useEngine, useTicker } from '../hooks/useTradingStore';
 import { tradingEngine } from '../engine/tradingEngine';
 import { closedTradeDayKey, localDayKey } from '../engine/tradeJournal';
+import { getInstrumentConfig, SupportedSymbol } from '../engine/instrumentConfig';
 import {
-  FileText,
-  X,
-  Copy,
-  Check,
-  Download,
   Calendar,
-  ShieldCheck,
-  TrendingUp,
-  TrendingDown,
-  DollarSign,
-  ArrowLeft,
-  Filter,
+  Check,
+  ChevronLeft,
+  ChevronRight,
+  Copy,
+  Download,
+  FileText,
   Search,
-  CheckCircle2,
-  XCircle,
+  X,
 } from 'lucide-react';
 
 interface DailyReportModalProps {
@@ -43,12 +34,17 @@ export const DailyReportModal: React.FC<DailyReportModalProps> = ({
 }) => {
   const closedTrades = useClosedTrades();
   const ticker = useTicker();
+  const engine = useEngine();
+  const [activeDate, setActiveDate] = useState(selectedDate);
   const [copied, setCopied] = useState(false);
 
-  // Advanced item selector filters
   const [outcomeFilter, setOutcomeFilter] = useState<'ALL' | 'WIN' | 'LOSS'>('ALL');
   const [directionFilter, setDirectionFilter] = useState<'ALL' | 'BUY' | 'SELL'>('ALL');
   const [searchQuery, setSearchQuery] = useState('');
+
+  useEffect(() => {
+    setActiveDate(selectedDate);
+  }, [selectedDate]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -59,12 +55,14 @@ export const DailyReportModal: React.FC<DailyReportModalProps> = ({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isOpen, onClose]);
 
-  // Overall session statistics
+  const mt5 = engine.mt5Account;
+  const accountLabel = mt5?.connected ? `MT5 #${mt5.login} · ${mt5.server}` : 'No MT5 Account Connected';
+
   const stats = useMemo(() => {
-    const todayTrades = closedTrades.filter((trade) => closedTradeDayKey(trade) === selectedDate);
-    const totalCount = todayTrades.length;
-    const winningTrades = todayTrades.filter((t) => t.profit > 0);
-    const losingTrades = todayTrades.filter((t) => t.profit < 0);
+    const dayTrades = closedTrades.filter((trade) => closedTradeDayKey(trade) === activeDate);
+    const totalCount = dayTrades.length;
+    const winningTrades = dayTrades.filter((t) => t.profit > 0);
+    const losingTrades = dayTrades.filter((t) => t.profit < 0);
     const winCount = winningTrades.length;
     const lossCount = losingTrades.length;
     const winRate = totalCount > 0 ? ((winCount / totalCount) * 100).toFixed(1) : '0.0';
@@ -74,24 +72,29 @@ export const DailyReportModal: React.FC<DailyReportModalProps> = ({
     const netPnl = Number((grossProfit - grossLoss).toFixed(2));
     const profitFactor = grossLoss > 0 ? (grossProfit / grossLoss).toFixed(2) : grossProfit > 0 ? 'MAX' : '0.00';
 
-    const totalVolume = todayTrades.reduce((acc, t) => acc + t.volume, 0);
-    const totalPips = todayTrades.reduce((acc, t) => acc + t.pips, 0);
+    const totalVolume = dayTrades.reduce((acc, t) => acc + t.volume, 0);
+    const totalPips = dayTrades.reduce((acc, t) => acc + t.pips, 0);
 
     const avgWin = winCount > 0 ? (grossProfit / winCount).toFixed(2) : '0.00';
     const avgLoss = lossCount > 0 ? (grossLoss / lossCount).toFixed(2) : '0.00';
 
-    const longTrades = todayTrades.filter((t) => t.type === 'BUY');
-    const shortTrades = todayTrades.filter((t) => t.type === 'SELL');
+    const longTrades = dayTrades.filter((t) => t.type === 'BUY');
+    const shortTrades = dayTrades.filter((t) => t.type === 'SELL');
     const longWins = longTrades.filter((t) => t.profit > 0).length;
     const shortWins = shortTrades.filter((t) => t.profit > 0).length;
     const longWinRate = longTrades.length > 0 ? ((longWins / longTrades.length) * 100).toFixed(0) : '0';
     const shortWinRate = shortTrades.length > 0 ? ((shortWins / shortTrades.length) * 100).toFixed(0) : '0';
 
-    const startBalance = tradingEngine.account.daily_start_balance || 10300;
-    const returnPct = ((netPnl / startBalance) * 100).toFixed(2);
+    const startBalance =
+      tradingEngine.account.daily_start_balance > 0
+        ? tradingEngine.account.daily_start_balance
+        : ticker.balance > 0
+          ? Math.max(1, ticker.balance - netPnl)
+          : 0;
+    const returnPct = startBalance > 0 ? ((netPnl / startBalance) * 100).toFixed(2) : '0.00';
 
     return {
-      todayTrades,
+      dayTrades,
       totalCount,
       winCount,
       lossCount,
@@ -110,39 +113,41 @@ export const DailyReportModal: React.FC<DailyReportModalProps> = ({
       shortWinRate,
       returnPct,
     };
-  }, [closedTrades, selectedDate]);
+  }, [closedTrades, activeDate, ticker.balance]);
 
-  // Filtered trades based on user selectors
   const filteredTrades = useMemo(() => {
-    return stats.todayTrades.filter((t) => {
-      // Outcome filter
+    return stats.dayTrades.filter((t) => {
       if (outcomeFilter === 'WIN' && t.profit <= 0) return false;
       if (outcomeFilter === 'LOSS' && t.profit >= 0) return false;
-
-      // Direction filter
       if (directionFilter === 'BUY' && t.type !== 'BUY') return false;
       if (directionFilter === 'SELL' && t.type !== 'SELL') return false;
-
-      // Search query
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase();
+        const matchSymbol = (t.symbol || '').toLowerCase().includes(q);
         const matchTicket = t.ticket.toString().includes(q);
         const matchReason = t.reason.toLowerCase().includes(q);
         const matchComment = t.comment ? t.comment.toLowerCase().includes(q) : false;
         const matchRationale = t.strategyRationale ? t.strategyRationale.toLowerCase().includes(q) : false;
-        if (!matchTicket && !matchReason && !matchComment && !matchRationale) return false;
+        if (!matchSymbol && !matchTicket && !matchReason && !matchComment && !matchRationale) return false;
       }
-
       return true;
     });
-  }, [stats.todayTrades, outcomeFilter, directionFilter, searchQuery]);
+  }, [stats.dayTrades, outcomeFilter, directionFilter, searchQuery]);
+
+  const shiftDate = (deltaDays: number) => {
+    const d = new Date(`${activeDate}T12:00:00`);
+    if (Number.isNaN(d.getTime())) return;
+    d.setDate(d.getDate() + deltaDays);
+    setActiveDate(localDayKey(d));
+  };
 
   const handleCopyReport = () => {
     const reportText = `===========================================
-SMC GOLD BOT (XAUUSD) - DAILY PERFORMANCE REPORT
-Session Date:    ${selectedDate} (Local)
+NIFTY TERMINAL - DAILY PERFORMANCE REPORT
+Account:         ${accountLabel}
+Session Date:    ${activeDate} (Local)
 -------------------------------------------
-Net Realized PnL:   ${stats.netPnl >= 0 ? '+' : ''}$${stats.netPnl} USD (${stats.returnPct}%)
+Net Realized PnL:   ${stats.netPnl >= 0 ? '+' : ''}$${stats.netPnl.toFixed(2)} USD (${stats.returnPct}%)
 Total Trades:       ${stats.totalCount} (${stats.winCount}W / ${stats.lossCount}L)
 Win Rate:           ${stats.winRate}%
 Profit Factor:      ${stats.profitFactor}
@@ -152,7 +157,7 @@ Avg Win / Loss:     +$${stats.avgWin} / -$${stats.avgLoss}
 Long Win Rate:      ${stats.longWinRate}% (${stats.longCount} trades)
 Short Win Rate:     ${stats.shortWinRate}% (${stats.shortCount} trades)
 Current Equity:     $${ticker.equity.toFixed(2)}
-Daily Drawdown:     ${tradingEngine.account.daily_drawdown_pct}% (Max: 3.0%)
+Daily Drawdown:     ${tradingEngine.account.daily_drawdown_pct}% (Max: ${tradingEngine.account.max_daily_loss_pct}%)
 ===========================================`;
 
     navigator.clipboard.writeText(reportText).then(() => {
@@ -162,26 +167,30 @@ Daily Drawdown:     ${tradingEngine.account.daily_drawdown_pct}% (Max: 3.0%)
   };
 
   const handleDownloadCSV = () => {
-    if (stats.todayTrades.length === 0) return;
-    const headers = ['Ticket', 'CloseAt', 'Type', 'Volume', 'OpenPrice', 'ClosePrice', 'Pips', 'Profit', 'Reason', 'StrategyRationale'];
-    const rows = stats.todayTrades.map((t) => [
-      t.ticket,
-      t.closedAt || t.closeTime,
-      t.type,
-      t.volume,
-      t.openPrice.toFixed(2),
-      t.closePrice.toFixed(2),
-      t.pips.toFixed(1),
-      t.profit.toFixed(2),
-      t.reason,
-      t.strategyRationale || '',
-    ].map((value) => `"${String(value).replaceAll('"', '""')}"`));
+    if (stats.dayTrades.length === 0) return;
+    const headers = ['Ticket', 'Symbol', 'CloseAt', 'Type', 'Volume', 'OpenPrice', 'ClosePrice', 'Pips', 'Profit', 'Reason', 'StrategyRationale'];
+    const rows = stats.dayTrades.map((t) => {
+      const sym = (t.symbol || 'XAUUSD') as SupportedSymbol;
+      const d = getInstrumentConfig(sym).digits;
+      return [
+        t.ticket,
+        t.symbol || '',
+        t.closedAt || t.closeTime || '',
+        t.type,
+        t.volume,
+        t.openPrice.toFixed(d),
+        t.closePrice.toFixed(d),
+        t.pips.toFixed(1),
+        t.profit.toFixed(2),
+        t.reason,
+        t.strategyRationale || '',
+      ].map((value) => `"${String(value).replaceAll('"', '""')}"`);
+    });
 
     const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map((e) => e.join(','))].join('\n');
-    const encodedUri = encodeURI(csvContent);
     const link = document.createElement('a');
-    link.setAttribute('href', encodedUri);
-    link.setAttribute('download', `smc_trading_journal_${selectedDate}.csv`);
+    link.setAttribute('href', encodeURI(csvContent));
+    link.setAttribute('download', `nifty_daily_report_${activeDate}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -193,332 +202,296 @@ Daily Drawdown:     ${tradingEngine.account.daily_drawdown_pct}% (Max: 3.0%)
     <div
       role="dialog"
       aria-modal="true"
-      className="fixed inset-0 z-[170] flex items-center justify-center p-2.5 sm:p-4 bg-black/75 backdrop-blur-xs font-mono text-xs select-none animate-in fade-in duration-150"
+      aria-labelledby="daily-report-title"
+      className="fixed inset-0 z-[170] flex justify-end bg-black/60 backdrop-blur-xs text-xs select-none"
     >
-      <div className="w-full max-w-3xl max-h-[92dvh] sm:max-h-[88dvh] rounded-2xl bg-white dark:bg-[#0c0e12] border border-slate-200 dark:border-zinc-800 shadow-xl flex flex-col overflow-hidden transition-colors">
-        {/* Top Header */}
-        <div className="px-4 sm:px-6 py-3 border-b border-slate-200 dark:border-zinc-800 flex items-center justify-between bg-slate-50/50 dark:bg-zinc-950/50 shrink-0">
+      <div className="w-full max-w-3xl h-full ws-surface border-l shadow-2xl flex flex-col overflow-hidden">
+        {/* Minimalist Header */}
+        <header className="px-5 py-3.5 ws-subtle border-b flex items-center justify-between gap-3 flex-wrap shrink-0">
           <div className="flex items-center gap-2.5">
-            <span className="p-2 rounded-lg bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
-              <FileText className="w-4 h-4" />
-            </span>
+            <FileText className="w-4 h-4 text-emerald-500 shrink-0" />
             <div>
-              <h2 className="font-extrabold text-sm sm:text-base text-slate-900 dark:text-white uppercase tracking-wider">
-                Daily Performance Journal
+              <h2 id="daily-report-title" className="font-extrabold text-sm text-slate-900 dark:text-white tracking-tight">
+                Daily Performance Report
               </h2>
-              <div className="flex items-center gap-2 text-[11px] text-slate-400">
-                <Calendar className="w-3 h-3 text-slate-400" />
-                <span>{new Date(`${selectedDate}T12:00:00`).toLocaleDateString()} (Local)</span>
-                <span>·</span>
-                <span className="text-emerald-500 font-bold">XAUUSD Institutional Ledger</span>
-              </div>
+              <p className="text-[11px] font-mono text-slate-500 dark:text-slate-400">
+                {accountLabel}
+              </p>
             </div>
           </div>
 
-          <button
-            onClick={onClose}
-            className="p-1.5 rounded-lg text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-zinc-800 transition-colors cursor-pointer"
-            title="Close Journal Window"
-            aria-label="Close"
-          >
-            <X className="w-5 h-5" />
-          </button>
-        </div>
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => shiftDate(-1)}
+              aria-label="Previous day"
+              className="p-1.5 rounded-lg border border-slate-300 dark:border-[#2b3b59] bg-white dark:bg-[#0b111d] text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-[#1e2d48] cursor-pointer"
+            >
+              <ChevronLeft className="w-3.5 h-3.5" />
+            </button>
+            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-slate-300 dark:border-[#2b3b59] bg-white dark:bg-[#0b111d]">
+              <Calendar className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+              <input
+                type="date"
+                value={activeDate}
+                onChange={(e) => e.target.value && setActiveDate(e.target.value)}
+                className="bg-transparent font-mono text-xs font-bold text-slate-900 dark:text-white outline-none cursor-pointer"
+              />
+            </div>
+            <button
+              type="button"
+              onClick={() => shiftDate(1)}
+              aria-label="Next day"
+              className="p-1.5 rounded-lg border border-slate-300 dark:border-[#2b3b59] bg-white dark:bg-[#0b111d] text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-[#1e2d48] cursor-pointer"
+            >
+              <ChevronRight className="w-3.5 h-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close"
+              className="ml-1 p-1.5 rounded-lg text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-[#1e2d48] transition-colors cursor-pointer"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </header>
 
-        {/* Scrollable Report Content */}
-        <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-4 sm:space-y-5">
-          {/* Executive Net P&L Hero Card */}
-          <div className="p-4 sm:p-5 rounded-2xl bg-slate-50 dark:bg-[#12141a] border border-slate-200 dark:border-zinc-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3.5">
-            <div className="space-y-1">
-              <span className="text-[10px] text-slate-400 uppercase font-semibold block tracking-wider">
-                Net Realized Performance (Today)
+        {/* Scrollable Content */}
+        <div className="flex-1 overflow-y-auto p-5 space-y-4">
+          {/* Net P&L Hero Strip */}
+          <div className="p-4 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-slate-50/70 dark:bg-[#141f35] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div>
+              <span className="text-[10px] text-slate-500 dark:text-slate-400 uppercase font-bold block tracking-wider">
+                Realized Net P&amp;L ({activeDate})
               </span>
-              <div className="flex items-baseline gap-2.5 flex-wrap">
+              <div className="flex items-baseline gap-2.5 mt-0.5">
                 <span
-                  className={`text-2xl sm:text-3xl font-black tabular-nums tracking-tight ${
+                  className={`text-2xl font-black font-mono tabular-nums tracking-tight ${
                     stats.netPnl >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'
                   }`}
                 >
-                  {stats.netPnl >= 0 ? '+' : ''}${stats.netPnl} USD
+                  {stats.netPnl >= 0 ? '+' : ''}${stats.netPnl.toFixed(2)}
                 </span>
                 <span
-                  className={`text-xs font-bold px-2 py-0.5 rounded-md ${
-                    stats.netPnl >= 0
-                      ? 'bg-emerald-100 dark:bg-emerald-950/50 text-emerald-800 dark:text-emerald-300'
-                      : 'bg-rose-100 dark:bg-rose-950/50 text-rose-800 dark:text-rose-300'
+                  className={`text-xs font-mono font-bold ${
+                    stats.netPnl >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'
                   }`}
                 >
-                  {stats.netPnl >= 0 ? '+' : ''}{stats.returnPct}% Return
+                  ({stats.netPnl >= 0 ? '+' : ''}{stats.returnPct}%)
                 </span>
               </div>
             </div>
 
-            <div className="flex items-center gap-3 sm:text-right border-t sm:border-t-0 border-slate-200 dark:border-zinc-800 pt-2.5 sm:pt-0">
+            <div className="flex items-center gap-4 sm:text-right border-t sm:border-t-0 border-slate-200 dark:border-[#2b3b59] pt-2.5 sm:pt-0 font-mono">
               <div>
-                <span className="text-[10px] text-slate-400 uppercase block">Account Balance</span>
-                <span className="text-sm font-bold text-slate-900 dark:text-white tabular-nums">
-                  ${ticker.balance.toLocaleString()}
+                <span className="text-[10px] text-slate-500 dark:text-slate-400 uppercase block font-sans font-bold">
+                  Balance
+                </span>
+                <span className="text-sm font-extrabold text-slate-900 dark:text-white tabular-nums">
+                  ${ticker.balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                 </span>
               </div>
-              <div className="w-px h-8 bg-slate-200 dark:bg-zinc-800" />
+              <div className="w-px h-8 bg-slate-200 dark:bg-[#2b3b59]" />
               <div>
-                <span className="text-[10px] text-slate-400 uppercase block">Daily Drawdown</span>
-                <span className="text-sm font-bold text-emerald-600 dark:text-emerald-400 tabular-nums">
-                  {tradingEngine.account.daily_drawdown_pct}% / 3.0% Limit
+                <span className="text-[10px] text-slate-500 dark:text-slate-400 uppercase block font-sans font-bold">
+                  Daily Drawdown
+                </span>
+                <span className="text-sm font-extrabold text-emerald-600 dark:text-emerald-400 tabular-nums">
+                  {tradingEngine.account.daily_drawdown_pct}% / {tradingEngine.account.max_daily_loss_pct}%
                 </span>
               </div>
             </div>
           </div>
 
-          {/* 6 Key Performance Indicators Grid */}
+          {/* 6 KPI Cards */}
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
-            <div className="p-3 rounded-xl border border-slate-200 dark:border-zinc-800 bg-white dark:bg-[#12141a] space-y-1">
-              <span className="text-[10px] uppercase font-semibold text-slate-400 block">Win Rate</span>
-              <div className="text-base font-black text-slate-900 dark:text-white tabular-nums">
+            <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-white dark:bg-[#141f35]">
+              <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400 block">Win Rate</span>
+              <div className="text-base font-extrabold font-mono text-slate-900 dark:text-white tabular-nums mt-0.5">
                 {stats.winRate}%
               </div>
-              <div className="text-[10px] text-slate-500">
-                {stats.winCount}W · {stats.lossCount}L ({stats.totalCount} Total)
+              <div className="text-[10px] font-mono text-slate-500 dark:text-slate-400">
+                {stats.winCount}W · {stats.lossCount}L ({stats.totalCount} total)
               </div>
             </div>
 
-            <div className="p-3 rounded-xl border border-slate-200 dark:border-zinc-800 bg-white dark:bg-[#12141a] space-y-1">
-              <span className="text-[10px] uppercase font-semibold text-slate-400 block">Profit Factor</span>
-              <div className="text-base font-black text-slate-900 dark:text-white tabular-nums">
+            <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-white dark:bg-[#141f35]">
+              <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400 block">Profit Factor</span>
+              <div className="text-base font-extrabold font-mono text-slate-900 dark:text-white tabular-nums mt-0.5">
                 {stats.profitFactor}
               </div>
-              <div className="text-[10px] text-slate-500">
-                Gross: +${stats.grossProfit} / -${stats.grossLoss}
+              <div className="text-[10px] font-mono text-slate-500 dark:text-slate-400">
+                +${stats.grossProfit} / -${stats.grossLoss}
               </div>
             </div>
 
-            <div className="p-3 rounded-xl border border-slate-200 dark:border-zinc-800 bg-white dark:bg-[#12141a] space-y-1">
-              <span className="text-[10px] uppercase font-semibold text-slate-400 block">Total Pips</span>
-              <div className="text-base font-black text-slate-900 dark:text-white tabular-nums">
+            <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-white dark:bg-[#141f35]">
+              <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400 block">Pips &amp; Volume</span>
+              <div className="text-base font-extrabold font-mono text-slate-900 dark:text-white tabular-nums mt-0.5">
                 {stats.totalPips} pips
               </div>
-              <div className="text-[10px] text-slate-500">
-                Volume: {stats.totalVolume} lots
+              <div className="text-[10px] font-mono text-slate-500 dark:text-slate-400">
+                {stats.totalVolume} lots
               </div>
             </div>
 
-            <div className="p-3 rounded-xl border border-slate-200 dark:border-zinc-800 bg-white dark:bg-[#12141a] space-y-1">
-              <span className="text-[10px] uppercase font-semibold text-slate-400 block">Avg Win / Loss</span>
-              <div className="text-sm font-black text-slate-900 dark:text-white tabular-nums">
+            <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-white dark:bg-[#141f35]">
+              <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400 block">Avg Win / Loss</span>
+              <div className="text-sm font-extrabold font-mono text-slate-900 dark:text-white tabular-nums mt-0.5">
                 +${stats.avgWin} / -${stats.avgLoss}
               </div>
-              <div className="text-[10px] text-slate-500">
-                Positive edge
+            </div>
+
+            <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-white dark:bg-[#141f35]">
+              <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400 block">Long (BUY)</span>
+              <div className="text-sm font-extrabold font-mono text-emerald-600 dark:text-emerald-400 tabular-nums mt-0.5">
+                {stats.longWinRate}% Win
+              </div>
+              <div className="text-[10px] font-mono text-slate-500 dark:text-slate-400">
+                {stats.longCount} trades
               </div>
             </div>
 
-            <div className="p-3 rounded-xl border border-slate-200 dark:border-zinc-800 bg-white dark:bg-[#12141a] space-y-1">
-              <span className="text-[10px] uppercase font-semibold text-slate-400 block">Long (BUY)</span>
-              <div className="text-sm font-black text-emerald-600 dark:text-emerald-400 tabular-nums">
-                {stats.longWinRate}% Win Rate
+            <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-white dark:bg-[#141f35]">
+              <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400 block">Short (SELL)</span>
+              <div className="text-sm font-extrabold font-mono text-rose-600 dark:text-rose-400 tabular-nums mt-0.5">
+                {stats.shortWinRate}% Win
               </div>
-              <div className="text-[10px] text-slate-500">
-                {stats.longCount} BUY trades
-              </div>
-            </div>
-
-            <div className="p-3 rounded-xl border border-slate-200 dark:border-zinc-800 bg-white dark:bg-[#12141a] space-y-1">
-              <span className="text-[10px] uppercase font-semibold text-slate-400 block">Short (SELL)</span>
-              <div className="text-sm font-black text-rose-600 dark:text-rose-400 tabular-nums">
-                {stats.shortWinRate}% Win Rate
-              </div>
-              <div className="text-[10px] text-slate-500">
-                {stats.shortCount} SELL trades
+              <div className="text-[10px] font-mono text-slate-500 dark:text-slate-400">
+                {stats.shortCount} trades
               </div>
             </div>
           </div>
 
-          {/* ADVANCED ITEM SELECTORS & FILTERS */}
-          <div className="p-3 rounded-xl bg-slate-50 dark:bg-zinc-900/70 border border-slate-200 dark:border-zinc-800 space-y-2.5">
-            <div className="flex items-center justify-between flex-wrap gap-2">
-              <span className="text-[10px] uppercase font-bold text-zinc-500 flex items-center gap-1.5">
-                <Filter className="w-3 h-3 text-zinc-400" />
-                <span>Trade Item Selectors & Filter</span>
-              </span>
+          {/* Filter Bar */}
+          <div className="flex items-center justify-between gap-2 flex-wrap">
+            <div className="flex items-center gap-1.5 flex-wrap">
+              {(
+                [
+                  { id: 'ALL', label: `All (${stats.totalCount})` },
+                  { id: 'WIN', label: `Wins (${stats.winCount})` },
+                  { id: 'LOSS', label: `Losses (${stats.lossCount})` },
+                ] as const
+              ).map((o) => (
+                <button
+                  key={o.id}
+                  type="button"
+                  onClick={() => setOutcomeFilter(o.id)}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer ${
+                    outcomeFilter === o.id
+                      ? 'bg-slate-900 text-white dark:bg-sky-500 dark:text-slate-950'
+                      : 'bg-slate-100 dark:bg-[#141f35] text-slate-600 dark:text-slate-300'
+                  }`}
+                >
+                  {o.label}
+                </button>
+              ))}
 
-              {/* Search by Ticket # or reason */}
-              <div className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white dark:bg-zinc-800 border border-slate-200 dark:border-zinc-700">
-                <Search className="w-3 h-3 text-zinc-400" />
-                <input
-                  type="text"
-                  placeholder="Filter ticket / reason..."
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="bg-transparent outline-none text-[11px] text-slate-900 dark:text-white w-36 sm:w-44"
-                />
-                {searchQuery && (
-                  <button onClick={() => setSearchQuery('')} className="text-zinc-400 hover:text-white">
-                    <X className="w-3 h-3" />
-                  </button>
-                )}
-              </div>
+              <span className="text-slate-300 dark:text-slate-700 mx-1">|</span>
+
+              {(['ALL', 'BUY', 'SELL'] as const).map((d) => (
+                <button
+                  key={d}
+                  type="button"
+                  onClick={() => setDirectionFilter(d)}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer ${
+                    directionFilter === d
+                      ? 'bg-slate-900 text-white dark:bg-sky-500 dark:text-slate-950'
+                      : 'bg-slate-100 dark:bg-[#141f35] text-slate-600 dark:text-slate-300'
+                  }`}
+                >
+                  {d === 'ALL' ? 'Both' : d}
+                </button>
+              ))}
             </div>
 
-            {/* Segmented Filter Selectors */}
-            <div className="flex items-center justify-between flex-wrap gap-2 pt-1 border-t border-slate-200/50 dark:border-zinc-800/50">
-              {/* Outcome Selectors */}
-              <div className="flex items-center gap-1 bg-white dark:bg-zinc-800 p-0.5 rounded-lg border border-slate-200 dark:border-zinc-700">
-                <button
-                  type="button"
-                  onClick={() => setOutcomeFilter('ALL')}
-                  className={`px-2 py-1 rounded text-[10px] font-bold transition-colors cursor-pointer ${
-                    outcomeFilter === 'ALL'
-                      ? 'bg-zinc-900 text-white dark:bg-white dark:text-black shadow-xs'
-                      : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-white'
-                  }`}
-                >
-                  All ({stats.totalCount})
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setOutcomeFilter('WIN')}
-                  className={`px-2 py-1 rounded text-[10px] font-bold transition-colors cursor-pointer flex items-center gap-1 ${
-                    outcomeFilter === 'WIN'
-                      ? 'bg-emerald-600 text-white shadow-xs'
-                      : 'text-emerald-600 dark:text-emerald-400 hover:underline'
-                  }`}
-                >
-                  <CheckCircle2 className="w-2.5 h-2.5" />
-                  <span>Winners ({stats.winCount})</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setOutcomeFilter('LOSS')}
-                  className={`px-2 py-1 rounded text-[10px] font-bold transition-colors cursor-pointer flex items-center gap-1 ${
-                    outcomeFilter === 'LOSS'
-                      ? 'bg-rose-600 text-white shadow-xs'
-                      : 'text-rose-600 dark:text-rose-400 hover:underline'
-                  }`}
-                >
-                  <XCircle className="w-2.5 h-2.5" />
-                  <span>Losses ({stats.lossCount})</span>
-                </button>
-              </div>
-
-              {/* Direction Selectors */}
-              <div className="flex items-center gap-1 bg-white dark:bg-zinc-800 p-0.5 rounded-lg border border-slate-200 dark:border-zinc-700">
-                <button
-                  type="button"
-                  onClick={() => setDirectionFilter('ALL')}
-                  className={`px-2 py-1 rounded text-[10px] font-bold transition-colors cursor-pointer ${
-                    directionFilter === 'ALL'
-                      ? 'bg-zinc-900 text-white dark:bg-white dark:text-black shadow-xs'
-                      : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-white'
-                  }`}
-                >
-                  Both Sides
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setDirectionFilter('BUY')}
-                  className={`px-2 py-1 rounded text-[10px] font-bold transition-colors cursor-pointer ${
-                    directionFilter === 'BUY'
-                      ? 'bg-zinc-900 text-white dark:bg-white dark:text-black shadow-xs'
-                      : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-white'
-                  }`}
-                >
-                  BUY Only
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setDirectionFilter('SELL')}
-                  className={`px-2 py-1 rounded text-[10px] font-bold transition-colors cursor-pointer ${
-                    directionFilter === 'SELL'
-                      ? 'bg-zinc-900 text-white dark:bg-white dark:text-black shadow-xs'
-                      : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-white'
-                  }`}
-                >
-                  SELL Only
-                </button>
-              </div>
+            <div className="relative min-w-[180px]">
+              <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Search symbol or ticket..."
+                className="w-full pl-8 pr-3 py-1 rounded-lg border border-slate-300 dark:border-[#2b3b59] bg-slate-50 dark:bg-[#0d1424] text-slate-900 dark:text-white placeholder:text-slate-500 text-xs outline-none focus:border-sky-500"
+              />
             </div>
           </div>
 
-          {/* Trade Ledger / Cards Section */}
-          <div className="space-y-2.5">
+          {/* Session Trades Table */}
+          <div className="space-y-2">
             <div className="flex items-center justify-between">
               <h3 className="font-extrabold text-xs text-slate-900 dark:text-white uppercase tracking-wider">
-                Audited Session Trades ({filteredTrades.length} of {stats.todayTrades.length})
+                Session Trades ({filteredTrades.length} of {stats.dayTrades.length})
               </h3>
-
-              {stats.todayTrades.length > 0 && (
+              {stats.dayTrades.length > 0 && (
                 <button
+                  type="button"
                   onClick={handleDownloadCSV}
-                  className="flex items-center gap-1 text-[11px] text-emerald-600 dark:text-emerald-400 hover:underline font-bold cursor-pointer"
+                  className="inline-flex items-center gap-1 text-[11px] text-emerald-600 dark:text-emerald-400 hover:underline font-bold cursor-pointer"
                 >
                   <Download className="w-3.5 h-3.5" />
-                  <span>Download CSV</span>
+                  <span>Export CSV</span>
                 </button>
               )}
             </div>
 
             {filteredTrades.length > 0 ? (
-              <div className="overflow-x-auto rounded-xl border border-slate-200 dark:border-zinc-800">
+              <div className="overflow-x-auto rounded-xl border border-slate-200 dark:border-[#2b3b59]">
                 <table className="w-full text-left border-collapse text-xs">
                   <thead>
-                    <tr className="bg-slate-50 dark:bg-zinc-950 border-b border-slate-200 dark:border-zinc-800 text-[10px] text-slate-500 uppercase">
-                      <th className="py-2.5 px-3">Time</th>
-                      <th className="py-2.5 px-2">Order</th>
-                      <th className="py-2.5 px-2">Side</th>
-                      <th className="py-2.5 px-2">Lots</th>
+                    <tr className="bg-slate-50 dark:bg-[#0d1424] border-b border-slate-200 dark:border-[#2b3b59] text-[10px] text-slate-500 dark:text-slate-400 uppercase">
+                      <th className="py-2.5 px-3">Ticket / Time</th>
+                      <th className="py-2.5 px-2">Pair</th>
+                      <th className="py-2.5 px-2">Side &amp; Vol</th>
                       <th className="py-2.5 px-2">Prices</th>
-                      <th className="py-2.5 px-2">Strategy Rationale</th>
+                      <th className="py-2.5 px-2">Note / Rationale</th>
                       <th className="py-2.5 px-2">Reason</th>
                       <th className="py-2.5 px-3 text-right">Profit</th>
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-slate-100 dark:divide-zinc-800/80">
-                    {filteredTrades.map((t, idx) => (
-                      <tr key={`${t.ticket}_${t.closeTime}_${idx}`} className="hover:bg-slate-50 dark:hover:bg-zinc-800/30">
-                        <td className="py-2.5 px-3 text-slate-500">{t.closeTime}</td>
-                        <td className="py-2.5 px-2 font-bold text-slate-700 dark:text-slate-300">#{t.ticket}</td>
-                        <td className="py-2.5 px-2">
-                          <span
-                            className={`font-black px-1.5 py-0.5 rounded text-[10px] ${
-                              t.type === 'BUY'
-                                ? 'bg-emerald-100 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400'
-                                : 'bg-rose-100 dark:bg-rose-950/40 text-rose-700 dark:text-rose-400'
-                            }`}
-                          >
-                            {t.type}
-                          </span>
-                        </td>
-                        <td className="py-2.5 px-2 text-slate-700 dark:text-slate-300">{t.volume}L</td>
-                        <td className="py-2.5 px-2 text-slate-600 dark:text-slate-400 tabular-nums">
-                          ${t.openPrice.toFixed(2)} → ${t.closePrice.toFixed(2)}
-                        </td>
-                        <td className="py-2.5 px-2">
-                          <span className="block max-w-sm whitespace-normal break-words text-xs leading-relaxed text-zinc-600 dark:text-zinc-300" title={t.strategyRationale || 'SMC Confluence execution'}>
-                            {t.strategyRationale || 'SMC Confluence execution'}
-                          </span>
-                        </td>
-                        <td className="py-2.5 px-2">
-                          <span className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-zinc-800 text-slate-700 dark:text-slate-300 text-[10px]">
-                            {t.reason}
-                          </span>
-                        </td>
-                        <td className="py-2.5 px-3 text-right font-black tabular-nums">
-                          <span className={t.profit >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}>
-                            {t.profit >= 0 ? '+' : ''}${t.profit.toFixed(2)}
-                          </span>
-                        </td>
-                      </tr>
-                    ))}
+                  <tbody className="divide-y divide-slate-100 dark:divide-[#23314c]">
+                    {filteredTrades.map((t, idx) => {
+                      const sym = (t.symbol || 'XAUUSD') as SupportedSymbol;
+                      const d = getInstrumentConfig(sym).digits;
+                      return (
+                        <tr key={`${t.ticket}_${t.closeTime}_${idx}`} className="hover:bg-slate-50 dark:hover:bg-[#172238]/60">
+                          <td className="py-2.5 px-3 font-mono">
+                            <span className="font-bold text-slate-900 dark:text-slate-100 block">#{t.ticket}</span>
+                            <span className="text-[10px] text-slate-400">{t.closeTime || '—'}</span>
+                          </td>
+                          <td className="py-2.5 px-2 font-bold text-slate-800 dark:text-slate-200">{t.symbol || '—'}</td>
+                          <td className="py-2.5 px-2 font-mono">
+                            <span className={`font-bold ${t.type === 'BUY' ? 'text-emerald-500' : 'text-rose-500'}`}>
+                              {t.type}
+                            </span>{' '}
+                            <span className="text-slate-500 dark:text-slate-400">{t.volume}L</span>
+                          </td>
+                          <td className="py-2.5 px-2 font-mono text-slate-700 dark:text-slate-300 tabular-nums">
+                            {t.openPrice.toFixed(d)} → {t.closePrice.toFixed(d)}
+                          </td>
+                          <td className="py-2.5 px-2 max-w-[180px] truncate text-slate-600 dark:text-slate-300" title={t.strategyRationale || t.comment || ''}>
+                            {t.strategyRationale || t.comment || '—'}
+                          </td>
+                          <td className="py-2.5 px-2 text-slate-500 dark:text-slate-400">{t.reason}</td>
+                          <td className="py-2.5 px-3 text-right font-mono font-extrabold tabular-nums">
+                            <span className={t.profit >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}>
+                              {t.profit >= 0 ? '+' : ''}${t.profit.toFixed(2)}
+                            </span>
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
             ) : (
-              <div className="py-8 px-4 rounded-xl border border-dashed border-slate-200 dark:border-zinc-800 text-center space-y-1">
-                <span className="font-bold text-xs uppercase tracking-wider block text-zinc-400">
-                  No Trades Match Selected Filter
+              <div className="py-10 px-4 rounded-xl border border-dashed border-slate-300 dark:border-[#2b3b59] text-center space-y-1">
+                <span className="font-bold text-xs uppercase tracking-wider block text-slate-500 dark:text-slate-400">
+                  No Closed Trades for {activeDate}
                 </span>
-                <span className="text-[11px] text-zinc-500 block">
-                  Change item selectors or clear search query to inspect other trades
+                <span className="text-[11px] text-slate-400 block">
+                  Select another date or sync your MetaTrader 5 account history.
                 </span>
               </div>
             )}
@@ -526,23 +499,24 @@ Daily Drawdown:     ${tradingEngine.account.daily_drawdown_pct}% (Max: 3.0%)
         </div>
 
         {/* Footer */}
-        <div className="p-3 sm:p-4 border-t border-slate-200 dark:border-zinc-800 bg-slate-50 dark:bg-zinc-950 flex flex-col sm:flex-row items-center justify-between gap-2.5 shrink-0">
+        <footer className="px-5 py-3.5 ws-subtle border-t flex items-center justify-between gap-2.5 shrink-0">
           <button
+            type="button"
             onClick={onClose}
-            className="w-full sm:w-auto px-4 py-2 rounded-xl text-xs font-bold text-slate-600 dark:text-zinc-300 hover:text-slate-950 dark:hover:text-white bg-slate-200/80 hover:bg-slate-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 transition-colors cursor-pointer flex items-center justify-center gap-1.5"
+            className="px-4 py-1.5 rounded-lg text-xs font-bold text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-[#2b3b59] bg-white dark:bg-[#0b111d] hover:bg-slate-100 dark:hover:bg-[#1e2d48] cursor-pointer"
           >
-            <ArrowLeft className="w-3.5 h-3.5" />
-            <span>Back to Terminal</span>
+            Close
           </button>
 
           <button
+            type="button"
             onClick={handleCopyReport}
-            className="w-full sm:w-auto flex items-center justify-center gap-1.5 px-4 py-2 rounded-xl bg-zinc-900 text-white dark:bg-white dark:text-black font-bold transition-all shadow-xs active:scale-95 cursor-pointer text-xs"
+            className="flex items-center gap-1.5 px-4 py-1.5 rounded-lg bg-slate-900 text-white dark:bg-white dark:text-slate-950 font-bold cursor-pointer text-xs"
           >
             {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-            <span>{copied ? 'Report Copied!' : 'Copy Daily Report'}</span>
+            <span>{copied ? 'Copied' : 'Copy Summary'}</span>
           </button>
-        </div>
+        </footer>
       </div>
     </div>
   );

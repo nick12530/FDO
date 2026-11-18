@@ -12,10 +12,16 @@ export interface SignalValidationRecord {
   id: string;
   createdAt: string;
   sourceCandleTime: number;
+  generatedAt?: string;
+  availableAt?: string;
+  sourceCandleOpenTime?: number;
+  sourceCandleCloseTime?: number;
+  scoringPolicyVersion?: number;
   expiresAt: number;
   symbol: string;
   direction: 'BUY' | 'SELL';
-  timeframe: 'M5' | 'M15';
+  timeframe: 'M1' | 'M5' | 'M15';
+  strategy?: string;
   triggerPrice: number;
   stopLoss: number;
   takeProfit: number;
@@ -63,6 +69,12 @@ export function advanceSignalValidation(
 ): SignalValidationRecord {
   if (record.outcome !== 'WATCHING') return record;
 
+  const availableAt = Date.parse(record.availableAt || record.generatedAt || record.createdAt);
+  const sourceCandleCloseTime = record.sourceCandleCloseTime ?? record.sourceCandleTime;
+  const earliestCandleTime = Math.max(
+    Number.isFinite(availableAt) ? availableAt : record.sourceCandleTime,
+    sourceCandleCloseTime
+  );
   const closedCandles = oneMinuteCandles
     .filter((candle) => {
       const time = candleTimeMs(candle);
@@ -71,7 +83,7 @@ export function advanceSignalValidation(
         Number.isFinite(candle.high) &&
         Number.isFinite(candle.low) &&
         candle.high >= candle.low &&
-        time > record.sourceCandleTime &&
+        time >= earliestCandleTime &&
         time + 60_000 <= now &&
         time < record.expiresAt
       );
@@ -126,5 +138,52 @@ export function summarizeSignalValidations(records: SignalValidationRecord[]): S
     expiredOpen,
     watching,
     resolvedWinRate: resolvedCount ? (targetHits / resolvedCount) * 100 : null,
+  };
+}
+
+export interface ValidationBucketSummary {
+  key: string;
+  sampleCount: number;
+  targetHits: number;
+  stopHits: number;
+  resolvedWinRate: number | null;
+}
+
+export function summarizeValidationsByTimeframeAndStrategy(records: SignalValidationRecord[]): {
+  byTimeframe: ValidationBucketSummary[];
+  byStrategy: ValidationBucketSummary[];
+} {
+  const bucket = (rows: Map<string, SignalValidationRecord[]>): ValidationBucketSummary[] =>
+    Array.from(rows.entries()).map(([key, items]) => {
+      const targetHits = items.filter((r) => r.outcome === 'TARGET_HIT').length;
+      const stopHits = items.filter((r) => r.outcome === 'STOP_HIT').length;
+      const resolved = targetHits + stopHits;
+      return {
+        key,
+        sampleCount: items.length,
+        targetHits,
+        stopHits,
+        resolvedWinRate: resolved > 0 ? (targetHits / resolved) * 100 : null,
+      };
+    });
+
+  const tfMap = new Map<string, SignalValidationRecord[]>();
+  const stratMap = new Map<string, SignalValidationRecord[]>();
+
+  for (const r of records) {
+    const tfKey = r.timeframe || 'M5';
+    const tfList = tfMap.get(tfKey) || [];
+    tfList.push(r);
+    tfMap.set(tfKey, tfList);
+
+    const stratKey = r.strategy || 'SMC POI Retest';
+    const stratList = stratMap.get(stratKey) || [];
+    stratList.push(r);
+    stratMap.set(stratKey, stratList);
+  }
+
+  return {
+    byTimeframe: bucket(tfMap),
+    byStrategy: bucket(stratMap),
   };
 }

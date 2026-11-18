@@ -1,12 +1,7 @@
 /**
- * SMCOverlayHUD.tsx - Institutional SMC Indicators Overlay for the Chart
- * Pure coloured lines and embedded text - ZERO opaque coloured bars or background blocks.
- *
- * Implements:
- * - Coloured dotted horizontal lines with centred text for Order Blocks, BOS, CHoCH, EQ, and FVGs
- * - Pure transparent background: chart candlesticks remain 100% visible
- * - Tapped trade highlights trade Order Block, Entry, SL, and TP coloured lines
- * - Cross-pair signal correlation strip at the top
+ * SMCOverlayHUD.tsx - System-Synced SMC Levels & Position Dock
+ * Renders cleanly below the TradingView canvas (zero overlap on chart candles or TV toolbars).
+ * Every toggle in indicatorConfig strictly controls real system data readouts from tradingEngine.
  */
 
 import React, { memo } from 'react';
@@ -17,22 +12,17 @@ import {
   useScannerAnalyses,
 } from '../hooks/useTradingStore';
 import { tradingEngine } from '../engine/tradingEngine';
-import { findCorrespondingOrderBlock } from '../engine/tradeJournal';
-import type { SMCIndicatorConfig } from './SMCInteractiveChart';
-import type { SupportedSymbol } from '../engine/instrumentConfig';
+import { getInstrumentConfig } from '../engine/instrumentConfig';
+import type { SMCIndicatorConfig } from '../types/smc';
 
 interface SMCOverlayHUDProps {
   showIndicators: boolean;
   indicatorConfig: SMCIndicatorConfig;
-  onToggleIndicators?: () => void;
-  onFocusOrderBlock?: () => void;
-  onSwitchToSMC?: () => void;
 }
 
 export const SMCOverlayHUD: React.FC<SMCOverlayHUDProps> = memo(({
   showIndicators,
   indicatorConfig,
-  onSwitchToSMC,
 }) => {
   const market = useMarket();
   const positionsState = usePositions();
@@ -41,140 +31,155 @@ export const SMCOverlayHUD: React.FC<SMCOverlayHUDProps> = memo(({
 
   if (!showIndicators) return null;
 
-  const currentPrice = ticker.bid;
-  const signal = market.signal;
-  const dealingRange = market.dealing_range;
-  const zones = market.zones || [];
+  const cfg = getInstrumentConfig(ticker.symbol);
+  const digits = cfg.digits;
+  const hasLiveBroker = Boolean(market.brokerMarketData && ticker.bid > 0);
+  const analysis = scannerAnalyses.find((a) => a.symbol === ticker.symbol);
 
-  // Filter nearest Order Blocks
-  const demandOB = zones.find((z) => z.kind === 'OB' && z.bullish);
-  const supplyOB = zones.find((z) => z.kind === 'OB' && !z.bullish);
-  const activeFVG = zones.find((z) => z.kind === 'FVG');
-  const activePositions = positionsState.positions;
+  const tfData = market.timeframeData?.[market.currentTimeframe];
+  const zones = tfData?.zones?.length ? tfData.zones : market.zones || [];
+  const demandOB = zones.find((z) => z.kind === 'OB' && z.bullish && !z.filled);
+  const supplyOB = zones.find((z) => z.kind === 'OB' && !z.bullish && !z.filled);
+  const bullFvg = zones.find((z) => z.kind === 'FVG' && z.bullish && !z.filled);
+  const bearFvg = zones.find((z) => z.kind === 'FVG' && !z.bullish && !z.filled);
 
-  // Calculate Equilibrium & Premium/Discount
-  const eqPrice = dealingRange?.equilibrium ?? (
-    market.brokerMarketData && ticker.high24h > 0 && ticker.low24h > 0
+  const latestStructure =
+    tfData?.choch ||
+    tfData?.bos ||
+    market.choch ||
+    market.bos ||
+    analysis?.lastCHoCH ||
+    analysis?.lastBOS ||
+    null;
+
+  const eqPrice =
+    tfData?.dealing_range?.equilibrium ??
+    market.dealing_range?.equilibrium ??
+    (hasLiveBroker && ticker.high24h > 0 && ticker.low24h > 0
       ? (ticker.high24h + ticker.low24h) / 2
-      : null
-  );
-  const isPremium = eqPrice !== null && currentPrice >= eqPrice;
+      : null);
 
-  // Find selected trade and its corresponding order block (guaranteed fallback to first active trade)
-  const selectedPosition =
-    positionsState.positions.find((p) => p.ticket === positionsState.selectedTicket) ||
-    positionsState.positions[0];
-
-  const selectedOrderBlock = selectedPosition
-    ? selectedPosition.strategyOrderBlock ||
-      findCorrespondingOrderBlock(selectedPosition.type, selectedPosition.price_open, zones)
-    : undefined;
-
-  // Other currency pairs signals linked into the chart
-  const otherPairAnalyses = scannerAnalyses.filter((item) => item.symbol !== ticker.symbol);
+  const activePositions = positionsState.positions;
+  const selectedTicket = positionsState.selectedTicket ?? activePositions[0]?.ticket;
 
   return (
-    <div className="absolute inset-0 pointer-events-none z-10 flex flex-col justify-between p-2 select-none overflow-hidden font-mono bg-transparent">
-      {/* Top Bar: Minimal Line Status, SMC Structure Telemetry & Linked Cross-Pair Signals Strip */}
-      <div className="flex flex-col gap-1.5 pointer-events-auto bg-black/60 backdrop-blur-xs p-1.5 rounded-xl border border-slate-800/80">
-        <div className="flex items-center justify-between gap-2 flex-wrap">
-          {/* Active Overlay Status & Live Structure */}
-          <div className="flex items-center gap-2 text-[10px] sm:text-[11px] font-bold flex-wrap">
-            <span className={`w-2 h-2 rounded-full ${market.brokerMarketData ? 'bg-emerald-400 animate-pulse' : 'bg-sky-400'}`} />
-            <span className="text-sky-300">SMC</span>
-            <span className="text-slate-500">|</span>
-            <span className={market.brokerMarketData ? (isPremium ? 'text-rose-400 font-bold' : 'text-emerald-400 font-bold') : 'text-sky-300 font-bold'}>
-              {eqPrice === null ? 'WAITING FOR MT5 DATA' : isPremium ? 'PREMIUM (Sells)' : 'DISCOUNT (Buys)'}
+    <div className="px-3.5 py-2.5 ws-subtle border-t flex flex-wrap items-center justify-between gap-x-4 gap-y-2 text-[11px] font-mono">
+      {/* System-Synced SMC Readouts */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+        {/* Broker Live Quote & Range Zone */}
+        <span className="inline-flex items-center gap-1.5 font-bold text-slate-900 dark:text-slate-100">
+          <span
+            className={`w-2 h-2 rounded-full shrink-0 ${
+              hasLiveBroker ? 'bg-emerald-500' : 'bg-slate-400 dark:bg-slate-600'
+            }`}
+          />
+          <span>{hasLiveBroker ? `MT5 Spot ${ticker.bid.toFixed(digits)}` : 'MT5 Feed Offline'}</span>
+          {hasLiveBroker && eqPrice !== null && (
+            <span className={ticker.bid >= eqPrice ? 'text-amber-600 dark:text-amber-400' : 'text-emerald-600 dark:text-emerald-400'}>
+              ({ticker.bid >= eqPrice ? 'Premium' : 'Discount'} · EQ {eqPrice.toFixed(digits)})
             </span>
-            <span className="text-slate-500">|</span>
-            <span className="text-slate-300">EQ: <strong className="text-sky-300">{eqPrice === null ? '—' : `$${eqPrice.toFixed(2)}`}</strong></span>
-            {demandOB && (
-              <>
-                <span className="text-slate-600 hidden sm:inline">|</span>
-                <span className="text-slate-300 hidden sm:inline">Demand: <strong className="text-emerald-400">${demandOB.bottom.toFixed(2)}</strong></span>
-              </>
-            )}
-            {supplyOB && (
-              <>
-                <span className="text-slate-600 hidden sm:inline">|</span>
-                <span className="text-slate-300 hidden sm:inline">Supply: <strong className="text-rose-400">${supplyOB.bottom.toFixed(2)}</strong></span>
-              </>
-            )}
-          </div>
-
-          {/* Quick Cross-Pair Indicator Links */}
-          {otherPairAnalyses.length > 0 && (
-            <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar py-0.5">
-              <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider shrink-0">
-                Pairs:
-              </span>
-              {otherPairAnalyses.map((pair) => {
-                const isBull = pair.bias === 'BUY';
-                return (
-                  <button
-                    key={pair.symbol}
-                    onClick={() => tradingEngine.switchSymbol(pair.symbol as SupportedSymbol)}
-                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold border transition-all cursor-pointer shrink-0 ${
-                      pair.signal
-                        ? isBull
-                          ? 'border-emerald-500/50 text-emerald-400 hover:bg-emerald-500/10'
-                          : 'border-rose-500/50 text-rose-400 hover:bg-rose-500/10'
-                        : 'border-slate-700 text-slate-400 hover:text-white'
-                    }`}
-                    title={`Switch chart to ${pair.symbol}`}
-                  >
-                    <span className="text-white mr-1">{pair.symbol}</span>
-                    <span className={isBull ? 'text-emerald-400' : 'text-rose-400'}>
-                      {pair.bias} ({pair.confluenceScore})
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
           )}
-        </div>
-      </div>
+        </span>
 
-      {/* Bottom Bar: Tapped Trade Selector & Spot Price Line */}
-      <div className="flex items-center justify-between gap-2 flex-wrap pointer-events-auto text-[10px]">
-        {indicatorConfig.trades && activePositions.length > 0 ? (
-          <div className="flex items-center gap-1.5 flex-wrap">
-            <span className="text-slate-400 mr-1 hidden sm:inline">
-              Tap Trade to Highlight Lines:
-            </span>
-            {activePositions.map((pos) => {
-              const isProfit = pos.profit >= 0;
-              const isSelected = selectedPosition?.ticket === pos.ticket;
-              return (
-                <button
-                  key={pos.ticket}
-                  type="button"
-                  onClick={() => tradingEngine.setSelectedTicket(pos.ticket)}
-                  className={`border rounded px-2 py-0.5 transition-all cursor-pointer font-bold ${
-                    isSelected
-                      ? 'border-sky-400 text-sky-300 bg-sky-950/40'
-                      : isProfit
-                      ? 'border-emerald-500/50 text-emerald-400 hover:bg-emerald-500/10'
-                      : 'border-rose-500/50 text-rose-400 hover:bg-rose-500/10'
-                  }`}
-                  title={`Focus lines for trade #${pos.ticket}`}
-                >
-                  #{pos.ticket} {pos.type} {pos.volume}L @ ${pos.price_open.toFixed(2)}
-                  <span className="ml-1">({isProfit ? '+' : ''}${pos.profit.toFixed(2)})</span>
-                </button>
-              );
-            })}
-          </div>
-        ) : (
-          <div className="text-slate-400 font-bold">
-            Spot: <span className="text-white">{market.brokerMarketData && ticker.bid > 0 ? `$${ticker.bid.toFixed(2)}` : '—'}</span> · Spread: <span className="text-sky-300">{market.brokerMarketData ? `${ticker.spread} pts` : '—'}</span>
-          </div>
+        {/* Structure Layer (BOS / CHoCH + HTF Trend) */}
+        {indicatorConfig.structure && (
+          <span className="text-slate-600 dark:text-slate-300">
+            <strong className="text-slate-800 dark:text-white">Struct:</strong>{' '}
+            {latestStructure ? (
+              <span
+                className={
+                  latestStructure.direction === 'bullish'
+                    ? 'text-emerald-600 dark:text-emerald-400 font-bold'
+                    : 'text-rose-600 dark:text-rose-400 font-bold'
+                }
+              >
+                {latestStructure.kind} {latestStructure.direction === 'bullish' ? 'Bull' : 'Bear'}
+              </span>
+            ) : analysis ? (
+              <span>
+                H1 {analysis.h1Trend} / M15 {analysis.m15Trend}
+              </span>
+            ) : (
+              <span className="text-slate-400">Awaiting candles</span>
+            )}
+          </span>
         )}
 
-        <div className="text-[9px] text-slate-500">
-          Transparent SMC Overlay
-        </div>
+        {/* Order Blocks Layer */}
+        {indicatorConfig.orderBlocks && (
+          <span className="text-slate-600 dark:text-slate-300">
+            <strong className="text-slate-800 dark:text-white">OB:</strong>{' '}
+            {demandOB || supplyOB ? (
+              <>
+                {demandOB && (
+                  <span className="text-emerald-600 dark:text-emerald-400 font-bold">
+                    +OB {demandOB.bottom.toFixed(digits)}
+                  </span>
+                )}
+                {demandOB && supplyOB && <span className="mx-1 text-slate-400">/</span>}
+                {supplyOB && (
+                  <span className="text-rose-600 dark:text-rose-400 font-bold">
+                    -OB {supplyOB.top.toFixed(digits)}
+                  </span>
+                )}
+              </>
+            ) : (
+              <span className="text-slate-400">None active</span>
+            )}
+          </span>
+        )}
+
+        {/* Fair Value Gaps Layer */}
+        {indicatorConfig.fairValueGaps && (
+          <span className="text-slate-600 dark:text-slate-300">
+            <strong className="text-slate-800 dark:text-white">FVG:</strong>{' '}
+            {bullFvg || bearFvg ? (
+              <span className="text-sky-600 dark:text-sky-400 font-bold">
+                {(bullFvg || bearFvg)!.bottom.toFixed(digits)}–{(bullFvg || bearFvg)!.top.toFixed(digits)}
+              </span>
+            ) : (
+              <span className="text-slate-400">Balanced</span>
+            )}
+          </span>
+        )}
+
+        {/* Active Signal POI Levels */}
+        {indicatorConfig.signals && market.signal && (
+          <span className="text-slate-700 dark:text-slate-200 font-bold">
+            <span className={market.signal.direction === 'BUY' ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}>
+              {market.signal.direction} {market.signal.entry.toFixed(digits)}
+            </span>{' '}
+            · SL {market.signal.sl.toFixed(digits)} · TP {market.signal.tp.toFixed(digits)}
+          </span>
+        )}
       </div>
+
+      {/* Interactive Active Trades Sync Strip */}
+      {indicatorConfig.trades && activePositions.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          {activePositions.map((pos) => {
+            const isProfit = pos.profit >= 0;
+            const isSelected = selectedTicket === pos.ticket;
+            return (
+              <button
+                key={pos.ticket}
+                type="button"
+                onClick={() => tradingEngine.setSelectedTicket(pos.ticket)}
+                className={`px-2 py-0.5 rounded-md border font-bold transition-colors cursor-pointer ${
+                  isSelected
+                    ? 'bg-sky-500/15 border-sky-500 text-sky-700 dark:text-sky-300'
+                    : isProfit
+                      ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-600 dark:text-emerald-400'
+                      : 'bg-rose-500/10 border-rose-500/30 text-rose-600 dark:text-rose-400'
+                }`}
+                title={`Focus trade #${pos.ticket}`}
+              >
+                #{pos.ticket} {pos.type} {pos.volume.toFixed(2)}L ({isProfit ? '+' : ''}${pos.profit.toFixed(2)})
+              </button>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 });

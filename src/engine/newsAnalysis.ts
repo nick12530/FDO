@@ -218,8 +218,6 @@ export function pairNewsBiasScore(symbol: SupportedSymbol, analysis: NewsMarketA
       return Number((bias.EUR.score - bias.USD.score).toFixed(1));
     case 'GBPUSD':
       return Number((bias.GBP.score - bias.USD.score).toFixed(1));
-    case 'USDJPY':
-      return Number((bias.USD.score - bias.JPY.score).toFixed(1));
     case 'XAUUSD':
       // Gold often rises on USD weakness / risk-off — blend both
       return Number((bias.XAU.score - bias.USD.score * 0.6).toFixed(1));

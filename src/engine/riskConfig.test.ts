@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { calculateRiskBasedVolume, RISK_CONFIG } from './riskConfig';
+import { calculateRiskBasedVolume, isAdaptiveMicroFloorAllowed, RISK_CONFIG } from './riskConfig';
 
 const spec = {
   tickSize: 0.01,
@@ -11,12 +11,12 @@ const spec = {
 };
 
 describe('broker risk-based position sizing', () => {
-  it('rejects a broker minimum lot when it would exceed the risk budget', () => {
-    expect(calculateRiskBasedVolume(100, 0.1, 0.2, spec)).toBeNull();
+  it('can disable the adaptive minimum-lot allowance for strict risk-budget sizing', () => {
+    expect(calculateRiskBasedVolume(100, 0.1, 0.2, spec, false)).toBeNull();
   });
 
-  it('does not use a small-account allowance to exceed the configured risk budget', () => {
-    expect(calculateRiskBasedVolume(10, 1, 0.2, spec)).toBeNull();
+  it('requires minimum-lot risk to remain within both adaptive allowance caps', () => {
+    expect(calculateRiskBasedVolume(10, 1, 0.36, spec)).toBeNull();
   });
 
   it('rounds down to the broker volume step without exceeding risk', () => {
@@ -30,5 +30,12 @@ describe('broker risk-based position sizing', () => {
   it('allows the broker minimum for the previously blocked small-account EURUSD risk estimate', () => {
     const eurUsdSpec = { ...spec, tickSize: 1, tickValue: 94 };
     expect(calculateRiskBasedVolume(89.92, RISK_CONFIG.riskPercentPerTrade, 1, eurUsdSpec)).toBe(0.01);
+  });
+
+  it('limits adaptive minimum-lot risk to the configured dollar or equity cap', () => {
+    expect(isAdaptiveMicroFloorAllowed(332, 2.37)).toBe(true);
+    expect(isAdaptiveMicroFloorAllowed(100, 15.01)).toBe(false);
+    expect(isAdaptiveMicroFloorAllowed(100, 3.5)).toBe(true);
+    expect(isAdaptiveMicroFloorAllowed(100, 3.51)).toBe(false);
   });
 });

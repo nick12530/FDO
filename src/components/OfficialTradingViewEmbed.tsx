@@ -1,16 +1,16 @@
 /**
  * OfficialTradingViewEmbed.tsx - Institutional Real-Time TradingView Advanced Chart
- * Embeds official TradingView charting library widget directly with full indicator
- * suite, official drawing tools, timeframe switcher, and live market quotes.
+ * Syncs symbol, timeframe, dark/light surfaces, and TradingView technical studies cleanly.
  */
 
-import React, { useEffect, useRef, memo } from 'react';
+import React, { memo, useMemo } from 'react';
 
 interface OfficialTradingViewEmbedProps {
   symbol: string;
   isDark?: boolean;
   interval?: '1' | '5' | '15' | '60' | '240' | 'D';
   height?: number | string;
+  studies?: string[];
 }
 
 export const OfficialTradingViewEmbed: React.FC<OfficialTradingViewEmbedProps> = memo(({
@@ -18,74 +18,66 @@ export const OfficialTradingViewEmbed: React.FC<OfficialTradingViewEmbedProps> =
   isDark = true,
   interval = '1',
   height = '100%',
+  studies = [],
 }) => {
-  const containerRef = useRef<HTMLDivElement>(null);
+  const formattedSymbol = useMemo(() => {
+    if (symbol.includes(':')) return symbol;
+    if (symbol.toUpperCase() === 'XAUUSD') return 'OANDA:XAUUSD';
+    return `FX:${symbol.toUpperCase()}`;
+  }, [symbol]);
 
-  useEffect(() => {
-    const container = containerRef.current;
-    if (!container) return;
+  const studiesKey = studies.join('|');
 
-    // Clear previous widget
-    container.innerHTML = '';
-
-    const widgetWrapper = document.createElement('div');
-    widgetWrapper.className = 'tradingview-widget-container';
-    widgetWrapper.style.height = '100%';
-    widgetWrapper.style.width = '100%';
-
-    const widgetDiv = document.createElement('div');
-    widgetDiv.className = 'tradingview-widget-container__widget';
-    widgetDiv.style.height = '100%';
-    widgetDiv.style.width = '100%';
-    widgetWrapper.appendChild(widgetDiv);
-
-    const script = document.createElement('script');
-    script.src = 'https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
-    script.type = 'text/javascript';
-    script.async = true;
-
-    // Normalize symbol for TradingView
-    let formattedSymbol = symbol;
-    if (!formattedSymbol.includes(':')) {
-      if (formattedSymbol.toUpperCase() === 'XAUUSD') formattedSymbol = 'OANDA:XAUUSD';
-      else formattedSymbol = `FX:${formattedSymbol.toUpperCase()}`;
-    }
-
-    const widgetConfig = {
+  const iframeSrc = useMemo(() => {
+    const widgetConfig: Record<string, unknown> = {
       autosize: true,
       symbol: formattedSymbol,
-      interval: interval,
+      interval,
       timezone: 'Africa/Nairobi',
       theme: isDark ? 'dark' : 'light',
       style: '1',
-      locale: 'en',
       enable_publishing: false,
       allow_symbol_change: true,
       calendar: false,
       hide_top_toolbar: false,
       hide_legend: false,
       save_image: true,
-      backgroundColor: isDark ? '#080d14' : '#ffffff',
-      gridColor: isDark ? 'rgba(30, 41, 59, 0.4)' : 'rgba(226, 232, 240, 0.8)',
+      backgroundColor: isDark ? '#0f172a' : '#ffffff',
+      gridColor: isDark ? 'rgba(51, 65, 85, 0.35)' : 'rgba(203, 213, 225, 0.7)',
       support_host: 'https://www.tradingview.com',
+      width: '100%',
+      height: '100%',
     };
 
-    script.innerHTML = JSON.stringify(widgetConfig);
-    widgetWrapper.appendChild(script);
-    container.appendChild(widgetWrapper);
+    if (studies.length > 0) {
+      widgetConfig.studies = studies;
+    }
 
-    return () => {
-      if (container) {
-        container.innerHTML = '';
-      }
-    };
-  }, [symbol, isDark, interval]);
+    const url = new URL('https://www.tradingview-widget.com/embed-widget/advanced-chart/');
+    url.searchParams.set('locale', 'en');
+    if (typeof window !== 'undefined' && window.location.hostname) {
+      url.searchParams.set('utm_source', window.location.hostname);
+    }
+    url.searchParams.set('utm_medium', 'widget');
+    url.searchParams.set('utm_campaign', 'advanced-chart');
+    url.hash = encodeURIComponent(JSON.stringify(widgetConfig));
+    return url.toString();
+  }, [formattedSymbol, interval, isDark, studiesKey]);
 
   return (
     <div
-      ref={containerRef}
-      className="w-full h-full min-h-[380px] relative overflow-hidden bg-[#080d14]"
+      className={`w-full h-full min-h-[380px] relative overflow-hidden ${isDark ? 'bg-[#0f172a]' : 'bg-white'}`}
       style={{ height: typeof height === 'number' ? `${height}px` : height }}
-    />
+    >
+      <iframe
+        key={iframeSrc}
+        title={`TradingView Advanced Chart (${formattedSymbol})`}
+        src={iframeSrc}
+        className="w-full h-full border-0 block select-none"
+        style={{ width: '100%', height: '100%' }}
+        allowFullScreen
+        loading="eager"
+      />
+    </div>
   );
 });

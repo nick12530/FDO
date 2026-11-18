@@ -284,7 +284,7 @@ export const SignalToastNotification: React.FC<SignalToastNotificationProps> = (
                       {signal.timeframe} Setup
                     </span>
                     <span className="text-[10px] font-bold px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30">
-                      {signal.sniperGrade} · {signal.sniperQualityIndex ?? Math.round(signal.score * 20)}%
+                      {signal.sniperGrade} · {signal.sniperQualityIndex ?? Math.round(signal.score)}%
                     </span>
                   </div>
                   <h3 className="font-extrabold text-sm text-white mt-0.5">

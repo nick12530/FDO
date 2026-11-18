@@ -77,8 +77,9 @@ def volume_for_risk(
     volume_max: float,
     allow_micro_floor: bool = False,
     equity: float | None = None,
+    max_micro_floor_risk: float = 15.0,
 ) -> float | None:
-    values = (risk_budget, risk_per_lot, volume_min, volume_step, volume_max)
+    values = (risk_budget, risk_per_lot, volume_min, volume_step, volume_max, max_micro_floor_risk)
     if (
         not all(math.isfinite(value) for value in values)
         or risk_budget <= 0
@@ -86,6 +87,7 @@ def volume_for_risk(
         or volume_min <= 0
         or volume_step <= 0
         or volume_max < volume_min
+        or max_micro_floor_risk < 0
     ):
         return None
 
@@ -93,9 +95,9 @@ def volume_for_risk(
     if raw_volume + 1e-9 < volume_min:
         # Smart Adaptive Micro-Floor:
         # If minimum lot risks <= $15.0 or <= 3.5% equity, allow volume_min
-        if allow_micro_floor:
+        if allow_micro_floor and equity is not None and math.isfinite(equity) and equity > 0:
             min_lot_risk = risk_per_lot * volume_min
-            if min_lot_risk <= 15.0 or (equity and (min_lot_risk / equity) * 100 <= 3.5):
+            if min_lot_risk <= max_micro_floor_risk or (min_lot_risk / equity) * 100 <= 3.5:
                 return volume_min
         return None
     step_count = math.floor((min(raw_volume, volume_max) - volume_min) / volume_step + 1e-9)

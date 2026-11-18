@@ -29,11 +29,6 @@ export function generatePairCandles(
     digits = 5;
     volatilityStep = 0.00025;
     spreadPoints = 8;
-  } else if (sym.includes('USDJPY')) {
-    basePrice = 153.850;
-    digits = 3;
-    volatilityStep = 0.035;
-    spreadPoints = 12;
   } else if (sym.includes('GBPUSD')) {
     basePrice = 1.29650;
     digits = 5;

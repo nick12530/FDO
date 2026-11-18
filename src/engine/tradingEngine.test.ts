@@ -9,9 +9,10 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { TradingEngine, getDefaultSymbolSpec } from './tradingEngine';
 import { Candle } from '../types/smc';
-import { calculateRiskBasedVolume } from './riskConfig';
+import { calculateRiskBasedVolume, RISK_CONFIG } from './riskConfig';
 import { mt5Bridge } from './mt5Bridge';
 import { analyzeWorldNews } from './newsAnalysis';
+import { SUPPORTED_SYMBOLS } from './instrumentConfig';
 
 describe('risk-based position sizing', () => {
   it('sizes a known XAU-style contract from equity, stop, tick value, and broker lot step', () => {
@@ -71,7 +72,7 @@ describe('risk-based position sizing', () => {
     expect(volume).toBe(0.05);
   });
 
-  it('reports when broker minimum lot risk exceeds the account budget', () => {
+  it('rejects broker minimum risk when it exceeds the adaptive caps', () => {
     const engine = new TradingEngine();
     engine.stopEngineLoops();
     engine.activeSymbol = 'XAUUSD';
@@ -88,14 +89,39 @@ describe('risk-based position sizing', () => {
       volumeStep: 0.01,
     };
 
-    expect(engine.getRiskSizingInfo(100, 'BUY')).toEqual({
+    expect(engine.getRiskSizingInfo(97, 'BUY')).toEqual({
       riskPercent: 0.5,
       riskBudget: 0.25,
       minimumLot: 0.01,
-      minimumLotRisk: 1,
+      minimumLotRisk: 4,
       safeVolume: null,
     });
-    expect(engine.getRiskBasedVolume(100, 0.01, 'BUY')).toBeNull();
+    expect(engine.getRiskBasedVolume(97, 0.01, 'BUY')).toBeNull();
+  });
+
+  it('keeps adaptive broker-minimum sizing consistent through execution validation', () => {
+    const engine = new TradingEngine();
+    engine.stopEngineLoops();
+    engine.activeSymbol = 'XAUUSD';
+    engine.account.equity = 332;
+    engine.account.risk_pct = 0.5;
+    engine.bid = 2000;
+    engine.ask = 2000;
+    const spec = {
+      tickSize: 0.01,
+      tickValue: 1,
+      contractSize: 100,
+      volumeMin: 0.01,
+      volumeMax: 100,
+      volumeStep: 0.01,
+    };
+    (engine as any).symbolSpec = spec;
+
+    expect(engine.getRiskSizingInfo(1997.63, 'BUY')?.safeVolume).toBe(0.01);
+    expect(engine.getRiskBasedVolume(1997.63, 0.01, 'BUY')).toBe(0.01);
+    expect((engine as any).getExecutionRiskVolume(0.01, 1997.63, 2000, 'XAUUSD')).toEqual({
+      volume: 0.01,
+    });
   });
 });
 
@@ -123,6 +149,43 @@ describe('broker-only signal availability', () => {
     expect(engine.getBestOpportunity()).toBeNull();
   });
 
+  it('shows stale broker pairs as blocked instead of leaving the connected scanner blank', () => {
+    const engine = new TradingEngine();
+    engine.stopEngineLoops();
+    engine.connected = true;
+    engine.mt5Account.connected = true;
+    for (const symbol of SUPPORTED_SYMBOLS) {
+      const stale = (intervalMs: number) =>
+        candles(80, intervalMs).map((candle) => ({
+          ...candle,
+          time: candle.time - 60 * 60_000,
+        }));
+      engine.pairData[symbol] = {
+        candlesM1: stale(60_000),
+        candlesM5: stale(5 * 60_000),
+        candlesM15: stale(15 * 60_000),
+        candlesH1: stale(60 * 60_000),
+        bid: 2000,
+        ask: 2000.1,
+        spread: 10,
+        marketDataAt: Date.now(),
+        symbolSpec: getDefaultSymbolSpec(symbol),
+      };
+    }
+
+    engine.refreshScanner();
+
+    const analyses = engine.getScannerAnalyses();
+    expect(analyses).toHaveLength(SUPPORTED_SYMBOLS.length);
+    expect(analyses.every((analysis) =>
+      analysis.status === 'BLOCKED' &&
+      analysis.price > 0 &&
+      analysis.safeLotSize === null &&
+      analysis.rejectionReason === 'BROKER_CANDLES_STALE_WAITING_FOR_FRESH_BARS'
+    )).toBe(true);
+    engine.stopEngineLoops();
+  });
+
   it('refreshes the scanner after failed pair-data requests so stale analyses are rechecked', async () => {
     const engine = new TradingEngine();
     engine.stopEngineLoops();
@@ -141,10 +204,69 @@ describe('broker-only signal availability', () => {
     engine.stopEngineLoops();
     vi.restoreAllMocks();
   });
+
+  it('does not auto-select a stale scanner winner after the user switches symbols mid-refresh', async () => {
+    const engine = new TradingEngine();
+    engine.stopEngineLoops();
+    engine.connected = true;
+    engine.mt5Account.connected = true;
+    vi.spyOn(mt5Bridge, 'getStatus').mockReturnValue({
+      connected: true, serverUrl: 'test', lastPing: null, lastError: null, mode: 'demo',
+    });
+    let rejectSnapshot: (reason: Error) => void = () => {};
+    const delayedSnapshot = new Promise<any>((_, reject) => {
+      rejectSnapshot = reject;
+    });
+    vi.spyOn(mt5Bridge, 'fetchSymbolSnapshot').mockReturnValue(delayedSnapshot);
+    const refreshScanner = vi.spyOn(engine, 'refreshScanner');
+
+    const refresh = (engine as any).refreshBrokerPairData();
+    engine.switchSymbol('EURUSD');
+    rejectSnapshot(new Error('broker request completed late'));
+    await refresh;
+
+    expect(refreshScanner).toHaveBeenCalledWith(false);
+    expect(engine.activeSymbol).toBe('EURUSD');
+    engine.stopEngineLoops();
+    vi.restoreAllMocks();
+  });
+
+  it('discards pair snapshots fetched under a previous broker account', async () => {
+    const engine = new TradingEngine();
+    engine.stopEngineLoops();
+    engine.connected = true;
+    engine.mt5Account.connected = true;
+    vi.spyOn(mt5Bridge, 'getStatus').mockReturnValue({
+      connected: true, serverUrl: 'test', lastPing: null, lastError: null, mode: 'demo',
+    });
+    vi.spyOn(mt5Bridge, 'refreshAccountHistory').mockResolvedValue([]);
+    let resolveSnapshot: (snapshot: any) => void = () => {};
+    const delayedSnapshot = new Promise<any>((resolve) => {
+      resolveSnapshot = resolve;
+    });
+    let requests = 0;
+    vi.spyOn(mt5Bridge, 'fetchSymbolSnapshot').mockImplementation((symbol) => {
+      requests += 1;
+      return requests <= 2
+        ? delayedSnapshot.then((snapshot) => ({ ...snapshot, symbol }))
+        : Promise.reject(new Error('replacement account refresh'));
+    });
+
+    const refresh = (engine as any).refreshBrokerPairData();
+    engine.linkMt5Account('987654', 'New-Demo', 500, 500);
+    resolveSnapshot({ bid: 1.2345 } as any);
+    await refresh;
+
+    expect(engine.pairData.EURUSD.bid).toBe(0);
+    expect(engine.pairData.GBPUSD.bid).toBe(0);
+    engine.stopEngineLoops();
+    vi.restoreAllMocks();
+    localStorage.clear();
+  });
 });
 
 describe('scanner signals in the active signal engine', () => {
-  it('surfaces the active pair scanner candidate and preserves its 0-10 score scale', () => {
+  it('surfaces the active pair scanner candidate with the normalized 0-100 score scale', () => {
     const engine = new TradingEngine();
     engine.stopEngineLoops();
     engine.activeSymbol = 'EURUSD';
@@ -154,7 +276,8 @@ describe('scanner signals in the active signal engine', () => {
       strategy: 'SMC POI Retest' as const,
       direction: 'BUY' as const,
       timeframe: 'M5' as const,
-      score: 6.5,
+      score: 65,
+      scoringPolicyVersion: 2,
       entry: 1.1,
       sl: 1.099,
       tp: 1.103,
@@ -176,7 +299,7 @@ describe('scanner signals in the active signal engine', () => {
 
     expect(market.signals).toContainEqual(expect.objectContaining({
       direction: 'BUY',
-      score: 6.5,
+      score: 65,
       timestamp: signal.timestamp,
     }));
   });
@@ -191,7 +314,8 @@ describe('scanner signals in the active signal engine', () => {
       strategy: 'SMC POI Retest' as const,
       direction: 'BUY' as const,
       timeframe: 'M5' as const,
-      score: 5.5,
+      score: 55,
+      scoringPolicyVersion: 2,
       entry: 1.1,
       sl: 1.099,
       tp: 1.103,
@@ -208,9 +332,9 @@ describe('scanner signals in the active signal engine', () => {
     } as any];
 
     expect(engine.getMarketSnapshot().signals).toContainEqual(
-      expect.objectContaining({ timestamp: signal.timestamp, score: 5.5 })
+      expect.objectContaining({ timestamp: signal.timestamp, score: 55 })
     );
-    expect(engine.getEntryBlockReason('BUY', signal, Date.now(), true, 'EURUSD')).toBe(
+    expect(engine.getEntryBlockReason('BUY', signal, Date.now(), false, 'EURUSD')).toBe(
       'TRADE_REJECTED: NEWS_DATA_UNAVAILABLE'
     );
   });
@@ -219,11 +343,18 @@ describe('scanner signals in the active signal engine', () => {
     const engine = new TradingEngine();
     engine.stopEngineLoops();
     engine.mt5Account.connected = true;
+    engine.instrumentType = 'standard';
+    engine.account.equity = 10_000;
+    engine.activeSymbol = 'EURUSD';
+    engine.bid = 1.1;
+    engine.ask = 1.10002;
+    (engine as any).symbolSpec = getDefaultSymbolSpec('EURUSD');
     const signal = {
       strategy: 'Trend Pullback' as const,
       direction: 'BUY' as const,
       timeframe: 'M5' as const,
-      score: 6.8,
+      score: 68,
+      scoringPolicyVersion: 2,
       entry: 1.1,
       sl: 1.099,
       tp: 1.103,
@@ -232,7 +363,7 @@ describe('scanner signals in the active signal engine', () => {
       atr: 0.001,
     };
 
-    expect(engine.getEntryBlockReason('BUY', signal, Date.now(), true, 'EURUSD')).toBe(
+    expect(engine.getEntryBlockReason('BUY', signal, Date.now(), false, 'EURUSD')).toBe(
       'TRADE_REJECTED: NEWS_DATA_UNAVAILABLE'
     );
   });
@@ -319,7 +450,7 @@ describe('final execution-boundary risk validation', () => {
     vi.spyOn(engine, 'getEntryBlockReason').mockReturnValue(null);
   });
 
-  it('rejects 0.01 EURUSD when the requested stop risks $1.50 against a $0.46 budget', () => {
+  it('rejects 0.01 EURUSD when minimum-lot risk exceeds the adaptive cap', () => {
     engine.account.equity = 92;
     engine.account.risk_pct = 0.5;
     engine.activeSymbol = 'EURUSD';
@@ -327,11 +458,11 @@ describe('final execution-boundary risk validation', () => {
     engine.bid = 1.10000;
     engine.ask = 1.10002;
 
-    const result = engine.sendMarket('BUY', 0.01, 1.09852, 1.10302, 'manual');
+    const result = engine.sendMarket('BUY', 0.01, 1.09502, 1.10302, 'manual');
 
     expect(result.ok).toBe(false);
     expect(result.error).toContain('TRADE_REJECTED: MINIMUM_LOT_EXCEEDS_RISK');
-    expect(result.error).toContain('0.01L risks $1.50, budget: $0.46');
+    expect(result.error).toContain('0.01L risks $5.00, budget: $0.46');
     expect(engine.positions).toHaveLength(0);
   });
 
@@ -353,7 +484,7 @@ describe('final execution-boundary risk validation', () => {
       brokerMarketData: true,
       zones: [],
       signals: [{
-        direction: 'BUY', entry: 1.1, sl: 1.09852, tp: 1.10302,
+        direction: 'BUY', entry: 1.1, sl: 1.09502, tp: 1.10802,
         score: 80, strategy: 'SMC POI Retest', timeframe: 'M5', timestamp: new Date().toISOString(),
       }],
     } as any);
@@ -362,13 +493,13 @@ describe('final execution-boundary risk validation', () => {
 
     expect(sendTrade).not.toHaveBeenCalled();
     expect(rejectedSignal).toHaveBeenCalledWith(
-      expect.objectContaining({ sl: 1.09852 }),
+      expect.objectContaining({ sl: 1.09502 }),
       expect.stringContaining('TRADE_REJECTED: MINIMUM_LOT_EXCEEDS_RISK'),
       'EURUSD'
     );
   });
 
-  it('allows a qualifying 0-10 technical signal at the documented 6/10 threshold', async () => {
+  it('allows a qualifying normalized technical signal at the configured 60/100 threshold', async () => {
     engine.account.equity = 10_000;
     engine.account.risk_pct = 0.5;
     engine.activeSymbol = 'XAUUSD';
@@ -377,6 +508,7 @@ describe('final execution-boundary risk validation', () => {
     engine.ask = 2000.1;
     (engine as any).symbolSpec = getDefaultSymbolSpec('XAUUSD');
     engine.autoTrade = true;
+    engine.minScoreThreshold = 60;
     vi.spyOn(mt5Bridge, 'getSymbol').mockReturnValue('XAUUSD');
     const sendTrade = vi.spyOn(mt5Bridge, 'sendTrade').mockResolvedValue({
       ok: true,
@@ -392,7 +524,8 @@ describe('final execution-boundary risk validation', () => {
       entry: 2000,
       sl: 1990,
       tp: 2032,
-      score: 6.8,
+      score: 68,
+      scoringPolicyVersion: 2,
       strategy: 'Trend Pullback' as const,
       timeframe: 'M5' as const,
       timestamp: new Date().toISOString(),
@@ -407,6 +540,48 @@ describe('final execution-boundary risk validation', () => {
 
     await engine.evaluateAutoExecution();
 
+    expect(sendTrade).toHaveBeenCalledTimes(1);
+  });
+
+  it('pauses auto-trade after MT5 reports trading disabled and does not retry', async () => {
+    engine.account.equity = 10_000;
+    engine.account.risk_pct = 0.5;
+    engine.activeSymbol = 'XAUUSD';
+    engine.instrumentType = 'synthetic';
+    engine.bid = 2000;
+    engine.ask = 2000.1;
+    (engine as any).symbolSpec = getDefaultSymbolSpec('XAUUSD');
+    engine.autoTrade = true;
+    vi.spyOn(mt5Bridge, 'getSymbol').mockReturnValue('XAUUSD');
+    const sendTrade = vi.spyOn(mt5Bridge, 'sendTrade').mockRejectedValue(
+      new Error('MT5 has disabled trading for XAUUSD (retcode 10017).')
+    );
+    const setAutoTrade = vi.spyOn(mt5Bridge, 'setAutoTrade').mockResolvedValue();
+    const signal = {
+      direction: 'BUY' as const,
+      entry: 2000,
+      sl: 1990,
+      tp: 2032,
+      score: 75,
+      scoringPolicyVersion: 2,
+      strategy: 'Trend Pullback' as const,
+      timeframe: 'M5' as const,
+      timestamp: new Date().toISOString(),
+      expiryTimestamp: Date.now() + 60_000,
+    };
+    vi.spyOn(engine, 'getMarketSnapshot').mockReturnValue({
+      brokerMarketData: true,
+      zones: [],
+      signals: [signal],
+      signal,
+    } as any);
+
+    await engine.evaluateAutoExecution();
+    await Promise.resolve();
+
+    expect(engine.autoTrade).toBe(false);
+    expect(setAutoTrade).toHaveBeenCalledWith(false);
+    await engine.evaluateAutoExecution();
     expect(sendTrade).toHaveBeenCalledTimes(1);
   });
 
@@ -604,7 +779,7 @@ describe('TradingEngine Store Architecture', () => {
 
   it('does not carry the consecutive-loss circuit breaker across UTC trading days', () => {
     const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    const losses = Array.from({ length: 3 }, (_, index) => ({
+    const losses = Array.from({ length: RISK_CONFIG.maxConsecutiveLosses }, (_, index) => ({
       ticket: index + 1,
       type: 'BUY' as const,
       volume: 0.01,
@@ -906,7 +1081,7 @@ describe('TradingEngine Store Architecture', () => {
     const lowSignal: any = {
       direction: 'BUY',
       timeframe: 'M5',
-      score: 4.5,
+      score: 45,
       entry: 2000,
       sl: 1995,
       tp: 2005,
@@ -923,7 +1098,7 @@ describe('TradingEngine Store Architecture', () => {
     const highProfitSignal: any = {
       direction: 'BUY',
       timeframe: 'M5',
-      score: 7.2,
+      score: 72,
       entry: 2000,
       sl: 1995,
       tp: 2018, // 18 pts reward / 5 pts risk = 3.6 RR

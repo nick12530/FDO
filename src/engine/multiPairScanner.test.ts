@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { INSTRUMENTS, SUPPORTED_SYMBOLS, getInstrumentConfig } from './instrumentConfig';
+import { INSTRUMENTS, SUPPORTED_SYMBOLS, getInstrumentConfig, getSupportedSymbol } from './instrumentConfig';
 import {
   analyzeInstrument,
   rankOpportunities,
@@ -56,7 +56,8 @@ describe('Multi-Pair Market Scanner & Instrument System', () => {
       signal: {
         direction: 'BUY' as const,
         timeframe: 'M5' as const,
-        score: 4.5,
+        score: 45,
+        scoringPolicyVersion: 2,
         entry: 2000.1,
         sl: 1990,
         tp: 2032,
@@ -97,22 +98,21 @@ describe('Multi-Pair Market Scanner & Instrument System', () => {
     expect(findLiquidityLevels(candles, 0.0001).recentSweep).toBe('low');
   });
 
-  it('supports all 4 instruments with independent specifications', () => {
-    expect(SUPPORTED_SYMBOLS).toEqual(['XAUUSD', 'EURUSD', 'USDJPY', 'GBPUSD']);
+  it('supports the configured instruments with independent specifications', () => {
+    expect(SUPPORTED_SYMBOLS).toEqual(['XAUUSD', 'EURUSD', 'GBPUSD']);
+    expect(getSupportedSymbol('USDJPY')).toBeNull();
+    expect(getSupportedSymbol('EURUSD.pro')).toBe('EURUSD');
 
     const gold = getInstrumentConfig('XAUUSD');
     const eurusd = getInstrumentConfig('EURUSD');
-    const usdjpy = getInstrumentConfig('USDJPY');
     const gbpusd = getInstrumentConfig('GBPUSD');
 
     expect(gold.magicNumber).toBe(20261001);
     expect(eurusd.magicNumber).toBe(10001);
-    expect(usdjpy.magicNumber).toBe(10002);
     expect(gbpusd.magicNumber).toBe(10003);
 
     expect(gold.digits).toBe(2);
     expect(eurusd.digits).toBe(5);
-    expect(usdjpy.digits).toBe(3);
     expect(gbpusd.digits).toBe(5);
 
     expect(eurusd.minRR).toBe(2.0);
@@ -143,31 +143,30 @@ describe('Multi-Pair Market Scanner & Instrument System', () => {
       expect(['READY', 'WAITING', 'BLOCKED']).toContain(analysis.status);
       expect(analysis.riskRewardRatio).toBeGreaterThanOrEqual(0);
       expect(analysis.scoreBreakdown).toBeDefined();
-      expect(analysis.confluenceScore).toBe(
+      expect(analysis.rawConfluenceScore).toBe(
         Object.values(analysis.scoreBreakdown).reduce((total, score) => total + (score ?? 0), 0)
       );
+      expect(analysis.confluenceScore).toBe(Math.min(100, analysis.rawConfluenceScore));
+      expect(analysis.scoringPolicyVersion).toBe(2);
     }
   });
 
   it('ranks trade opportunities by score, setup quality and risk/reward', () => {
     const dataGold = generatePairCandles('XAUUSD', 60);
     const dataEur = generatePairCandles('EURUSD', 60);
-    const dataJpy = generatePairCandles('USDJPY', 60);
     const dataGbp = generatePairCandles('GBPUSD', 60);
 
     const analyses = [
       analyzeInstrument('XAUUSD', dataGold.candlesM1, dataGold.candlesM5, dataGold.candlesM15, dataGold.candlesH1, dataGold.currentBid, dataGold.currentAsk, dataGold.spreadPoints, 100, 1.0, []),
       analyzeInstrument('EURUSD', dataEur.candlesM1, dataEur.candlesM5, dataEur.candlesM15, dataEur.candlesH1, dataEur.currentBid, dataEur.currentAsk, dataEur.spreadPoints, 100, 1.0, []),
-      analyzeInstrument('USDJPY', dataJpy.candlesM1, dataJpy.candlesM5, dataJpy.candlesM15, dataJpy.candlesH1, dataJpy.currentBid, dataJpy.currentAsk, dataJpy.spreadPoints, 100, 1.0, []),
       analyzeInstrument('GBPUSD', dataGbp.candlesM1, dataGbp.candlesM5, dataGbp.candlesM15, dataGbp.candlesH1, dataGbp.currentBid, dataGbp.currentAsk, dataGbp.spreadPoints, 100, 1.0, []),
     ];
 
     const ranked = rankOpportunities(analyses);
-    expect(ranked.length).toBe(4);
+    expect(ranked.length).toBe(3);
     expect(ranked[0].rank).toBe(1);
     expect(ranked[1].rank).toBe(2);
     expect(ranked[2].rank).toBe(3);
-    expect(ranked[3].rank).toBe(4);
   });
 
   describe('Small Account ($10) Risk Protections', () => {
@@ -185,8 +184,24 @@ describe('Multi-Pair Market Scanner & Instrument System', () => {
       expect(sizing.rejectionReason).toBeUndefined();
     });
 
+    it('marks a broker-minimum setup ready when it is within the adaptive floor cap', () => {
+      const sizing = calculateSmallAccountPositionSize(
+        332,
+        0.5,
+        2.37,
+        'XAUUSD',
+        0.01,
+        0.01,
+        { tickSize: 0.01, tickValue: 1, contractSize: 100, volumeMin: 0.01, volumeMax: 10, volumeStep: 0.01 }
+      );
+
+      expect(sizing.safeVolume).toBe(0.01);
+      expect(sizing.riskAmount).toBeCloseTo(2.37);
+      expect(sizing.rejectionReason).toBeUndefined();
+    });
+
     it('rejects minimum volume when it exceeds the configured risk on larger accounts too', () => {
-      const sizing = calculateSmallAccountPositionSize(100, 1, 0.003, 'EURUSD', 0.01, 0.01);
+      const sizing = calculateSmallAccountPositionSize(100, 1, 0.0036, 'EURUSD', 0.01, 0.01);
 
       expect(sizing.safeVolume).toBeNull();
       expect(sizing.rejectionReason).toContain('TRADE_REJECTED: MINIMUM_LOT_EXCEEDS_RISK');
@@ -217,9 +232,6 @@ describe('Multi-Pair Market Scanner & Instrument System', () => {
       expect(check.allowed).toBe(false);
       expect(check.reason).toContain('TRADE_REJECTED: CORRELATION_LIMIT_EXCEEDED');
 
-      // USDJPY BUY is Long USD, so it does not conflict with Short USD
-      const checkJpy = checkCorrelationExposure('USDJPY', 'BUY', openPositions, 1);
-      expect(checkJpy.allowed).toBe(true);
     });
   });
 
@@ -284,9 +296,6 @@ describe('Multi-Pair Market Scanner & Instrument System', () => {
       const ticker = tradingEngine.getTickerSnapshot();
       expect(ticker.symbol).toBe('EURUSD');
       expect(ticker.displayName).toBe('Euro / US Dollar');
-
-      tradingEngine.switchSymbol('USDJPY');
-      expect(tradingEngine.activeSymbol).toBe('USDJPY');
 
       tradingEngine.switchSymbol('XAUUSD');
       expect(tradingEngine.activeSymbol).toBe('XAUUSD');

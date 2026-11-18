@@ -46,10 +46,10 @@ describe('SignalQualityCard', () => {
       />
     );
 
-    expect(screen.getByText('FRESH')).toBeTruthy();
+    expect(screen.getByText(/Data Feed Verified/)).toBeTruthy();
     act(() => {
       vi.advanceTimersByTime(2_000);
     });
-    expect(screen.getByText('CHECK FEED')).toBeTruthy();
+    expect(screen.getByText(/Checking Feed/)).toBeTruthy();
   });
 });

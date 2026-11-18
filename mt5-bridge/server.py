@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request as UrlRequest, urlopen
+from contextlib import closing
 from functools import wraps
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,8 +24,28 @@ from zoneinfo import ZoneInfo
 
 logger = logging.getLogger("mt5_bridge")
 
-import MetaTrader5 as mt5  # type: ignore[attr-defined]
+class _UnavailableMT5Adapter:
+    def __getattr__(self, name: str) -> Any:
+        raise RuntimeError(
+            "The MetaTrader5 Python package is required for broker operations. "
+            "Inject an adapter when running broker-free tests."
+        )
+
+
+try:
+    import MetaTrader5 as mt5  # type: ignore[attr-defined]
+except ImportError:
+    mt5 = _UnavailableMT5Adapter()
 mt5 = cast(Any, mt5)
+
+
+def configure_mt5_adapter(adapter: Any) -> None:
+    if adapter is None:
+        raise ValueError("An MT5 adapter is required.")
+    global mt5
+    mt5 = adapter
+
+
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -33,6 +54,7 @@ from broker_time import future_broker_clock_offset_seconds
 from signal_freshness import is_signal_stale
 from calendar_feed import normalize_finnhub_calendar, normalize_forexfactory_calendar
 from news_feed import merge_news_items, parse_rss_items
+from symbol_resolution import select_broker_symbol, symbol_allows_open
 
 app = FastAPI(title="Local MT5 Bridge", docs_url=None, redoc_url=None)
 
@@ -61,14 +83,23 @@ _WORLD_NEWS_FEEDS: tuple[tuple[str, str], ...] = (
     ("BBC Business", "https://feeds.bbci.co.uk/news/business/rss.xml"),
     ("CNBC World", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100727362"),
 )
+_live_news_cache: tuple[float, list[dict]] | None = None
+_live_news_cache_lock = threading.Lock()
+_live_news_cache_ttl = 60.0
 RISK_CONFIG = json.loads((Path(__file__).resolve().parents[1] / "risk-config.json").read_text(encoding="utf-8"))
 STATE_DIRECTORY = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SMCBridge"
 STATE_DIRECTORY.mkdir(parents=True, exist_ok=True)
-STATE_DATABASE = STATE_DIRECTORY / "order-idempotency.sqlite3"
+STATE_DATABASE = Path(
+    os.environ.get(
+        "MT5_BRIDGE_STATE_DATABASE",
+        str(STATE_DIRECTORY / "order-idempotency.sqlite3"),
+    )
+)
+STATE_DATABASE.parent.mkdir(parents=True, exist_ok=True)
 
 
 def initialize_state_database() -> None:
-    with sqlite3.connect(STATE_DATABASE) as connection:
+    with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS order_requests (
@@ -164,83 +195,46 @@ def configured_news_blackout(now: datetime) -> bool:
         return False
 
 
-def resolve_broker_symbol(symbol: str) -> str:
+def resolve_broker_symbol(
+    symbol: str,
+    direction: str | None = None,
+    require_tradeable: bool = False,
+) -> str:
     cleaned = (symbol or "").strip()
     if not cleaned:
         return cleaned
 
-    upper_clean = cleaned.upper().replace("/", "")
-    disabled_mode = getattr(mt5, "SYMBOL_TRADE_MODE_DISABLED", 0)
-    exact_name = None
-
-    def is_tradable(name: str) -> bool:
-        info = mt5.symbol_info(name)
-        return (
-            info is not None
-            and getattr(info, "trade_mode", disabled_mode) != disabled_mode
-        )
-
-    def choose_tradable(candidates: list[str]) -> str | None:
-        tradable = [name for name in candidates if is_tradable(name)]
-        if not tradable:
-            return None
-
-        visible = [
-            name for name in tradable
-            if (info := mt5.symbol_info(name))
-            and getattr(info, "visible", True)
-        ]
-        return visible[0] if visible else tradable[0]
+    info = mt5.symbol_info(cleaned)
+    if info is not None and symbol_allows_open(int(getattr(info, "trade_mode", 4)), direction):
+        return cleaned
 
     try:
-        exact_info = mt5.symbol_info(cleaned)
-        if exact_info is not None:
-            exact_name = cleaned
-            if getattr(exact_info, "trade_mode", disabled_mode) != disabled_mode:
-                return cleaned
-
-        all_symbols = mt5.symbols_get()
-        if not all_symbols:
-            return exact_name or cleaned
-
-        exact_candidates = [
-            item.name for item in all_symbols
-            if item.name.upper() == upper_clean
-        ]
-        selected = choose_tradable(exact_candidates)
+        candidates: list[tuple[str, int, bool]] = []
+        for item in mt5.symbols_get() or []:
+            candidate_info = mt5.symbol_info(item.name)
+            if candidate_info is not None:
+                candidates.append((
+                    item.name,
+                    int(getattr(candidate_info, "trade_mode", 4)),
+                    bool(getattr(candidate_info, "visible", False)),
+                ))
+        selected = select_broker_symbol(cleaned, candidates, direction)
         if selected:
             return selected
-        if exact_candidates:
-            exact_name = exact_candidates[0]
-
-        suffix_candidates = [
-            item.name for item in all_symbols
-            if item.name.upper().startswith(upper_clean)
-        ]
-        selected = choose_tradable(suffix_candidates)
-        if selected:
-            return selected
-
-        contains_candidates = [
-            item.name for item in all_symbols
-            if upper_clean in item.name.upper()
-        ]
-        selected = choose_tradable(contains_candidates)
-        if selected:
-            return selected
-
-        if "XAU" in upper_clean or "GOLD" in upper_clean:
-            gold_candidates = [
-                item.name for item in all_symbols
-                if "XAUUSD" in item.name.upper()
-                or "GOLD" in item.name.upper()
-            ]
-            selected = choose_tradable(gold_candidates)
-            if selected:
-                return selected
-
     except Exception:
-        pass
+        logger.exception("Could not inspect MT5 symbols while resolving %r.", cleaned)
+
+    if require_tradeable:
+        side = f" for opening {direction}" if direction else ""
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No trade-enabled MT5 symbol matching {cleaned!r}{side} was found. "
+                "Check the exact Market Watch symbol and account trading permissions."
+            ),
+        )
+
+
 
     return exact_name or cleaned
 
@@ -261,6 +255,9 @@ def get_symbol_spec(login: int, server: str, symbol: str, info: Any) -> dict:
         }
         if any(not math.isfinite(value) for value in spec.values()):
             raise HTTPException(status_code=503, detail="MT5 returned non-finite symbol risk specifications.")
+        trade_mode_val = int(getattr(info, "trade_mode", 4) or 0)
+        spec["tradeMode"] = trade_mode_val
+        spec["tradeDisabled"] = bool(trade_mode_val == 0)
         _symbol_spec_cache[key] = spec
     return _symbol_spec_cache[key]
 
@@ -276,7 +273,7 @@ def idempotent_order(handler):
         with _order_id_lock:
             if order_id in _inflight_order_requests:
                 raise HTTPException(status_code=409, detail="This order request is already being processed.")
-            with sqlite3.connect(STATE_DATABASE) as connection:
+            with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
                 cached = connection.execute(
                     """
                     SELECT account_login, account_server, symbol, direction, volume, sl, tp,
@@ -339,6 +336,16 @@ class TradeRequest(BaseModel):
     bypassCooldown: bool = False
     bypassCircuitBreaker: bool = False
     forceExecute: bool = False
+    orderType: Literal["MARKET", "LIMIT"] = "MARKET"
+    limitPrice: float | None = Field(default=None, gt=0)
+    expirationMinutes: int = Field(default=10, ge=1, le=240)
+
+
+class CancelOrderRequest(BaseModel):
+    ticket: int = Field(gt=0)
+    symbol: str = Field(default="XAUUSD", max_length=32)
+    expectedLogin: int = Field(gt=0)
+    expectedServer: str = Field(min_length=1, max_length=128)
 
 
 class TradingControlRequest(BaseModel):
@@ -372,14 +379,12 @@ INSTRUMENT_MAX_SPREADS: dict[str, float] = {
     "XAUUSD": 40.0,
     "EURUSD": 20.0,
     "GBPUSD": 25.0,
-    "USDJPY": 25.0,
 }
 
 INSTRUMENT_MAX_DEVIATIONS: dict[str, int] = {
     "XAUUSD": 50,  # 50 points = 5.0 pips / $0.50 on Gold
     "EURUSD": 20,  # 20 points = 2.0 pips on EURUSD
     "GBPUSD": 25,  # 25 points = 2.5 pips on GBPUSD
-    "USDJPY": 20,  # 20 points = 2.0 pips on USDJPY
 }
 
 
@@ -543,9 +548,54 @@ def read_positions() -> list[dict]:
     ]
 
 
+def read_pending_orders() -> list[dict]:
+    orders = mt5.orders_get()
+    if orders is None:
+        return []
+    buy_types = {
+        getattr(mt5, "ORDER_TYPE_BUY_LIMIT", 2),
+        getattr(mt5, "ORDER_TYPE_BUY_STOP", 4),
+        getattr(mt5, "ORDER_TYPE_BUY_STOP_LIMIT", 6),
+    }
+    buy_limit_type = getattr(mt5, "ORDER_TYPE_BUY_LIMIT", 2)
+    now_ts = datetime.now(timezone.utc).timestamp()
+    formatted: list[dict] = []
+    for order in orders:
+        o_type = int(getattr(order, "type", buy_limit_type))
+        direction = "BUY" if o_type in buy_types else "SELL"
+        setup_ts = int(getattr(order, "time_setup", now_ts) or now_ts)
+        exp_ts = int(getattr(order, "time_expiration", 0) or 0)
+        ttl_sec = max(60, exp_ts - setup_ts) if exp_ts > setup_ts else 600
+        rem_sec = max(0, exp_ts - int(now_ts)) if exp_ts > 0 else 600
+        formatted.append(
+            {
+                "ticket": int(order.ticket),
+                "symbol": str(order.symbol),
+                "type": "BUY_LIMIT" if direction == "BUY" else "SELL_LIMIT",
+                "direction": direction,
+                "volume": float(getattr(order, "volume_current", getattr(order, "volume_initial", 0.01))),
+                "entry": float(order.price_open),
+                "sl": float(order.sl),
+                "tp": float(order.tp),
+                "score": 0,
+                "strategy": str(getattr(order, "comment", "") or "SMC Limit"),
+                "createdTime": setup_ts * 1000,
+                "ttlSeconds": ttl_sec,
+                "expiresAt": (exp_ts * 1000) if exp_ts > 0 else int((setup_ts + ttl_sec) * 1000),
+                "remainingSeconds": rem_sec,
+                "maxDriftPips": 25,
+                "currentDriftPips": 0,
+                "status": "PENDING",
+                "isBrokerOrder": True,
+            }
+        )
+    return formatted
+
+
 def read_snapshot(symbol: str) -> dict:
     account = require_account()
     positions = read_positions()
+    pending_orders = read_pending_orders()
     resolved_symbol = resolve_broker_symbol(symbol)
     info = mt5.symbol_info(resolved_symbol)
     if info is None or not getattr(info, "visible", True):
@@ -569,13 +619,21 @@ def read_snapshot(symbol: str) -> dict:
         mt5.ACCOUNT_TRADE_MODE_CONTEST: "contest",
     }.get(account["trade_mode"], "unknown")
     account.pop("trade_mode")
-    with sqlite3.connect(STATE_DATABASE) as connection:
+    now_utc = datetime.now(timezone.utc)
+    reconstructed_day_start = reconstruct_day_starting_balance(
+        account["login"],
+        account["server"],
+        account["balance"],
+        now_utc,
+    )
+    account["daily_start_balance"] = round(float(reconstructed_day_start), 2)
+    with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
         connection.execute(
             """
             INSERT OR IGNORE INTO daily_risk (account_login, account_server, utc_date, start_balance)
             VALUES (?, ?, ?, ?)
             """,
-            (account["login"], account["server"], datetime.now(timezone.utc).date().isoformat(), account["balance"]),
+            (account["login"], account["server"], now_utc.date().isoformat(), account["daily_start_balance"]),
         )
         trading_halted = connection.execute(
             "SELECT state_value FROM control_state WHERE state_key = 'trading_halted'"
@@ -609,14 +667,15 @@ def read_snapshot(symbol: str) -> dict:
         ]
 
     return {
-         "account": account,
-         "positions": positions,
-         "symbol": resolved_symbol,
-         "accountMode": account_mode,
-         "tradingHalted": trading_halted,
-         "autoTrade": auto_trade,
-         "circuitBreakerEnabled": circuit_breaker_enabled,
-         "symbolSpec": symbol_spec,
+        "account": account,
+        "positions": positions,
+        "pendingOrders": pending_orders,
+        "symbol": resolved_symbol,
+        "accountMode": account_mode,
+        "tradingHalted": trading_halted,
+        "autoTrade": auto_trade,
+        "circuitBreakerEnabled": circuit_breaker_enabled,
+        "symbolSpec": symbol_spec,
         "bid": float(tick.bid),
         "ask": float(tick.ask),
         "spread": round((tick.ask - tick.bid) / info.point),
@@ -641,17 +700,18 @@ def _deal_cost(deal: Any) -> float:
 
 
 def read_closed_trades(days: int, symbol: str | None = None) -> list[dict]:
-    clean_sym = symbol.strip().upper() if symbol else ""
-    cache_key = f"{clean_sym or '*'}:{days}"
+    account = require_account()
+    clean_sym = (symbol or "ALL").strip().upper()
+    include_all_symbols = clean_sym in ("ALL", "*", "ANY", "")
+    cache_key = f"{account['login']}:{account['server']}:{clean_sym}:{days}"
     now_ts = time.time()
 
-    # Fast in-memory cache hit (5s TTL) avoids repetitive heavy 180-day deal scans & IPC overhead
+    # Fast in-memory cache hit (5s TTL) avoids repetitive heavy deal scans & IPC overhead
     if cache_key in _closed_trades_cache:
         cached_ts, cached_trades = _closed_trades_cache[cache_key]
         if now_ts - cached_ts < _closed_trades_cache_ttl:
             return cached_trades
 
-    require_account()
     now = datetime.now(timezone.utc)
     deals = mt5.history_deals_get(now - timedelta(days=days), now)
     if deals is None:
@@ -662,16 +722,20 @@ def read_closed_trades(days: int, symbol: str | None = None) -> list[dict]:
         raise HTTPException(status_code=503, detail=f"MT5 positions unavailable: {mt5.last_error()}")
     open_position_ids = {int(position.ticket) for position in open_positions}
     deals_by_position: dict[int, list[Any]] = {}
-    resolved_symbol = resolve_broker_symbol(clean_sym) if clean_sym else ""
+    resolved_symbol = "" if include_all_symbols else resolve_broker_symbol(symbol or "")
     for deal in deals:
-        deal_sym = str(deal.symbol).upper()
+        deal_sym = str(getattr(deal, "symbol", "") or "")
+        deal_sym_upper = deal_sym.upper()
+        position_id = int(getattr(deal, "position_id", 0) or 0)
+        if position_id <= 0 or not deal_sym:
+            continue
         if (
-            not clean_sym
-            or deal_sym == clean_sym
-            or deal_sym == resolved_symbol.upper()
-            or deal_sym.startswith(clean_sym)
+            include_all_symbols
+            or deal_sym_upper == clean_sym
+            or deal_sym_upper == resolved_symbol.upper()
+            or deal_sym_upper.startswith(clean_sym)
         ):
-            deals_by_position.setdefault(int(deal.position_id), []).append(deal)
+            deals_by_position.setdefault(position_id, []).append(deal)
 
     exits_by_position: dict[int, list[Any]] = {}
     for position_id, position_deals in deals_by_position.items():
@@ -697,7 +761,7 @@ def read_closed_trades(days: int, symbol: str | None = None) -> list[dict]:
                         deal
                         for deal in historical_position_deals
                         if (
-                            not clean_sym
+                            include_all_symbols
                             or str(deal.symbol).upper() == clean_sym
                             or str(deal.symbol).upper() == resolved_symbol.upper()
                             or str(deal.symbol).upper().startswith(clean_sym)
@@ -729,8 +793,8 @@ def read_closed_trades(days: int, symbol: str | None = None) -> list[dict]:
         }
         rationale = str(entry.comment).strip()
         # SAFETY-FIX: Compute pip size dynamically from symbol (JPY: 0.01, XAUUSD/metals: 0.1, others: 0.0001) via mt5.symbol_info
-        deal_sym = str(entry.symbol) or clean_sym
-        sym_info = mt5.symbol_info(deal_sym)
+        deal_sym = str(entry.symbol) or ("" if include_all_symbols else clean_sym)
+        sym_info = mt5.symbol_info(deal_sym) if deal_sym else None
         upper_sym = deal_sym.upper()
         if "JPY" in upper_sym:
             pip_size = 0.01
@@ -745,20 +809,22 @@ def read_closed_trades(days: int, symbol: str | None = None) -> list[dict]:
         results.append(
             {
                 "ticket": int(last_exit.ticket),
+                "symbol": deal_sym,
                 "orderTicket": int(entry.order),
                 "positionTicket": position_id,
                 "openTime": open_time.strftime("%H:%M:%S"),
+                "openedAt": open_time.isoformat(),
                 "closeTime": close_time.strftime("%H:%M:%S"),
                 "closedAt": close_time.isoformat(),
                 "type": direction,
                 "volume": float(entry.volume),
                 "openPrice": float(entry.price),
                 "closePrice": close_price,
-                "profit": sum(_deal_cost(deal) for deal in position_deals),
+                "profit": round(sum(_deal_cost(deal) for deal in position_deals), 2),
                 "pips": calculated_pips,
                 "reason": reason_by_code.get(last_exit.reason, "Manual"),
                 "comment": str(last_exit.comment),
-                "strategyRationale": rationale if rationale and rationale != "SMC dashboard" else None,
+                "strategyRationale": rationale if rationale and rationale not in ("SMC dashboard", "SMC_CLOSE") else None,
             }
         )
 
@@ -949,6 +1015,86 @@ def world_news(request: Request) -> dict:
     }
 
 
+@app.get("/api/live-news")
+def live_news(request: Request) -> dict:
+    require_bridge_token(request)
+    global _live_news_cache
+
+    now_monotonic = time.monotonic()
+    with _live_news_cache_lock:
+        if (
+            _live_news_cache is not None
+            and now_monotonic - _live_news_cache[0] < _live_news_cache_ttl
+        ):
+            return {
+                "available": True,
+                "news": _live_news_cache[1],
+                "updatedAt": datetime.now(timezone.utc).isoformat(),
+            }
+
+    rss_urls = [
+        ("MarketWatch Top Stories", "https://feeds.content.dowjones.io/public/rss/mw_topstories"),
+        ("MarketWatch Real-time", "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines"),
+    ]
+    parsed_items: list[dict[str, Any]] = []
+
+    import xml.etree.ElementTree as ET
+
+    for source_name, url in rss_urls:
+        req = UrlRequest(url, headers={"User-Agent": "NIFTY-Terminal/1.0", "Accept": "application/xml, text/xml"})
+        try:
+            with urlopen(req, timeout=8) as resp:
+                xml_data = resp.read()
+                root = ET.fromstring(xml_data)
+                channel = root.find("channel")
+                if channel is not None:
+                    for item in channel.findall("item"):
+                        title_el = item.find("title")
+                        desc_el = item.find("description")
+                        link_el = item.find("link")
+                        pub_el = item.find("pubDate")
+                        guid_el = item.find("guid")
+
+                        title = (title_el.text or "").strip() if title_el is not None else ""
+                        desc = (desc_el.text or "").strip() if desc_el is not None else ""
+                        link = (link_el.text or "").strip() if link_el is not None else ""
+                        pub_date = (pub_el.text or "").strip() if pub_el is not None else ""
+                        guid = (guid_el.text or "").strip() if guid_el is not None else title
+
+                        if title and len(title) > 5 and not any(p["title"] == title for p in parsed_items):
+                            parsed_items.append({
+                                "id": f"rss:{guid or title[:30]}",
+                                "title": title,
+                                "summary": desc or title,
+                                "source": source_name,
+                                "publishedAt": pub_date or datetime.now(timezone.utc).isoformat(),
+                                "link": link,
+                            })
+                            if len(parsed_items) >= 20:
+                                break
+        except Exception as e:
+            logger.warning(f"Live news fetch failed from {url}: {e}")
+            continue
+
+        if len(parsed_items) >= 15:
+            break
+
+    if parsed_items:
+        with _live_news_cache_lock:
+            _live_news_cache = (now_monotonic, parsed_items)
+        return {
+            "available": True,
+            "news": parsed_items,
+            "updatedAt": datetime.now(timezone.utc).isoformat(),
+        }
+
+    return {
+        "available": False,
+        "news": [],
+        "message": "Live financial news feed temporarily unreachable",
+    }
+
+
 @app.post("/api/connect")
 def connect(payload: ConnectRequest, request: Request) -> dict:
     require_bridge_token(request)
@@ -964,7 +1110,7 @@ def account(request: Request, symbol: str = "XAUUSD") -> dict:
 @app.post("/api/trading-control")
 def set_trading_control(payload: TradingControlRequest, request: Request) -> dict:
     require_bridge_token(request)
-    with sqlite3.connect(STATE_DATABASE) as connection:
+    with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
         connection.execute(
             "UPDATE control_state SET state_value = ? WHERE state_key = 'trading_halted'",
             ("true" if payload.tradingHalted else "false",),
@@ -975,7 +1121,7 @@ def set_trading_control(payload: TradingControlRequest, request: Request) -> dic
 @app.post("/api/auto-trade-control")
 def set_auto_trade_control(payload: AutoTradeControlRequest, request: Request) -> dict:
     require_bridge_token(request)
-    with sqlite3.connect(STATE_DATABASE) as connection:
+    with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
         connection.execute(
             "UPDATE control_state SET state_value = ? WHERE state_key = 'auto_trade'",
             ("true" if payload.autoTrade else "false",),
@@ -986,7 +1132,7 @@ def set_auto_trade_control(payload: AutoTradeControlRequest, request: Request) -
 @app.post("/api/reset-circuit-breakers")
 def reset_circuit_breakers(request: Request) -> dict:
     require_bridge_token(request)
-    with sqlite3.connect(STATE_DATABASE) as connection:
+    with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
         connection.execute("UPDATE control_state SET state_value = 'false' WHERE state_key = 'trading_halted'")
         connection.execute("DELETE FROM daily_risk")
     logger.info("✅ Circuit breakers and kill switch reset successfully.")
@@ -996,7 +1142,7 @@ def reset_circuit_breakers(request: Request) -> dict:
 @app.post("/api/circuit-breaker-control")
 def set_circuit_breaker_control(payload: CircuitBreakerControlRequest, request: Request) -> dict:
     require_bridge_token(request)
-    with sqlite3.connect(STATE_DATABASE) as connection:
+    with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
         connection.execute(
             "INSERT OR REPLACE INTO control_state (state_key, state_value) VALUES ('circuit_breaker_enabled', ?)",
             ("true" if payload.enabled else "false",),
@@ -1010,8 +1156,8 @@ def set_circuit_breaker_control(payload: CircuitBreakerControlRequest, request: 
 @app.get("/api/history")
 def history(
     request: Request,
-    days: int = Query(default=180, ge=1, le=365),
-    symbol: str | None = Query(default=None, min_length=1, max_length=32),
+    days: int = Query(default=365, ge=1, le=1825),
+    symbol: str = Query(default="ALL", min_length=1, max_length=32),
 ) -> list[dict]:
     require_bridge_token(request)
     return read_closed_trades(days, symbol)
@@ -1074,7 +1220,7 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
         # Signal timestamps identify the candle open; allow the candle to close plus its entry window.
         if is_signal_stale(signal_bar_time, now, payload.signalTimeframe):
             raise HTTPException(status_code=409, detail="Signal candle is stale; wait for a new broker-confirmed setup.")
-    with sqlite3.connect(STATE_DATABASE) as connection:
+    with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
         trading_halted = connection.execute(
             "SELECT state_value FROM control_state WHERE state_key = 'trading_halted'"
         ).fetchone()[0] == "true"
@@ -1097,7 +1243,7 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
         raise HTTPException(status_code=423, detail="Configured high-impact news blackout window is active.")
 
     raw_symbol = payload.symbol.strip()
-    symbol = resolve_broker_symbol(raw_symbol)
+    symbol = resolve_broker_symbol(raw_symbol, payload.direction, require_tradeable=True)
     info = mt5.symbol_info(symbol)
     if info is None or not getattr(info, "visible", True):
         mt5.symbol_select(symbol, True)
@@ -1163,7 +1309,7 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
             detail=f"Maximum open-position limit reached ({len(open_positions)}/{max_positions}). Non-bypassable hard risk protection."
         )
 
-    with sqlite3.connect(STATE_DATABASE) as connection:
+    with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
         day_row = connection.execute(
             """
             SELECT start_balance FROM daily_risk
@@ -1187,7 +1333,7 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
             day_start = day_row
 
     circuit_breaker_enabled = True
-    with sqlite3.connect(STATE_DATABASE) as connection:
+    with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
         cb_row = connection.execute(
             "SELECT state_value FROM control_state WHERE state_key = 'circuit_breaker_enabled'"
         ).fetchone()
@@ -1219,7 +1365,7 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
     else:
         logger.info(f"⚡ [Circuit Breaker Bypassed] Order #{payload.clientOrderId} permitted (Circuit Breaker toggled off by operator).")
 
-    with sqlite3.connect(STATE_DATABASE) as connection:
+    with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
         recent_count = connection.execute(
             "SELECT COUNT(*) FROM order_requests WHERE account_login = ? AND account_server = ? AND symbol = ? AND accepted_at >= ?",
             (account["login"], account["server"], symbol, (now - timedelta(hours=1)).isoformat()),
@@ -1276,11 +1422,30 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
         logger.warning(f"🚫 [423 Locked] This SMC point of interest on {symbol} was recently traded.")
         raise HTTPException(status_code=423, detail=f"This SMC point of interest on {symbol} was recently traded.")
 
-    order_type = mt5.ORDER_TYPE_BUY if payload.direction == "BUY" else mt5.ORDER_TYPE_SELL
     tick_size = symbol_spec.get("tickSize", 0.01) or 0.01
     digits = int(getattr(info, "digits", 2))
     point_val = float(getattr(info, "point", tick_size)) or tick_size
     min_stop_distance = max(float(symbol_spec.get("tradeStopsLevel", 0)) * point_val, tick_size * 5)
+
+    use_pending_limit = False
+    entry_reference_price = price
+    if payload.orderType == "LIMIT" and payload.limitPrice is not None and math.isfinite(payload.limitPrice):
+        rounded_limit = round(round(payload.limitPrice / tick_size) * tick_size, digits)
+        if payload.direction == "BUY" and rounded_limit < price - min_stop_distance:
+            use_pending_limit = True
+            entry_reference_price = rounded_limit
+        elif payload.direction == "SELL" and rounded_limit > price + min_stop_distance:
+            use_pending_limit = True
+            entry_reference_price = rounded_limit
+
+    if use_pending_limit:
+        order_type = (
+            getattr(mt5, "ORDER_TYPE_BUY_LIMIT", 2)
+            if payload.direction == "BUY"
+            else getattr(mt5, "ORDER_TYPE_SELL_LIMIT", 3)
+        )
+    else:
+        order_type = mt5.ORDER_TYPE_BUY if payload.direction == "BUY" else mt5.ORDER_TYPE_SELL
 
     # Auto-align SL and TP to valid tick sizes and broker limits instead of throwing 400 Bad Request
     if payload.sl:
@@ -1289,25 +1454,35 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
         payload.tp = round(round(payload.tp / tick_size) * tick_size, digits)
 
     if payload.direction == "BUY":
-        if payload.sl >= price or abs(price - payload.sl) < min_stop_distance:
-            payload.sl = round(price - min_stop_distance * 2, digits)
-        if payload.tp <= price or abs(payload.tp - price) < min_stop_distance:
-            payload.tp = round(price + min_stop_distance * 4, digits)
+        if payload.sl >= entry_reference_price or abs(entry_reference_price - payload.sl) < min_stop_distance:
+            payload.sl = round(entry_reference_price - min_stop_distance * 2, digits)
+        if payload.tp <= entry_reference_price or abs(payload.tp - entry_reference_price) < min_stop_distance:
+            payload.tp = round(entry_reference_price + min_stop_distance * 4, digits)
     else:
-        if payload.sl <= price or abs(payload.sl - price) < min_stop_distance:
-            payload.sl = round(price + min_stop_distance * 2, digits)
-        if payload.tp >= price or abs(price - payload.tp) < min_stop_distance:
-            payload.tp = round(price - min_stop_distance * 4, digits)
+        if payload.sl <= entry_reference_price or abs(payload.sl - entry_reference_price) < min_stop_distance:
+            payload.sl = round(entry_reference_price + min_stop_distance * 2, digits)
+        if payload.tp >= entry_reference_price or abs(entry_reference_price - payload.tp) < min_stop_distance:
+            payload.tp = round(entry_reference_price - min_stop_distance * 4, digits)
 
     # Target SL and TP requested
     desired_sl = float(payload.sl or 0.0)
     desired_tp = float(payload.tp or 0.0)
-    stop_distance = abs(price - desired_sl)
+    stop_distance = abs(entry_reference_price - desired_sl)
     risk_per_lot = stop_distance / symbol_spec["tickSize"] * symbol_spec["tickValue"]
     risk_budget = account["equity"] * RISK_CONFIG["riskPercentPerTrade"] / 100
+    allow_micro_floor = bool(RISK_CONFIG.get("adaptiveMicroFloorEnabled", False))
     if not math.isfinite(risk_per_lot) or risk_per_lot <= 0 or risk_budget <= 0:
         raise HTTPException(status_code=400, detail="Risk sizing inputs are invalid; order was not sent.")
-    safe_volume = volume_for_risk(risk_budget, risk_per_lot, vol_min, vol_step, vol_max)
+    safe_volume = volume_for_risk(
+        risk_budget,
+        risk_per_lot,
+        vol_min,
+        vol_step,
+        vol_max,
+        allow_micro_floor=allow_micro_floor,
+        equity=account["equity"],
+        max_micro_floor_risk=float(RISK_CONFIG.get("maxMicroFloorRiskDollar", 15.0)),
+    )
     if safe_volume is None:
         min_lot_risk = risk_per_lot * vol_min
         raise HTTPException(
@@ -1398,6 +1573,8 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
         vol_min,
         vol_step,
         vol_max,
+        allow_micro_floor=(allow_micro_floor and current_portfolio_risk == 0.0),
+        equity=account["equity"],
     )
     if portfolio_safe_volume is None:
         raise HTTPException(
@@ -1439,8 +1616,10 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
     candidate_comments = [order_comment, ""]
 
     # Stops to try on initial entry
-    # If broker uses Market Execution (mode 2), start immediately with sl=0, tp=0
-    if is_market_exec:
+    # If broker uses Market Execution (mode 2) for instant market fills, start immediately with sl=0, tp=0
+    if use_pending_limit:
+        candidate_stops = [(desired_sl, desired_tp)]
+    elif is_market_exec:
         candidate_stops = [(0.0, 0.0)]
     else:
         candidate_stops = [(desired_sl, desired_tp), (0.0, 0.0)]
@@ -1459,7 +1638,6 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
 
     magic_num = payload.magic or {
         "EURUSD": 10001,
-        "USDJPY": 10002,
         "GBPUSD": 10003,
         "XAUUSD": 20261001,
     }.get(canonical_symbol, 20261001)
@@ -1475,21 +1653,31 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
             for fill in candidate_fillings:
                 # Refresh tick for accurate live price on each pass
                 cur_tick = mt5.symbol_info_tick(symbol)
-                cur_price = (cur_tick.ask if payload.direction == "BUY" else cur_tick.bid) if cur_tick else price
+                cur_price = entry_reference_price if use_pending_limit else ((cur_tick.ask if payload.direction == "BUY" else cur_tick.bid) if cur_tick else price)
                 current_risk_per_lot = abs(cur_price - desired_sl) / symbol_spec["tickSize"] * symbol_spec["tickValue"]
                 current_portfolio_budget = max(0.0, portfolio_risk_budget - current_portfolio_risk)
-                current_safe_volume = volume_for_risk(
-                    min(risk_budget, current_portfolio_budget),
+                current_trade_safe_volume = volume_for_risk(
+                    risk_budget,
+                    current_risk_per_lot,
+                    vol_min,
+                    vol_step,
+                    vol_max,
+                    allow_micro_floor=allow_micro_floor,
+                    equity=account["equity"],
+                    max_micro_floor_risk=float(RISK_CONFIG.get("maxMicroFloorRiskDollar", 15.0)),
+                )
+                current_portfolio_safe_volume = volume_for_risk(
+                    current_portfolio_budget,
                     current_risk_per_lot,
                     vol_min,
                     vol_step,
                     vol_max,
                 )
-                if current_safe_volume is None:
+                if current_trade_safe_volume is None or current_portfolio_safe_volume is None:
                     min_lot_risk = current_risk_per_lot * vol_min
                     reason = (
                         "PORTFOLIO_RISK_LIMIT_EXCEEDED"
-                        if current_portfolio_budget < risk_budget
+                        if current_portfolio_safe_volume is None
                         else "MINIMUM_LOT_EXCEEDS_RISK"
                     )
                     raise HTTPException(
@@ -1500,6 +1688,7 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
                             f"available budget: ${min(risk_budget, current_portfolio_budget):.2f}) at refreshed quote."
                         ),
                     )
+                current_safe_volume = min(current_trade_safe_volume, current_portfolio_safe_volume)
                 if payload.volume > current_safe_volume + 1e-9:
                     logger.info(
                         "Reduced order volume at refreshed quote from %sL to risk-safe %sL.",
@@ -1509,7 +1698,7 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
                     payload.volume = current_safe_volume
 
                 request_data = {
-                    "action": mt5.TRADE_ACTION_DEAL,
+                    "action": getattr(mt5, "TRADE_ACTION_PENDING", 5) if use_pending_limit else mt5.TRADE_ACTION_DEAL,
                     "symbol": symbol,
                     "volume": payload.volume,
                     "type": order_type,
@@ -1521,6 +1710,9 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
                     "type_time": mt5.ORDER_TIME_GTC,
                     "type_filling": fill,
                 }
+                if use_pending_limit and hasattr(mt5, "ORDER_TIME_SPECIFIED"):
+                    request_data["type_time"] = getattr(mt5, "ORDER_TIME_SPECIFIED", mt5.ORDER_TIME_GTC)
+                    request_data["expiration"] = int((now + timedelta(minutes=payload.expirationMinutes)).timestamp())
                 if cmt:
                     request_data["comment"] = cmt
 
@@ -1694,7 +1886,7 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
 
     response_ticket = int(result.order or result.deal)
     execution_price = float(result.price or price)
-    with sqlite3.connect(STATE_DATABASE) as connection:
+    with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
         connection.execute(
             """
             INSERT OR IGNORE INTO order_requests
@@ -1862,6 +2054,29 @@ def modify_position(payload: StopsRequest, request: Request) -> dict:
         raise HTTPException(status_code=400, detail=f"MT5 stop update failed: {reason}")
     logger.info(f"🛡️ MT5 Stop Update OK for position #{payload.ticket}: SL={payload.sl}, TP={payload.tp}")
     return read_snapshot(position.symbol)
+
+
+@app.post("/api/cancel-order")
+def cancel_pending_order(payload: CancelOrderRequest, request: Request) -> dict:
+    require_bridge_token(request)
+    require_expected_account(payload.expectedLogin, payload.expectedServer)
+    matches = mt5.orders_get(ticket=payload.ticket)
+    if not matches:
+        raise HTTPException(status_code=404, detail=f"Pending MT5 order {payload.ticket} was not found.")
+    order = matches[0]
+    remove_action = getattr(mt5, "TRADE_ACTION_REMOVE", 8)
+    result = mt5.order_send(
+        {
+            "action": remove_action,
+            "order": int(order.ticket),
+            "symbol": str(order.symbol),
+        }
+    )
+    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+        reason = f"{result.retcode}: {result.comment}" if result else str(mt5.last_error())
+        raise HTTPException(status_code=400, detail=f"MT5 pending order cancel failed: {reason}")
+    logger.info(f"🗑️ MT5 Pending Order #{payload.ticket} cancelled successfully")
+    return read_snapshot(str(order.symbol) or payload.symbol)
 
 
 if __name__ == "__main__":

@@ -254,7 +254,7 @@ describe('SMC signal filters', () => {
       const seriesWithForming = [...execCandles, formingCandle];
 
       // Forming candle at dfExec[length - 1] is sliced off, so it does not trigger an incomplete signal
-      const signalForming = evaluateConfluence(seriesWithForming, htfCandles, 2.0, 5.0, 'M1');
+      const signalForming = evaluateConfluence(seriesWithForming, htfCandles, 2.0, 50, 'M1');
       expect(signalForming).toBeNull();
 
       // Now complete the bar by appending the next forming bar

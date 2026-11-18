@@ -1,11 +1,4 @@
-/**
- * TradingViewWidget.tsx - Institutional-Grade Dual Chart Workstation
- * Supports both Official TradingView Advanced Real-Time Chart and
- * Institutional SMC Engine Chart with broker ticks, indicator toggles,
- * and auto-scenario focus.
- */
-
-import React, { memo, useState, useCallback } from 'react';
+import React, { memo, useState, useCallback, useMemo, useRef, useEffect } from 'react';
 import {
   ExternalLink,
   HelpCircle,
@@ -13,24 +6,19 @@ import {
   RefreshCw,
   Eye,
   EyeOff,
-  SlidersHorizontal,
   ChevronDown,
-  Sparkles,
-  BarChart3,
-  Layers,
 } from 'lucide-react';
-import {
-  SMCInteractiveChart,
-  ChartTimeframe,
-  SMCIndicatorConfig,
-  DEFAULT_INDICATOR_CONFIG,
-} from './SMCInteractiveChart';
+import type { ChartTimeframe, SMCIndicatorConfig } from '../types/smc';
 import { OfficialTradingViewEmbed } from './OfficialTradingViewEmbed';
 import { SMCOverlayHUD } from './SMCOverlayHUD';
-import { MTFConfluenceRadar } from './MTFConfluenceRadar';
-import { useEngine, useBestOpportunity, useTicker, useMarket } from '../hooks/useTradingStore';
+import { useTicker, useMarket } from '../hooks/useTradingStore';
+import {
+  useIndicatorSync,
+  toggleShowIndicators,
+  toggleIndicatorKey,
+} from '../hooks/useIndicatorSync';
 import { tradingEngine } from '../engine/tradingEngine';
-import type { SupportedSymbol } from '../engine/instrumentConfig';
+import { getInstrumentConfig } from '../engine/instrumentConfig';
 
 interface TradingViewWidgetProps {
   isDark?: boolean;
@@ -57,139 +45,104 @@ export const TradingViewWidget: React.FC<TradingViewWidgetProps> = memo(({
   onExpand,
   onOpenHelp,
 }) => {
-  const initialTimeframe = timeframes.find((timeframe) => timeframe.interval === initialInterval)?.value ?? 'M1';
-  const [selectedTf, setSelectedTf] = useState<ChartTimeframe>(initialTimeframe);
-  const [chartMode, setChartMode] = useState<'tradingview' | 'smc'>('smc');
-  const [showIndicators, setShowIndicators] = useState(true);
-  const [indicatorConfig, setIndicatorConfig] = useState<SMCIndicatorConfig>(DEFAULT_INDICATOR_CONFIG);
-  const [showConfigMenu, setShowConfigMenu] = useState(false);
-  const [chartKey, setChartKey] = useState(0);
-
   const ticker = useTicker();
   const market = useMarket();
-  const engine = useEngine();
-  const bestOpportunity = useBestOpportunity();
-  const autoFocusEnabled = engine.autoSelectBestScenario ?? true;
+  const { showIndicators, config: indicatorConfig } = useIndicatorSync();
 
-  // Keep chart timeframe bidirectional in sync with the trading engine
-  React.useEffect(() => {
+  const initialTimeframe = timeframes.find((t) => t.interval === initialInterval)?.value ?? 'M1';
+  const [selectedTf, setSelectedTf] = useState<ChartTimeframe>(() => market.currentTimeframe || initialTimeframe);
+  const [showConfigMenu, setShowConfigMenu] = useState(false);
+  const [chartKey, setChartKey] = useState(0);
+  const [macdEnabled, setMacdEnabled] = useState(true);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  // Sync chart timeframe bidirectionally with tradingEngine
+  useEffect(() => {
     if (market.currentTimeframe && market.currentTimeframe !== selectedTf) {
       setSelectedTf(market.currentTimeframe);
     }
   }, [market.currentTimeframe, selectedTf]);
+
+  // Close indicator dropdown on outside click or Escape
+  useEffect(() => {
+    if (!showConfigMenu) return;
+    const handleOutside = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setShowConfigMenu(false);
+      }
+    };
+    const handleEsc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowConfigMenu(false);
+    };
+    document.addEventListener('mousedown', handleOutside);
+    window.addEventListener('keydown', handleEsc);
+    return () => {
+      document.removeEventListener('mousedown', handleOutside);
+      window.removeEventListener('keydown', handleEsc);
+    };
+  }, [showConfigMenu]);
 
   const handleSelectTimeframe = useCallback((tf: ChartTimeframe) => {
     setSelectedTf(tf);
     tradingEngine.setTimeframe(tf);
   }, []);
 
-  const handleToggleAutoFocus = useCallback(() => {
-    tradingEngine.setAutoSelectBestScenario(!autoFocusEnabled);
-  }, [autoFocusEnabled]);
-
-  const handleSelectBestOpportunity = useCallback(() => {
-    if (bestOpportunity && bestOpportunity.symbol !== ticker.symbol) {
-      tradingEngine.switchSymbol(bestOpportunity.symbol as SupportedSymbol);
-    }
-  }, [bestOpportunity, ticker.symbol]);
-
-  const toggleIndicatorItem = useCallback((key: keyof SMCIndicatorConfig) => {
-    setIndicatorConfig((prev) => ({
-      ...prev,
-      [key]: !prev[key],
-    }));
+  const handleToggleLayer = useCallback((key: keyof SMCIndicatorConfig) => {
+    toggleIndicatorKey(key);
   }, []);
 
-  const rawSymbol = symbol.includes(':') ? symbol.split(':').pop() : symbol;
+  // Build native TradingView studies array directly synced to showIndicators + indicatorConfig
+  const tvStudies = useMemo(() => {
+    if (!showIndicators) return [];
+    const list: string[] = [];
+    if (indicatorConfig.tvEma) list.push('MAExp@tv-basicstudies');
+    if (indicatorConfig.tvVwap) list.push('VWAP@tv-basicstudies');
+    if (indicatorConfig.tvRsi) list.push('RSI@tv-basicstudies');
+    if (macdEnabled) list.push('MACD@tv-basicstudies');
+    return list;
+  }, [showIndicators, indicatorConfig.tvEma, indicatorConfig.tvVwap, indicatorConfig.tvRsi, macdEnabled]);
+
+  const rawSymbol = symbol.includes(':') ? symbol.split(':').pop() || symbol : symbol;
+  const instrumentCfg = getInstrumentConfig(ticker.symbol);
+  const hasBrokerFeed = Boolean(market.brokerMarketData && ticker.bid > 0);
+  const isFullHeight = typeof height === 'string';
 
   return (
     <div
       id="price-structure-chart"
-      className={`bg-white dark:bg-[#0c0e12] border border-slate-200 dark:border-zinc-800 rounded-2xl overflow-hidden shadow-xs flex flex-col font-mono text-xs transition-colors ${
-        typeof height === 'string' ? 'h-full min-h-0' : ''
+      className={`ws-surface border rounded-xl overflow-hidden flex flex-col text-xs transition-colors ${
+        isFullHeight ? 'h-full min-h-0' : ''
       }`}
-      style={{ height: typeof height === 'number' ? `${height + 56}px` : '100%' }}
     >
-      {/* Chart Top Bar */}
-      <div className="px-3 sm:px-4 py-2 bg-slate-50/90 dark:bg-zinc-900/90 border-b border-slate-200 dark:border-zinc-800 flex items-center justify-between flex-wrap gap-2">
-        {/* Left: Engine Mode Switcher & Symbol Indicator */}
-        <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
-          {/* Dual Engine Tabs */}
-          <div className="flex items-center bg-slate-200/80 dark:bg-[#0c0e12] p-0.5 rounded-lg border border-slate-200 dark:border-[#222938]">
-            <button
-              onClick={() => setChartMode('tradingview')}
-              className={`px-2 sm:px-2.5 py-1 rounded-md text-[10px] sm:text-[11px] font-bold transition-all flex items-center gap-1 sm:gap-1.5 cursor-pointer ${
-                chartMode === 'tradingview'
-                  ? 'bg-slate-900 text-white dark:bg-white dark:text-slate-950 shadow-xs'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-              }`}
-              title="Official TradingView live candlestick chart with real-time quotes"
-            >
-              <BarChart3 className="w-3 h-3 sm:w-3.5 sm:h-3.5" />
-              <span className="hidden sm:inline">TradingView Official</span>
-              <span className="sm:hidden">TradingView</span>
-            </button>
-            <button
-              onClick={() => setChartMode('smc')}
-              className={`px-2 sm:px-2.5 py-1 rounded-md text-[10px] sm:text-[11px] font-bold transition-all flex items-center gap-1 sm:gap-1.5 cursor-pointer ${
-                chartMode === 'smc'
-                  ? 'bg-slate-900 text-white dark:bg-white dark:text-slate-950 shadow-xs'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-              }`}
-              title="Institutional SMC execution chart with Order Blocks, FVGs, and live broker trade lines"
-            >
-              <Layers className="w-3 h-3 sm:w-3.5 sm:h-3.5" />
-              <span className="hidden sm:inline">SMC Engine</span>
-              <span className="sm:hidden">SMC</span>
-            </button>
+      {/* Single Uncrowded Chart Header Bar */}
+      <div className="px-3.5 py-2 ws-subtle border-b flex items-center justify-between flex-wrap gap-2">
+        {/* Left: Active Symbol + Synced Spot + Timeframes */}
+        <div className="flex items-center gap-2.5 flex-wrap">
+          <div className="flex items-center gap-2">
+            <span className="font-mono font-extrabold text-slate-900 dark:text-white text-xs tracking-tight">
+              {rawSymbol}
+            </span>
+            {hasBrokerFeed && (
+              <span className="hidden sm:inline font-mono text-[11px] font-bold text-slate-600 dark:text-slate-300 tabular-nums">
+                · {ticker.bid.toFixed(instrumentCfg.digits)} · {ticker.spread}pts
+              </span>
+            )}
           </div>
 
-          <span className="font-bold text-slate-900 dark:text-white text-xs px-1.5 py-0.5 rounded bg-sky-500/10 text-sky-600 dark:text-sky-300 border border-sky-500/20">
-            {rawSymbol}
-          </span>
-
-          <span
-            className="hidden lg:inline-flex items-center text-[10px] font-bold px-2 py-0.5 rounded-full border bg-slate-500/10 text-slate-600 dark:text-slate-400 border-slate-500/20"
-            title="This chart embed is for viewing only. Signal calculations use verified MT5 broker data."
-          >
-            Chart view only · MT5 powers signals
-          </span>
-
-          {/* Auto-Scenario Focus Pill */}
-          {bestOpportunity && (
-            <button
-              onClick={handleSelectBestOpportunity}
-              className={`hidden md:flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold border transition-colors cursor-pointer ${
-                bestOpportunity.symbol === ticker.symbol
-                  ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30'
-                  : 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/30 hover:bg-amber-500/20'
-              }`}
-              title={
-                bestOpportunity.symbol === ticker.symbol
-                  ? `Active chart aligned with #1 best scenario (${bestOpportunity.symbol})`
-                  : `Click to focus #1 opportunity (${bestOpportunity.symbol}) in chart`
-              }
-            >
-              <Sparkles className="w-3 h-3 text-amber-500" />
-              <span>
-                {bestOpportunity.symbol === ticker.symbol ? '#1 Best Scenario Focused' : `Focus #1 ${bestOpportunity.symbol}`}
-              </span>
-            </button>
-          )}
-
-          {/* Timeframe selector (primarily for SMC mode or reference) */}
-          <div className="flex items-center bg-slate-200/70 dark:bg-[#0c0e12] p-0.5 rounded-lg border border-slate-200 dark:border-[#222938]">
+          {/* Segmented Timeframe Controls synced to tradingEngine */}
+          <div className="flex items-center bg-white dark:bg-[#0b111d] p-0.5 rounded-lg border border-slate-300 dark:border-[#2b3b59] font-mono">
             {timeframes.map(({ value, label }) => (
               <button
                 key={value}
+                type="button"
                 onClick={() => handleSelectTimeframe(value)}
                 aria-pressed={selectedTf === value}
-                className={`px-1.5 py-0.5 rounded text-[10px] sm:text-[11px] font-bold transition-all whitespace-nowrap cursor-pointer ${
+                className={`px-2 py-0.5 rounded text-[11px] font-bold transition-colors whitespace-nowrap cursor-pointer ${
                   selectedTf === value
-                    ? 'bg-slate-900 text-white dark:bg-white dark:text-slate-950 shadow-xs'
-                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                    ? 'bg-slate-900 text-white dark:bg-sky-500 dark:text-slate-950'
+                    : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
                 }`}
-                title={`Switch chart to ${label} timeframe`}
+                title={`Switch chart & engine timeframe to ${label}`}
               >
                 {label}
               </button>
@@ -197,21 +150,20 @@ export const TradingViewWidget: React.FC<TradingViewWidgetProps> = memo(({
           </div>
         </div>
 
-        {/* Right: Indicator Toggle Button & Controls */}
-        <div className="flex items-center gap-1.5 sm:gap-2">
-          {/* Main Indicators Toggle Button (Section: Indicators ON / OFF) */}
-          <div className="relative">
-            <div className="flex items-center rounded-lg border border-slate-200 dark:border-zinc-800 bg-slate-100 dark:bg-zinc-900 p-0.5">
+        {/* Right: Synced Indicator Toggle & Chart Actions */}
+        <div className="flex items-center gap-1.5">
+          <div className="relative" ref={menuRef}>
+            <div className="flex items-center rounded-lg border border-slate-300 dark:border-[#2b3b59] bg-white dark:bg-[#0b111d] p-0.5">
               <button
                 type="button"
-                onClick={() => setShowIndicators(!showIndicators)}
+                onClick={toggleShowIndicators}
                 aria-pressed={showIndicators}
-                className={`px-2 py-1 rounded-md text-[10px] sm:text-[11px] font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+                className={`px-2 py-1 rounded-md text-[11px] font-bold transition-colors flex items-center gap-1.5 cursor-pointer whitespace-nowrap ${
                   showIndicators
-                    ? 'bg-emerald-600 text-white shadow-xs'
-                    : 'text-slate-500 dark:text-zinc-400 hover:text-slate-900 dark:hover:text-white'
+                    ? 'bg-emerald-600 text-white'
+                    : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
                 }`}
-                title="Toggle technical & SMC indicators on or off"
+                title="Toggle TradingView studies & SMC level bar"
               >
                 {showIndicators ? <Eye className="w-3 h-3" /> : <EyeOff className="w-3 h-3" />}
                 <span>Indicators: {showIndicators ? 'ON' : 'OFF'}</span>
@@ -219,56 +171,95 @@ export const TradingViewWidget: React.FC<TradingViewWidgetProps> = memo(({
 
               <button
                 type="button"
-                onClick={() => setShowConfigMenu(!showConfigMenu)}
-                className="px-1.5 py-1 text-slate-500 hover:text-slate-900 dark:text-zinc-400 dark:hover:text-white transition-colors cursor-pointer"
-                title="Customize individual indicator overlays"
+                onClick={() => setShowConfigMenu((v) => !v)}
+                aria-expanded={showConfigMenu}
+                className="px-1.5 py-1 text-slate-500 hover:text-slate-900 dark:text-slate-300 dark:hover:text-white transition-colors cursor-pointer"
+                title="Configure chart studies & SMC levels"
               >
                 <ChevronDown className="w-3 h-3" />
               </button>
             </div>
 
-            {/* Indicator Config Dropdown Popover */}
             {showConfigMenu && (
-              <div className="absolute right-0 top-full mt-1.5 z-50 w-52 rounded-xl border border-slate-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-2.5 shadow-xl font-mono text-[11px] space-y-1.5">
-                <div className="font-bold text-slate-900 dark:text-white pb-1 border-b border-slate-100 dark:border-zinc-800 flex items-center justify-between">
-                  <span>SMC Indicators</span>
-                  <button
-                    onClick={() => setShowConfigMenu(false)}
-                    className="text-[10px] text-zinc-400 hover:text-zinc-200"
-                  >
-                    Done
-                  </button>
-                </div>
-                {(
-                  [
-                    { key: 'orderBlocks', label: 'Order Blocks (OB)' },
-                    { key: 'fairValueGaps', label: 'Fair Value Gaps (FVG)' },
-                    { key: 'structure', label: 'Structure (BOS/CHoCH)' },
-                    { key: 'signals', label: 'Signal POI Targets' },
-                    { key: 'trades', label: 'Live Active Trades' },
-                  ] as const
-                ).map(({ key, label }) => (
-                  <label
-                    key={key}
-                    className="flex items-center justify-between gap-2 p-1 rounded hover:bg-slate-50 dark:hover:bg-zinc-800/60 cursor-pointer text-slate-700 dark:text-zinc-300"
-                  >
-                    <span>{label}</span>
+              <div className="absolute right-0 top-full mt-1.5 z-50 w-60 rounded-xl ws-surface border p-3 shadow-2xl text-[11px] space-y-2.5">
+                <div className="space-y-1">
+                  <div className="font-extrabold text-slate-900 dark:text-white pb-1 border-b border-slate-200 dark:border-[#2b3b59] flex items-center justify-between">
+                    <span>Chart Indicators (TV)</span>
+                    <button
+                      type="button"
+                      onClick={() => setShowConfigMenu(false)}
+                      className="text-[11px] font-semibold text-sky-600 dark:text-sky-400 cursor-pointer"
+                    >
+                      Done
+                    </button>
+                  </div>
+                  {(
+                    [
+                      { key: 'tvEma', label: 'Exponential MA (EMA)' },
+                      { key: 'tvVwap', label: 'Session VWAP' },
+                      { key: 'tvRsi', label: 'Relative Strength (RSI)' },
+                    ] as const
+                  ).map(({ key, label }) => (
+                    <label
+                      key={key}
+                      className="flex items-center justify-between gap-2 p-1 rounded hover:bg-slate-100 dark:hover:bg-[#1e2d48] cursor-pointer text-slate-700 dark:text-slate-200 font-semibold"
+                    >
+                      <span>{label}</span>
+                      <input
+                        type="checkbox"
+                        checked={Boolean(indicatorConfig[key])}
+                        onChange={() => handleToggleLayer(key)}
+                        className="rounded border-slate-400 text-sky-500 focus:ring-sky-500"
+                      />
+                    </label>
+                  ))}
+                  <label className="flex items-center justify-between gap-2 p-1 rounded hover:bg-slate-100 dark:hover:bg-[#1e2d48] cursor-pointer text-slate-700 dark:text-slate-200 font-semibold">
+                    <span>MACD</span>
                     <input
                       type="checkbox"
-                      checked={indicatorConfig[key]}
-                      onChange={() => toggleIndicatorItem(key)}
-                      className="rounded border-zinc-700 text-sky-500 focus:ring-sky-500"
+                      checked={macdEnabled}
+                      onChange={() => setMacdEnabled((enabled) => !enabled)}
+                      className="rounded border-slate-400 text-sky-500 focus:ring-sky-500"
                     />
                   </label>
-                ))}
+                </div>
+
+                <div className="space-y-1">
+                  <div className="font-extrabold text-slate-900 dark:text-white pb-1 border-b border-slate-200 dark:border-[#2b3b59]">
+                    System SMC Levels
+                  </div>
+                  {(
+                    [
+                      { key: 'orderBlocks', label: 'Order Blocks (OB)' },
+                      { key: 'fairValueGaps', label: 'Fair Value Gaps (FVG)' },
+                      { key: 'structure', label: 'Structure (BOS / CHoCH)' },
+                      { key: 'signals', label: 'Signal POI Levels' },
+                      { key: 'trades', label: 'Open Trade Markers' },
+                    ] as const
+                  ).map(({ key, label }) => (
+                    <label
+                      key={key}
+                      className="flex items-center justify-between gap-2 p-1 rounded hover:bg-slate-100 dark:hover:bg-[#1e2d48] cursor-pointer text-slate-700 dark:text-slate-200 font-semibold"
+                    >
+                      <span>{label}</span>
+                      <input
+                        type="checkbox"
+                        checked={Boolean(indicatorConfig[key])}
+                        onChange={() => handleToggleLayer(key)}
+                        className="rounded border-slate-400 text-sky-500 focus:ring-sky-500"
+                      />
+                    </label>
+                  ))}
+                </div>
               </div>
             )}
           </div>
 
           {onOpenHelp && (
             <button
+              type="button"
               onClick={onOpenHelp}
-              className="p-1 rounded text-zinc-400 hover:text-zinc-950 dark:hover:text-white transition-colors"
+              className="p-1.5 rounded text-slate-500 hover:text-slate-950 dark:text-slate-300 dark:hover:text-white transition-colors cursor-pointer"
               title="View SMC abbreviations and strategy guide"
             >
               <HelpCircle className="w-3.5 h-3.5" />
@@ -276,18 +267,20 @@ export const TradingViewWidget: React.FC<TradingViewWidgetProps> = memo(({
           )}
 
           <button
+            type="button"
             onClick={() => setChartKey((key) => key + 1)}
-            title="Refresh chart view"
-            className="p-1 rounded text-zinc-400 hover:text-zinc-950 dark:hover:text-white transition-colors cursor-pointer"
+            title="Reload chart"
+            className="p-1.5 rounded text-slate-500 hover:text-slate-950 dark:text-slate-300 dark:hover:text-white transition-colors cursor-pointer"
           >
             <RefreshCw className="w-3.5 h-3.5" />
           </button>
 
           {onExpand && (
             <button
+              type="button"
               onClick={onExpand}
-              title="Full-screen chart workstation"
-              className="p-1 rounded text-zinc-400 hover:text-zinc-950 dark:hover:text-white transition-colors cursor-pointer"
+              title="Fullscreen chart"
+              className="p-1.5 rounded text-slate-500 hover:text-slate-950 dark:text-slate-300 dark:hover:text-white transition-colors cursor-pointer"
             >
               <Maximize2 className="w-3.5 h-3.5" />
             </button>
@@ -297,68 +290,46 @@ export const TradingViewWidget: React.FC<TradingViewWidgetProps> = memo(({
             href={`https://www.tradingview.com/symbols/${symbol.replace(':', '-')}/`}
             target="_blank"
             rel="noopener noreferrer"
-            title="Open symbol reference on official TradingView"
-            className="p-1 rounded text-zinc-400 hover:text-zinc-950 dark:hover:text-white transition-colors"
+            title="Open on TradingView"
+            className="p-1.5 rounded text-slate-500 hover:text-slate-950 dark:text-slate-300 dark:hover:text-white transition-colors"
           >
             <ExternalLink className="w-3.5 h-3.5" />
           </a>
         </div>
       </div>
 
-      {/* Top-Down Multi-Timeframe Alignment Radar Ribbon */}
-      <div className="px-3 sm:px-4 py-1.5 bg-slate-900/90 dark:bg-black/80 border-b border-slate-200 dark:border-zinc-800 flex items-center justify-between gap-2 overflow-x-auto text-xs font-mono">
-        <MTFConfluenceRadar
-          symbol={ticker.symbol as SupportedSymbol}
-          signal={market.signal}
-          compact={true}
+      {/* Main Chart Canvas Area (100% Unobstructed TradingView Toolbar & Candles) */}
+      <div
+        className={`w-full relative ${isDark ? 'bg-[#0f172a]' : 'bg-white'} overflow-hidden ${
+          isFullHeight ? 'flex-1 min-h-0' : 'shrink-0'
+        }`}
+        style={!isFullHeight && typeof height === 'number' ? { height: `${height}px` } : undefined}
+      >
+        <OfficialTradingViewEmbed
+          key={`tv-${chartKey}`}
+          symbol={symbol}
+          isDark={isDark}
+          interval={
+            selectedTf === 'M1'
+              ? '1'
+              : selectedTf === 'M5'
+              ? '5'
+              : selectedTf === 'M15'
+              ? '15'
+              : selectedTf === 'H4'
+              ? '240'
+              : '60'
+          }
+          height={typeof height === 'number' ? height : '100%'}
+          studies={tvStudies}
         />
-        <div className="hidden sm:flex items-center gap-2 text-[10px] text-zinc-400 font-mono">
-          <span>Dealing Range: <strong className={market.price_pos !== null && market.price_pos < 0.5 ? 'text-emerald-400' : 'text-amber-400'}>{market.price_pos !== null && market.price_pos < 0.5 ? 'Discount (<50%)' : 'Premium (>50%)'}</strong></span>
-        </div>
       </div>
 
-      {/* Main Chart Canvas Area */}
-      <div
-        className={`w-full relative bg-[#080d14] overflow-hidden ${
-          typeof height === 'string' ? 'flex-1 min-h-0' : 'shrink-0'
-        }`}
-        style={typeof height === 'number' ? { height: `${height}px` } : undefined}
-      >
-        {chartMode === 'tradingview' ? (
-          <>
-            <OfficialTradingViewEmbed
-              key={`tv-${symbol}-${selectedTf}-${chartKey}`}
-              symbol={symbol}
-              isDark={isDark}
-              interval={
-                selectedTf === 'M1'
-                  ? '1'
-                  : selectedTf === 'M5'
-                  ? '5'
-                  : selectedTf === 'M15'
-                  ? '15'
-                  : selectedTf === 'H4'
-                  ? '240'
-                  : '60'
-              }
-              height={typeof height === 'number' ? height : '100%'}
-            />
-            <SMCOverlayHUD
-              showIndicators={showIndicators}
-              indicatorConfig={indicatorConfig}
-              onSwitchToSMC={() => setChartMode('smc')}
-            />
-          </>
-        ) : (
-          <SMCInteractiveChart
-            key={`smc-${selectedTf}-${chartKey}`}
-            timeframe={selectedTf}
-            height={typeof height === 'number' ? height : 650}
-            showIndicators={showIndicators}
-            indicatorConfig={indicatorConfig}
-          />
-        )}
-      </div>
+      {/* System-Synced SMC Levels Bar cleanly below the chart */}
+      <SMCOverlayHUD
+        showIndicators={showIndicators}
+        indicatorConfig={indicatorConfig}
+      />
     </div>
   );
 });

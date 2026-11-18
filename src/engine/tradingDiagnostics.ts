@@ -1,4 +1,5 @@
 import type { Candle, ClosedTrade, PendingOrder, Position, SymbolTradingSpec } from '../types/smc';
+import type { SignalValidationRecord } from './signalValidation';
 
 export interface ClosedTradeMetrics {
   count: number;
@@ -114,4 +115,105 @@ export function estimatePortfolioStopRisk(
   }
 
   return { riskUsd, positionCount, pendingOrderCount, unknownCount };
+}
+
+export interface StrategyAttributionRow {
+  key: string;
+  group: 'strategy' | 'timeframe';
+  trades: number;
+  wins: number;
+  losses: number;
+  winRate: number | null;
+  netProfit: number;
+  profitFactor: number | null;
+  signalSamples: number;
+  signalWinRate: number | null;
+}
+
+export function inferTradeAttribution(trade: ClosedTrade): {
+  strategy: string;
+  timeframe: 'M1' | 'M5' | 'M15' | 'Unknown';
+} {
+  const haystack = `${trade.comment || ''} ${trade.strategyRationale || ''}`.toUpperCase();
+
+  let timeframe: 'M1' | 'M5' | 'M15' | 'Unknown' = 'Unknown';
+  if (/\bM15\b|\[M15\]|_M15\b|:M15\b/.test(haystack)) timeframe = 'M15';
+  else if (/\bM5\b|\[M5\]|_M5\b|:M5\b/.test(haystack)) timeframe = 'M5';
+  else if (/\bM1\b|\[M1\]|_M1\b|:M1\b/.test(haystack)) timeframe = 'M1';
+
+  let strategy = 'Manual / Broker';
+  if (haystack.includes('TREND PULLBACK') || haystack.includes('TREND_PULLBACK') || haystack.includes('PULLBACK')) {
+    strategy = 'Trend Pullback';
+  } else if (haystack.includes('VOLATILITY BREAKOUT') || haystack.includes('VOLATILITY_BREAKOUT') || haystack.includes('BREAKOUT')) {
+    strategy = 'Volatility Breakout';
+  } else if (haystack.includes('SMC') || haystack.includes('POI') || haystack.includes('SFP') || haystack.includes('FVG') || haystack.includes('OB')) {
+    strategy = 'SMC POI Retest';
+  }
+
+  return { strategy, timeframe };
+}
+
+export function summarizeStrategyAttribution(
+  trades: ClosedTrade[],
+  validations: SignalValidationRecord[]
+): {
+  byStrategy: StrategyAttributionRow[];
+  byTimeframe: StrategyAttributionRow[];
+} {
+  const closed = trades.filter(
+    (t) => (!t.status || t.status === 'CLOSED') && Number.isFinite(t.profit)
+  );
+
+  const buildRows = (
+    group: 'strategy' | 'timeframe',
+    keys: string[],
+    tradeSelector: (t: ClosedTrade) => string,
+    valSelector: (v: SignalValidationRecord) => string
+  ): StrategyAttributionRow[] => {
+    const dynamicKeys = new Set(keys);
+    for (const t of closed) dynamicKeys.add(tradeSelector(t));
+    for (const v of validations) dynamicKeys.add(valSelector(v));
+
+    return Array.from(dynamicKeys).map((key) => {
+      const matchedTrades = closed.filter((t) => tradeSelector(t) === key);
+      const wins = matchedTrades.filter((t) => t.profit > 0);
+      const losses = matchedTrades.filter((t) => t.profit < 0);
+      const grossWins = wins.reduce((s, t) => s + t.profit, 0);
+      const grossLosses = Math.abs(losses.reduce((s, t) => s + t.profit, 0));
+      const netProfit = matchedTrades.reduce((s, t) => s + t.profit, 0);
+
+      const matchedVals = validations.filter((v) => valSelector(v) === key);
+      const valHits = matchedVals.filter((v) => v.outcome === 'TARGET_HIT').length;
+      const valStops = matchedVals.filter((v) => v.outcome === 'STOP_HIT').length;
+      const valResolved = valHits + valStops;
+
+      return {
+        key,
+        group,
+        trades: matchedTrades.length,
+        wins: wins.length,
+        losses: losses.length,
+        winRate: matchedTrades.length > 0 ? (wins.length / matchedTrades.length) * 100 : null,
+        netProfit: Number(netProfit.toFixed(2)),
+        profitFactor: grossLosses > 0 ? grossWins / grossLosses : grossWins > 0 ? 99.9 : null,
+        signalSamples: matchedVals.length,
+        signalWinRate: valResolved > 0 ? (valHits / valResolved) * 100 : null,
+      };
+    });
+  };
+
+  return {
+    byStrategy: buildRows(
+      'strategy',
+      ['SMC POI Retest', 'Trend Pullback', 'Volatility Breakout'],
+      (t) => inferTradeAttribution(t).strategy,
+      (v) => v.strategy || 'SMC POI Retest'
+    ),
+    byTimeframe: buildRows(
+      'timeframe',
+      ['M1', 'M5', 'M15'],
+      (t) => inferTradeAttribution(t).timeframe,
+      (v) => v.timeframe || 'M5'
+    ),
+  };
 }

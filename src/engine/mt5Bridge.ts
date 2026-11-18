@@ -1,5 +1,6 @@
-import { Candle, ClosedTrade, EconomicEvent, InstrumentType, TradeDirection } from '../types/smc';
+import { Candle, ClosedTrade, EconomicEvent, InstrumentType, PendingOrder, TradeDirection, NewsSentimentItem } from '../types/smc';
 import type { SymbolRiskSpec } from './riskConfig';
+import { getSupportedSymbol } from './instrumentConfig';
 
 export interface BridgeAccountSnapshot {
   account: {
@@ -9,6 +10,7 @@ export interface BridgeAccountSnapshot {
     equity: number;
     margin_free: number;
     leverage?: number;
+    daily_start_balance?: number;
   };
   positions: Array<{
     ticket: number;
@@ -23,6 +25,7 @@ export interface BridgeAccountSnapshot {
     comment: string;
     time: string;
   }>;
+  pendingOrders?: PendingOrder[];
   symbol: string;
   instrumentType: InstrumentType;
   accountMode: 'demo' | 'live' | 'contest' | 'unknown';
@@ -47,6 +50,7 @@ export interface BridgeStatus {
   mode: 'standalone' | 'demo' | 'live' | 'contest' | 'unknown';
   latencyMs?: number | null;
   isReconnecting?: boolean;
+  isTailscale?: boolean;
 }
 
 const DEFAULT_SERVER_URL = 'http://127.0.0.1:8000';
@@ -65,6 +69,17 @@ export function normalizeLocalBridgeUrl(input: string): string {
     if (error instanceof Error && error.message.includes('PC-local')) throw error;
     throw new Error('Enter a valid local MT5 bridge URL, such as http://127.0.0.1:8000.');
   }
+}
+
+export function normalizeTailscaleUrl(input: string): string {
+  const trimmed = input.trim();
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+    return trimmed;
+  }
+  if (trimmed.startsWith('100.') || trimmed.includes('.ts.net') || trimmed.includes('127.0.0.1')) {
+    return `http://${trimmed}`;
+  }
+  return trimmed;
 }
 
 function isDashboardBridgeProxy(url: string): boolean {
@@ -110,12 +125,17 @@ export class MT5BridgeConnector {
       const auto = localStorage.getItem('smc_mt5_auto_connect');
       if (auto === 'true') {
         const savedSymbol = localStorage.getItem('smc_mt5_symbol');
-        if (savedSymbol) this.symbol = savedSymbol.trim();
+        if (savedSymbol && !getSupportedSymbol(savedSymbol)) {
+          localStorage.removeItem('smc_mt5_auto_connect');
+          this.lastError = `Saved MT5 symbol ${savedSymbol} is no longer supported. Choose XAUUSD, EURUSD, or GBPUSD to reconnect.`;
+        } else if (savedSymbol) {
+          this.symbol = savedSymbol.trim();
+        }
         const savedType = localStorage.getItem('smc_mt5_instrument_type') as InstrumentType;
         if (savedType) this.instrumentType = savedType;
         const savedLogin = localStorage.getItem('smc_mt5_login');
         const savedServer = localStorage.getItem('smc_mt5_server');
-        if (savedLogin && savedServer) {
+        if (savedLogin && savedServer && localStorage.getItem('smc_mt5_auto_connect') === 'true') {
           this.expectedAccount = { login: Number(savedLogin), server: savedServer };
           this.isConnected = true;
           this.isReconnecting = true;
@@ -158,6 +178,7 @@ export class MT5BridgeConnector {
   }
 
   getStatus(): BridgeStatus {
+    const isTailscale = this.serverUrl.includes('100.') || this.serverUrl.includes('.ts.net');
     return {
       connected: this.isConnected,
       serverUrl: this.serverUrl,
@@ -166,6 +187,7 @@ export class MT5BridgeConnector {
       mode: this.isConnected ? this.accountMode : 'standalone',
       latencyMs: this.lastLatencyMs,
       isReconnecting: this.isReconnecting,
+      isTailscale: isTailscale,
     };
   }
 
@@ -301,6 +323,9 @@ export class MT5BridgeConnector {
     },
     isAutoReconnect = false
   ): Promise<BridgeAccountSnapshot> {
+    if (!getSupportedSymbol(credentials.symbol)) {
+      throw new Error('Unsupported instrument. Choose XAUUSD, EURUSD, or GBPUSD.');
+    }
     if (credentials.token !== undefined) {
       this.setBridgeToken(credentials.token);
     }
@@ -414,6 +439,13 @@ export class MT5BridgeConnector {
     if (auto !== 'true') return false;
     const baseUrl = localStorage.getItem('smc_mt5_base_url') || getDefaultServerUrl();
     const symbol = localStorage.getItem('smc_mt5_symbol') || 'XAUUSD';
+    if (!getSupportedSymbol(symbol)) {
+      localStorage.removeItem('smc_mt5_auto_connect');
+      this.lastError = `Saved MT5 symbol ${symbol} is no longer supported. Choose XAUUSD, EURUSD, or GBPUSD to reconnect.`;
+      this.isReconnecting = false;
+      this.onConnectionChangeCallback?.(false, this.lastError);
+      return false;
+    }
     const instrumentType = (localStorage.getItem('smc_mt5_instrument_type') as InstrumentType) || 'standard';
     try {
       await this.connectAccount({ baseUrl, symbol, instrumentType }, true);
@@ -478,6 +510,9 @@ export class MT5BridgeConnector {
     instrumentType: InstrumentType;
     signalTimeframe: 'M1' | 'M5' | 'M15';
     signalTimestamp: string;
+    orderType?: 'MARKET' | 'LIMIT';
+    limitPrice?: number;
+    expirationMinutes?: number;
     magic?: number;
     forceExecute?: boolean;
     bypassCircuitBreaker?: boolean;
@@ -509,6 +544,7 @@ export class MT5BridgeConnector {
       pending: boolean;
       account: BridgeAccountSnapshot['account'];
       positions: BridgeAccountSnapshot['positions'];
+      pendingOrders?: PendingOrder[];
       symbol: BridgeAccountSnapshot['symbol'];
       accountMode: BridgeAccountSnapshot['accountMode'];
       tradingHalted: boolean;
@@ -547,6 +583,7 @@ export class MT5BridgeConnector {
     this.onDataCallback?.({
       account: response.account,
       positions: response.positions,
+      pendingOrders: response.pendingOrders,
       symbol: response.symbol,
       accountMode: response.accountMode,
       tradingHalted: response.tradingHalted,
@@ -570,6 +607,21 @@ export class MT5BridgeConnector {
       partial: response.partial,
       pending: response.pending,
     };
+  }
+
+  async cancelPendingOrder(ticket: number, symbol?: string): Promise<void> {
+    if (!this.expectedAccount || !this.isConnected) throw new Error('MT5 account identity is not verified.');
+    const snapshot = await this.request<BridgeAccountSnapshot>('/api/cancel-order', {
+      method: 'POST',
+      body: JSON.stringify({
+        ticket,
+        ...(symbol ? { symbol } : {}),
+        expectedLogin: this.expectedAccount.login,
+        expectedServer: this.expectedAccount.server,
+      }),
+    });
+    this.lastPing = Date.now();
+    this.onDataCallback?.({ ...snapshot, instrumentType: this.instrumentType });
   }
 
   async closePosition(ticket: number, volume?: number): Promise<void> {
@@ -689,15 +741,39 @@ export class MT5BridgeConnector {
     }
   }
 
+  public async refreshAccountHistory(): Promise<ClosedTrade[]> {
+    if (!this.isConnected || !this.expectedAccount) return [];
+    const accountSnap = { ...this.expectedAccount };
+    const trades = await this.request<ClosedTrade[]>(
+      `/api/history?days=365&symbol=ALL`,
+      {}
+    );
+    if (
+      this.expectedAccount &&
+      this.expectedAccount.login === accountSnap.login &&
+      this.expectedAccount.server === accountSnap.server
+    ) {
+      this.onClosedTradesCallback?.(Array.isArray(trades) ? trades : []);
+    }
+    return Array.isArray(trades) ? trades : [];
+  }
+
   private async refreshClosedTrades() {
-    if (!this.isConnected || this.closedTradesInFlight) return;
+    if (!this.isConnected || this.closedTradesInFlight || !this.expectedAccount) return;
     this.closedTradesInFlight = true;
+    const accountSnap = { ...this.expectedAccount };
     try {
       const trades = await this.request<ClosedTrade[]>(
-        '/api/history?days=180',
+        `/api/history?days=365&symbol=ALL`,
         {}
       );
-      this.onClosedTradesCallback?.(trades);
+      if (
+        this.expectedAccount &&
+        this.expectedAccount.login === accountSnap.login &&
+        this.expectedAccount.server === accountSnap.server
+      ) {
+        this.onClosedTradesCallback?.(Array.isArray(trades) ? trades : []);
+      }
     } catch (error) {
       console.error('[MT5 Bridge] Closed-trade history refresh failed:', error);
     } finally {
@@ -723,6 +799,32 @@ export class MT5BridgeConnector {
       console.warn(`[MT5 Bridge] Economic calendar unavailable; standard setups remain blocked: ${detail}`);
     } finally {
       this.calendarInFlight = false;
+    }
+  }
+
+  public async fetchLiveNews(): Promise<NewsSentimentItem[] | null> {
+    try {
+      const response = await this.request<{
+        available: boolean;
+        news: Array<{ id: string; title: string; summary: string; source: string; publishedAt: string; link?: string }>;
+      }>('/api/live-news', {});
+      if (!response.available || !Array.isArray(response.news)) {
+        return null;
+      }
+      return response.news.map((n) => ({
+        id: n.id,
+        title: n.title,
+        summary: n.summary,
+        source: n.source,
+        publishedAt: n.publishedAt,
+        link: n.link,
+        sentimentScore: 0,
+        urgency: 'BREAKING' as const,
+        catalystType: 'MARKET_FLOW' as const,
+        affectedAssets: ['USD'],
+      }));
+    } catch {
+      return null;
     }
   }
 

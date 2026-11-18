@@ -13,6 +13,18 @@ export const RISK_CONFIG = {
   samePoiCooldownMs: (config.samePoiCooldownMinutes ?? 0) * 60_000,
 } as const;
 
+export function isAdaptiveMicroFloorAllowed(equity: number, minimumLotRisk: number): boolean {
+  return (
+    RISK_CONFIG.adaptiveMicroFloorEnabled &&
+    Number.isFinite(equity) &&
+    equity > 0 &&
+    Number.isFinite(minimumLotRisk) &&
+    minimumLotRisk >= 0 &&
+    minimumLotRisk <= RISK_CONFIG.maxMicroFloorRiskDollar &&
+    minimumLotRisk <= equity * (RISK_CONFIG.maxMicroFloorRiskPercent / 100)
+  );
+}
+
 export function isWithinConfiguredNewsBlackout(date: Date): boolean {
   const parts = new Intl.DateTimeFormat('en-GB', {
     timeZone: config.newsBlackoutTimeZone,
@@ -61,14 +73,8 @@ export function calculateRiskBasedVolume(
     // Smart Adaptive Micro-Floor:
     // If raw volume is below broker minimum (e.g. 0.007 < 0.01L), don't block valid signals
     // on small or micro accounts if 0.01 lot dollar risk is <= $15.0 or <= 3.5% equity.
-    if (allowMicroFloor) {
-      const minLotDollarRisk = riskPerLot * spec.volumeMin;
-      const maxFloorDollar = (config as Record<string, unknown>).maxMicroFloorRiskDollar
-        ? Number((config as Record<string, unknown>).maxMicroFloorRiskDollar)
-        : 15.0;
-      if (minLotDollarRisk <= maxFloorDollar || (minLotDollarRisk / equity) * 100 <= 3.5) {
-        return spec.volumeMin;
-      }
+    if (allowMicroFloor && isAdaptiveMicroFloorAllowed(equity, riskPerLot * spec.volumeMin)) {
+      return spec.volumeMin;
     }
     return null;
   }

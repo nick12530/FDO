@@ -10,7 +10,8 @@ import type { ClosedTrade, Signal, Zone } from '../types/smc';
 const exampleSignal: Signal = {
   direction: 'BUY',
   timeframe: 'M15',
-  score: 5,
+  score: 50,
+  scoringPolicyVersion: 2,
   entry: 2300,
   sl: 2295,
   tp: 2310,
@@ -46,7 +47,7 @@ describe('trade journal helpers', () => {
   it('keeps signal confluence details in the recorded rationale', () => {
     expect(buildSignalRationale(exampleSignal)).toContain('Liquidity sweep and displacement confirmed.');
     expect(buildSignalRationale(exampleSignal)).toContain('Bullish structure break');
-    expect(buildSignalRationale(exampleSignal)).toContain('BUY M15 signal (score 5)');
+    expect(buildSignalRationale(exampleSignal)).toContain('BUY M15 signal (score 50)');
   });
 
   it('uses the device-local calendar date for closes', () => {

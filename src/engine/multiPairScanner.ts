@@ -1,6 +1,6 @@
 /**
  * multiPairScanner.ts - Multi-Pair Market Scanner, Common Confluence Signal Engine & Risk Manager
- * Analyzes XAUUSD, EURUSD, USDJPY, and GBPUSD independently with:
+ * Analyzes XAUUSD, EURUSD, and GBPUSD independently with:
  * - Live price, bid/ask, spread
  * - Multi-timeframe trend (M1, M5, M15, H1)
  * - Swings, BOS, CHoCH, liquidity highs/lows, FVGs, Order Blocks
@@ -22,6 +22,7 @@ import type {
   Swing,
   TradeDirection,
   Zone,
+  VolumeMetrics,
 } from '../types/smc';
 import { calculateATR, detectFVGs, detectOrderBlocks, MarketStructureEngine } from './smcCore';
 import { INSTRUMENTS, SupportedSymbol, getInstrumentConfig } from './instrumentConfig';
@@ -33,6 +34,12 @@ import {
   pairNewsBiasScore,
   type NewsMarketAnalysis,
 } from './newsAnalysis';
+import { calculateRVOL } from './volumeEngine';
+import { evaluateMacroSurpriseConfluence } from './macroSurpriseEngine';
+import { newsSentimentEngine } from './newsSentimentEngine';
+import { intermarketEngine } from './intermarketEngine';
+import { isAdaptiveMicroFloorAllowed } from './riskConfig';
+import { normalizeWeightedScore, SIGNAL_SCORING_POLICY_VERSION } from './scorePolicy';
 
 export interface LiquidityLevels {
   equalHighs: number[];
@@ -78,11 +85,17 @@ export interface PairAnalysis {
   newsStatus: string;
   newsBiasScore?: number;
   newsConfluenceNote?: string;
+  volumeMetrics?: VolumeMetrics;
+  macroBias?: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  sentimentBias?: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  sentimentScore?: number;
 
   // Signal & Score
   bias: 'BUY' | 'SELL' | 'WAITING';
   signal: Signal | null;
+  rawConfluenceScore: number;
   confluenceScore: number; // 0 to 100
+  scoringPolicyVersion: number;
   scoreBreakdown: {
     htfAlignment: number;      // max 20
     structureConfirm: number;  // max 20
@@ -93,6 +106,8 @@ export interface PairAnalysis {
     sessionConfirm: number;    // max 5
     spreadAcceptable: number;  // max 5
     candleConfirm?: number;    // max 5
+    volumeConfirm?: number;    // max 10
+    macroConfirm?: number;     // max 10
   };
   candlestickPattern?: CandlestickPatternMatch;
 
@@ -264,11 +279,35 @@ export function findLiquidityLevels(candles: Candle[], pipSize: number): Liquidi
   };
 }
 
+function detectMultiBarSweep(candles: Candle[], lookbackBars: number = 3): 'high' | 'low' | null {
+  if (candles.length < 12) return null;
+  const lastIdx = candles.length - 1;
+  const latest = candles[lastIdx];
+  const maxCheck = Math.min(Math.max(1, lookbackBars), Math.max(1, candles.length - 10));
+
+  for (let offset = 0; offset < maxCheck; offset++) {
+    const idx = lastIdx - offset;
+    const sweepCandle = candles[idx];
+    const prior = candles.slice(Math.max(0, idx - 30), idx);
+    if (prior.length === 0) continue;
+
+    const highest = Math.max(...prior.map((c) => c.high));
+    const lowest = Math.min(...prior.map((c) => c.low));
+
+    if (sweepCandle.high > highest && latest.close < highest && (offset === 0 || latest.close < latest.open)) {
+      return 'high';
+    }
+    if (sweepCandle.low < lowest && latest.close > lowest && (offset === 0 || latest.close > latest.open)) {
+      return 'low';
+    }
+  }
+  return null;
+}
+
 /**
  * Checks existing positions for cumulative USD exposure.
  * EURUSD BUY = short USD
  * GBPUSD BUY = short USD
- * USDJPY SELL = short USD
  * XAUUSD BUY = short USD
  */
 export function checkCorrelationExposure(
@@ -282,9 +321,8 @@ export function checkCorrelationExposure(
     if (s.includes('EURUSD') || s.includes('GBPUSD') || s.includes('XAUUSD')) {
       return dir === 'BUY' ? 'SHORT_USD' : 'LONG_USD';
     }
-    if (s.includes('USDJPY')) {
-      return dir === 'BUY' ? 'LONG_USD' : 'SHORT_USD';
-    }
+    // Include legacy USDJPY positions in exposure totals, though it is no longer tradeable here.
+    if (s.includes('USDJPY')) return dir === 'BUY' ? 'LONG_USD' : 'SHORT_USD';
     return null;
   };
 
@@ -364,8 +402,6 @@ export function calculateSmallAccountPositionSize(
     pipValuePerLot = (symbolSpec.tickValue / symbolSpec.tickSize) * config.pipSize;
     minLot = symbolSpec.volumeMin;
     lotStep = symbolSpec.volumeStep;
-  } else if (symbol === 'USDJPY') {
-    pipValuePerLot = 6.67;
   }
 
   const riskPerStandardLot = symbolSpec
@@ -373,7 +409,7 @@ export function calculateSmallAccountPositionSize(
     : (stopDistancePrice / config.pipSize) * pipValuePerLot;
   const riskPerMinLot = riskPerStandardLot * minLot;
 
-  if (riskPerMinLot > riskBudget) {
+  if (riskPerMinLot > riskBudget && !isAdaptiveMicroFloorAllowed(equity, riskPerMinLot)) {
     return {
       safeVolume: null,
       riskAmount: riskPerMinLot,
@@ -527,10 +563,14 @@ export function analyzeInstrument(
     scoreStructure = 10;
   }
 
-  // +15 Liquidity sweep
-  if (tentativeBias === 'BUY' && liquidity.recentSweep === 'low') {
+  // +15 Liquidity sweep (check both M15 and M5 3-bar sweep windows so multi-bar SFPs are caught)
+  const m15MultiSweep = detectMultiBarSweep(candlesM15, 3);
+  const m5MultiSweep = detectMultiBarSweep(candlesM5, 3);
+  const effectiveSweep = liquidity.recentSweep ?? m15MultiSweep ?? m5MultiSweep;
+
+  if (tentativeBias === 'BUY' && effectiveSweep === 'low') {
     scoreLiquidity = 15;
-  } else if (tentativeBias === 'SELL' && liquidity.recentSweep === 'high') {
+  } else if (tentativeBias === 'SELL' && effectiveSweep === 'high') {
     scoreLiquidity = 15;
   } else if (
     (tentativeBias === 'BUY' && liquidity.equalLows.length > 0) ||
@@ -553,12 +593,14 @@ export function analyzeInstrument(
   // +10 Order Block / FVG reaction in discount/premium
   const isRelevantZone = (zone: Zone) =>
     price >= zone.bottom - 0.25 * atr && price <= zone.top + 0.25 * atr;
-  const hasMatchingOb = obs.some(
+  const matchedObs = obs.filter(
     (ob) => (tentativeBias === 'BUY' ? ob.bullish : !ob.bullish) && isRelevantZone(ob)
   );
-  const hasMatchingFvg = fvgs.some(
+  const matchedFvgs = fvgs.filter(
     (fvg) => (tentativeBias === 'BUY' ? fvg.bullish : !fvg.bullish) && isRelevantZone(fvg)
   );
+  const hasMatchingOb = matchedObs.length > 0;
+  const hasMatchingFvg = matchedFvgs.length > 0;
   const isPricedRight = tentativeBias === 'BUY' ? premiumDiscountPct <= 55 : premiumDiscountPct >= 45;
 
   if (tentativeBias !== 'WAITING') {
@@ -606,16 +648,73 @@ export function analyzeInstrument(
     tentativeBias,
     liveNewsAnalysis
   );
-  const rawConfluence =
+
+  // 8b. Institutional Volume & RVOL Analysis (digits-calibrated for FX & XAUUSD)
+  const volMetrics = calculateRVOL(candlesM5.length > 0 ? candlesM5 : candlesM15, 20, config.digits);
+  let scoreVolume = 0;
+  if (volMetrics.rvol >= 2.0) scoreVolume = 10;
+  else if (volMetrics.rvol >= 1.4) scoreVolume = 6;
+  else if (volMetrics.rvol >= 1.0) scoreVolume = 3;
+
+  // 8c. Macroeconomic Surprise & Headline Sentiment Analysis
+  const macroConfluence = tentativeBias !== 'WAITING'
+    ? evaluateMacroSurpriseConfluence(symbol, tentativeBias, economicEvents)
+    : { scoreBonus: 0, macroBias: 'NEUTRAL' as const, postNewsDriftActive: false, reasons: [] };
+
+  const sentiment = newsSentimentEngine.evaluatePairSentiment(symbol);
+  let scoreMacro = 0;
+  if (macroConfluence.scoreBonus > 0) scoreMacro += 6;
+  else if (macroConfluence.scoreBonus < 0) scoreMacro -= 8;
+
+  if (
+    (tentativeBias === 'BUY' && sentiment.sentimentBias === 'BULLISH') ||
+    (tentativeBias === 'SELL' && sentiment.sentimentBias === 'BEARISH')
+  ) {
+    scoreMacro += 4;
+  }
+  scoreMacro = Math.max(0, Math.min(10, scoreMacro));
+
+  const rawConfluenceScore =
     scoreHtf + scoreStructure + scoreLiquidity + scoreBosChoch + scoreObFvg +
-    scoreMomentum + scoreSession + scoreSpread + scoreCandle;
+    scoreMomentum + scoreSession + scoreSpread + scoreCandle + scoreVolume + scoreMacro;
   const confluenceScore = Math.max(
     0,
-    Math.min(100, rawConfluence + newsSignalDecision.scoreAdjustment)
+    Math.min(
+      100,
+      normalizeWeightedScore(rawConfluenceScore) + newsSignalDecision.scoreAdjustment
+    )
   );
 
-  // 9. Stop Loss & Multi-Target Take Profit (Structure-based for Maximum Pips)
-  const slBuffer = atr * 0.3;
+  // Determine active execution timeframe (M15 swing, M1 fast scalp on tight spreads, or M5 baseline)
+  const isM15Setup =
+    ((tentativeBias === 'BUY' && m15Trend === 'bullish') ||
+      (tentativeBias === 'SELL' && m15Trend === 'bearish')) &&
+    scoreHtf >= 15;
+  const lastM1Event = msM1.events.at(-1);
+  const m1EventAge = lastM1Event ? Math.max(0, candlesM1.length - 1 - lastM1Event.bar) : 999;
+  const isM1ScalpSetup =
+    !isM15Setup &&
+    ((tentativeBias === 'BUY' && m1Trend === 'bullish') ||
+      (tentativeBias === 'SELL' && m1Trend === 'bearish')) &&
+    m1EventAge <= 6 &&
+    spreadAcceptable &&
+    spreadPoints <= config.maxSpreadPoints * 0.75;
+  const signalTimeframe: 'M1' | 'M5' | 'M15' = isM15Setup ? 'M15' : isM1ScalpSetup ? 'M1' : 'M5';
+
+  // 9. Stop Loss & Multi-Target Take Profit (Timeframe-calibrated for M1/M5 scalping & M15 swings)
+  const atrM1 = calculateATR(candlesM1, config.atrPeriod).at(-1);
+  const execAtr =
+    signalTimeframe === 'M1' && Number.isFinite(atrM1) && (atrM1 as number) > 0
+      ? (atrM1 as number)
+      : signalTimeframe === 'M5' && Number.isFinite(atrM5) && atrM5 > 0
+      ? atrM5
+      : atr;
+  const slBuffer = execAtr * 0.3;
+  const slFloorPips = signalTimeframe === 'M1' ? 4 : 5;
+  const mult1 = signalTimeframe === 'M1' ? 1.2 : signalTimeframe === 'M5' ? 1.5 : 1.8;
+  const mult2 = signalTimeframe === 'M1' ? 2.0 : signalTimeframe === 'M5' ? 2.5 : Math.max(3.2, config.minRR * 1.5);
+  const mult3 = signalTimeframe === 'M1' ? 3.2 : signalTimeframe === 'M5' ? 4.0 : Math.max(5.5, config.minRR * 2.8);
+
   let suggestedSL = price;
   let suggestedTP = price;
   let suggestedTP1 = price;
@@ -623,21 +722,23 @@ export function analyzeInstrument(
   let suggestedTP3 = price;
 
   if (tentativeBias === 'BUY') {
-    const swingLowPrice = msM5.lastSwingLow?.price || dr.low;
-    suggestedSL = Number(Math.min(price - atr * config.atrSlMultiplier, swingLowPrice - slBuffer).toFixed(config.digits));
-    const slDist = Math.max(config.pipSize * 5, price - suggestedSL);
-    suggestedTP1 = Number((price + slDist * 1.8).toFixed(config.digits));
-    suggestedTP2 = Number((price + slDist * Math.max(3.2, config.minRR * 1.5)).toFixed(config.digits));
-    suggestedTP3 = Number((price + slDist * Math.max(5.5, config.minRR * 2.8)).toFixed(config.digits));
-    suggestedTP = suggestedTP2; // Primary targets high-pip 3.2R expansion
+    const anchorMs = signalTimeframe === 'M1' ? msM1 : msM5;
+    const swingLowPrice = anchorMs.lastSwingLow?.price || dr.low;
+    suggestedSL = Number(Math.min(price - execAtr * config.atrSlMultiplier, swingLowPrice - slBuffer).toFixed(config.digits));
+    const slDist = Math.max(config.pipSize * slFloorPips, price - suggestedSL);
+    suggestedTP1 = Number((price + slDist * mult1).toFixed(config.digits));
+    suggestedTP2 = Number((price + slDist * mult2).toFixed(config.digits));
+    suggestedTP3 = Number((price + slDist * mult3).toFixed(config.digits));
+    suggestedTP = suggestedTP2;
   } else if (tentativeBias === 'SELL') {
-    const swingHighPrice = msM5.lastSwingHigh?.price || dr.high;
-    suggestedSL = Number(Math.max(price + atr * config.atrSlMultiplier, swingHighPrice + slBuffer).toFixed(config.digits));
-    const slDist = Math.max(config.pipSize * 5, suggestedSL - price);
-    suggestedTP1 = Number((price - slDist * 1.8).toFixed(config.digits));
-    suggestedTP2 = Number((price - slDist * Math.max(3.2, config.minRR * 1.5)).toFixed(config.digits));
-    suggestedTP3 = Number((price - slDist * Math.max(5.5, config.minRR * 2.8)).toFixed(config.digits));
-    suggestedTP = suggestedTP2; // Primary targets high-pip 3.2R expansion
+    const anchorMs = signalTimeframe === 'M1' ? msM1 : msM5;
+    const swingHighPrice = anchorMs.lastSwingHigh?.price || dr.high;
+    suggestedSL = Number(Math.max(price + execAtr * config.atrSlMultiplier, swingHighPrice + slBuffer).toFixed(config.digits));
+    const slDist = Math.max(config.pipSize * slFloorPips, suggestedSL - price);
+    suggestedTP1 = Number((price - slDist * mult1).toFixed(config.digits));
+    suggestedTP2 = Number((price - slDist * mult2).toFixed(config.digits));
+    suggestedTP3 = Number((price - slDist * mult3).toFixed(config.digits));
+    suggestedTP = suggestedTP2;
   }
 
   const stopDistance = Math.abs(price - suggestedSL);
@@ -683,7 +784,7 @@ export function analyzeInstrument(
     } else if (newsSignalDecision.statusHint === 'BLOCKED') {
       status = 'BLOCKED';
       rejectionReason = `TRADE_REJECTED: ${newsSignalDecision.reason || 'LIVE_NEWS_CONFLICT'}`;
-    } else if (!correlationResult.allowed && (confluenceScore < 70 && (confluenceScore > 10 || confluenceScore < 7.0))) {
+    } else if (!correlationResult.allowed && confluenceScore < 70) {
       status = 'BLOCKED';
       rejectionReason = correlationResult.reason || 'TRADE_REJECTED: CORRELATION_LIMIT_EXCEEDED';
     } else if (sizingResult.rejectionReason) {
@@ -694,18 +795,18 @@ export function analyzeInstrument(
     }
   }
 
-  // 11. Timeframe selection (M15 scanning prioritized for maximum pips)
-  const isM15Setup =
-    ((tentativeBias === 'BUY' && m15Trend === 'bullish') ||
-      (tentativeBias === 'SELL' && m15Trend === 'bearish')) &&
-    scoreHtf >= 15;
-  const signalTimeframe: 'M1' | 'M5' | 'M15' = isM15Setup ? 'M15' : 'M5';
-  const validityDurationMs = signalTimeframe === 'M15' ? 15 * 60_000 : 5 * 60_000;
+  // 11. Expiry & Institutional POI-anchored OTE
+  const validityDurationMs = signalTimeframe === 'M15' ? 15 * 60_000 : signalTimeframe === 'M5' ? 5 * 60_000 : 90_000;
   const signalCandle = signalTimeframe === 'M15'
     ? candlesM15[candlesM15.length - 1]
+    : signalTimeframe === 'M1'
+    ? candlesM1[candlesM1.length - 1]
     : candlesM5[candlesM5.length - 1];
   const rawCandleTime = signalCandle?.time ?? Date.now();
   const signalCandleTime = rawCandleTime < 1_000_000_000_000 ? rawCandleTime * 1000 : rawCandleTime;
+  const signalCandleDurationMs =
+    signalTimeframe === 'M15' ? 15 * 60_000 : signalTimeframe === 'M5' ? 5 * 60_000 : 60_000;
+  const signalGeneratedAt = new Date().toISOString();
   const expiryTimestamp = signalCandleTime + validityDurationMs * 2;
   if (status === 'READY' && expiryTimestamp <= Date.now()) {
     status = 'BLOCKED';
@@ -715,14 +816,32 @@ export function analyzeInstrument(
   const isSniper = confluenceScore >= 70 && (scoreLiquidity >= 10 || scoreObFvg >= 5);
   const sniperQualityIndex = confluenceScore;
   const sniperGrade: 'A+' | 'A' | 'B' = confluenceScore >= 88 ? 'A+' : confluenceScore >= 75 ? 'A' : 'B';
+
+  // Anchor Optimal Trade Entry to nearest matching FVG 50% CE or OB proximal edge when within 2 ATR
+  const dirMatchObs = obs.filter((ob) => tentativeBias === 'BUY' ? ob.bullish : !ob.bullish);
+  const dirMatchFvgs = fvgs.filter((fvg) => tentativeBias === 'BUY' ? fvg.bullish : !fvg.bullish);
+  const nearestPoi = [...matchedFvgs, ...matchedObs, ...dirMatchFvgs, ...dirMatchObs]
+    .sort((a, b) => Math.abs((a.top + a.bottom) / 2 - price) - Math.abs((b.top + b.bottom) / 2 - price))[0];
+  const poiAnchorPrice = nearestPoi
+    ? nearestPoi.kind === 'FVG'
+      ? (nearestPoi.bottom + nearestPoi.top) / 2
+      : nearestPoi.bullish
+        ? nearestPoi.top
+        : nearestPoi.bottom
+    : null;
+
   const swingLow = msM5.lastSwingLow?.price || dr.low;
   const swingHigh = msM5.lastSwingHigh?.price || dr.high;
   const legSpan = Math.max(config.pipSize * 10, swingHigh - swingLow);
-  const oteBuy = swingLow + 0.382 * legSpan; // 61.8% retracement into discount sweet spot
-  const oteSell = swingLow + 0.618 * legSpan; // 61.8% retracement into premium sweet spot
-  const optimalTradeEntry = tentativeBias === 'BUY'
-    ? Number(oteBuy.toFixed(config.digits))
-    : Number(oteSell.toFixed(config.digits));
+  const oteBuy = swingLow + 0.382 * legSpan;
+  const oteSell = swingLow + 0.618 * legSpan;
+  const rawOptimalTradeEntry =
+    poiAnchorPrice !== null && Math.abs(price - poiAnchorPrice) <= atr * 2
+      ? poiAnchorPrice
+      : tentativeBias === 'BUY'
+        ? oteBuy
+        : oteSell;
+  const optimalTradeEntry = Number(rawOptimalTradeEntry.toFixed(config.digits));
   const mitigationType = scoreLiquidity >= 10 ? 'Liquidity Pool Sweep (SFP)' : scoreObFvg >= 5 ? 'Order Block Mitigation' : 'Structural POI Retest';
 
   // 12. Create Signal object if ready
@@ -731,6 +850,7 @@ export function analyzeInstrument(
     const reasons: string[] = [];
     if (scoreHtf >= 15) reasons.push(`HTF ${h1Trend.toUpperCase()} Trend Alignment (+${scoreHtf})`);
     if (isM15Setup) reasons.push(`M15 Swing Entry Alignment (+15)`);
+    else if (isM1ScalpSetup) reasons.push(`M1 Precision Scalp Displacement (+15)`);
     if (scoreStructure >= 15) reasons.push(`M5 Structure Confirmation (+${scoreStructure})`);
     if (scoreLiquidity >= 10) reasons.push(`Liquidity Pool Sweep (+${scoreLiquidity})`);
     if (scoreBosChoch >= 5) reasons.push(`Recent aligned BOS/CHoCH (+${scoreBosChoch})`);
@@ -742,7 +862,12 @@ export function analyzeInstrument(
     signalObj = {
       direction: tentativeBias,
       timeframe: signalTimeframe,
-      score: Number((confluenceScore / 10).toFixed(1)),
+      score: confluenceScore,
+      scoringPolicyVersion: SIGNAL_SCORING_POLICY_VERSION,
+      generatedAt: signalGeneratedAt,
+      availableAt: signalGeneratedAt,
+      sourceCandleOpenTime: signalCandleTime,
+      sourceCandleCloseTime: signalCandleTime + signalCandleDurationMs,
       entry: Number(price.toFixed(config.digits)),
       sl: suggestedSL,
       tp: suggestedTP,
@@ -760,15 +885,17 @@ export function analyzeInstrument(
       sniperQualityIndex,
       sniperGrade,
       optimalTradeEntry,
+      executionMode: Math.abs(price - optimalTradeEntry) > execAtr * 0.25 ? 'PULLBACK_LIMIT' : 'MARKET',
       mitigationType,
       recommendedLot: sizingResult.safeVolume || undefined,
       reasons,
-      atr,
+      atr: execAtr,
       timestamp: new Date(Math.min(signalCandleTime, Date.now())).toISOString(),
       actionReason: `${symbol} ${tentativeBias} (${confluenceScore}/100 Confluence) - 1:${riskRewardRatio} RR · Targets: TP1 (${targetPips1}p), TP2 (${targetPips2}p), TP3 (${targetPips3}p)`,
       perfectEntryReason: `SMC ${signalTimeframe} ${tentativeBias} confluence with ${reasons.slice(0, 2).join(' + ')}`,
       strategy: 'SMC POI Retest',
       candlestickPattern: candlePattern,
+      volumeMetrics: volMetrics,
     };
 
   }
@@ -804,9 +931,15 @@ export function analyzeInstrument(
       (newsRisk.isDataUnavailable ? 'NEWS FILTER: DATA UNAVAILABLE' : 'Normal Conditions'),
     newsBiasScore: headlineLean,
     newsConfluenceNote: newsSignalDecision.reason,
+    volumeMetrics: volMetrics,
+    macroBias: macroConfluence.macroBias,
+    sentimentBias: sentiment.sentimentBias,
+    sentimentScore: sentiment.sentimentScore,
     bias: tentativeBias,
     signal: signalObj,
+    rawConfluenceScore,
     confluenceScore,
+    scoringPolicyVersion: SIGNAL_SCORING_POLICY_VERSION,
     scoreBreakdown: {
       htfAlignment: scoreHtf,
       structureConfirm: scoreStructure,
@@ -817,6 +950,8 @@ export function analyzeInstrument(
       sessionConfirm: scoreSession,
       spreadAcceptable: scoreSpread,
       candleConfirm: scoreCandle,
+      volumeConfirm: scoreVolume,
+      macroConfirm: scoreMacro,
     },
     candlestickPattern: candlePattern,
     entryPrice: Number(price.toFixed(config.digits)),
@@ -845,12 +980,12 @@ export function analyzeInstrument(
     rank: 4, // assigned below in rankOpportunities
   };
 
-  if (analysis.signal && isPrecisionEntryReady(analysis)) {
+  if (analysis.signal && (isPrecisionEntryReady(analysis) || (analysis.status === 'READY' && analysis.spreadAcceptable))) {
     void dispatchSniperAlert({
       symbol,
       direction: analysis.signal.direction,
       timeframe: signalTimeframe,
-      strategy: 'SMC POI Retest',
+      strategy: analysis.signal.strategy || 'SMC POI Retest',
       entry: Number(price.toFixed(config.digits)),
       sl: suggestedSL,
       tp1: suggestedTP1,
@@ -862,8 +997,9 @@ export function analyzeInstrument(
       tp3Pips: targetPips3,
       confluenceScore,
       recommendedLot: sizingResult.safeVolume || undefined,
+      isSniper,
       sniperGrade,
-      optimalTradeEntry,
+      optimalTradeEntry: optimalTradeEntry || Number(price.toFixed(config.digits)),
       triggerPattern: candlePattern.name !== 'Neutral Price Action' ? candlePattern.name : undefined,
       validUntil: expiryTimestamp,
     });
