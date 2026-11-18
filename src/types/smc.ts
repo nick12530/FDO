@@ -103,7 +103,12 @@ export interface Signal {
   strategy?: 'SMC POI Retest' | 'Trend Pullback' | 'Volatility Breakout';
   direction: TradeDirection;
   timeframe: 'M1' | 'M5' | 'M15';
-  score: number;
+  score: number; // Normalized score from 0 to 100 under scoringPolicyVersion
+  scoringPolicyVersion: number;
+  generatedAt: string;
+  availableAt: string;
+  sourceCandleOpenTime: number;
+  sourceCandleCloseTime: number;
   entry: number;
   sl: number;
   tp: number;

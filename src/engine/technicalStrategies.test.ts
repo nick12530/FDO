@@ -70,7 +70,7 @@ describe('multi-strategy technical signals', () => {
 
     expect(pullback).toEqual(expect.objectContaining({
       direction: 'BUY',
-      score: 6.2,
+      score: 62,
     }));
     expect(pullback?.reasons).toContain(
       'Higher-timeframe trend is neutral; execution-timeframe confirmation supports this candidate.'
@@ -131,7 +131,7 @@ describe('multi-strategy technical signals', () => {
     expect(signals).toContainEqual(expect.objectContaining({
       strategy: 'Volatility Breakout',
       direction: 'BUY',
-      score: 6.2,
+      score: 62,
     }));
   });
 
@@ -162,7 +162,7 @@ describe('multi-strategy technical signals', () => {
     );
     const breakout = signals.find((signal) => signal.strategy === 'Volatility Breakout');
 
-    expect(breakout).toEqual(expect.objectContaining({ direction: 'BUY', score: 5.8 }));
+    expect(breakout).toEqual(expect.objectContaining({ direction: 'BUY', score: 58 }));
     expect(breakout?.reasons).toContain(
       'Higher-timeframe trend disagrees; watch-only candidate below the automatic-execution score threshold.'
     );

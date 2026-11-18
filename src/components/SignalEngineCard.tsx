@@ -133,8 +133,6 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
     }
     if (!rawSig) return;
     try {
-      const normalizedConfluence =
-        rawSig.score <= 10 ? Math.round(rawSig.score * 10) : Math.round(rawSig.score);
       const res = await dispatchLiveSignalAlert({
         symbol: ticker.symbol as SupportedSymbol,
         direction: rawSig.direction,
@@ -143,7 +141,7 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
         entry: rawSig.entry,
         sl: rawSig.sl,
         tp: rawSig.tp,
-        confluenceScore: normalizedConfluence,
+        confluenceScore: rawSig.score,
         lotSize: riskLimitedLotSize ?? lotSize,
         force: true,
       });
@@ -253,7 +251,7 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
         <div className="flex items-center gap-1.5 shrink-0">
           {rawSig && (
             <span className="font-mono text-xs font-bold text-slate-900 dark:text-white tabular-nums mr-1">
-              {(rawSig.score <= 10 ? rawSig.score : rawSig.score / 10).toFixed(1)}/10
+              {rawSig.score.toFixed(1)}/100
             </span>
           )}
           <button
@@ -334,7 +332,7 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
                         : 'ws-subtle text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
                     }`}
                   >
-                    {sigItem.timeframe} · {sigItem.direction} · {(sigItem.score <= 10 ? sigItem.score : sigItem.score / 10).toFixed(1)}
+                    {sigItem.timeframe} · {sigItem.direction} · {sigItem.score.toFixed(1)}/100
                   </button>
                 );
               })}

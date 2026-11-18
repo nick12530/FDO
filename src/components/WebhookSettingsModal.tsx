@@ -113,7 +113,7 @@ export const WebhookSettingsModal: React.FC<WebhookSettingsModalProps> = ({ isOp
         entry: market.signal.entry,
         sl: market.signal.sl,
         tp: market.signal.tp,
-        confluenceScore: Math.round(market.signal.score * 10),
+        confluenceScore: market.signal.score,
       };
     }
 

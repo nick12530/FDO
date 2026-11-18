@@ -11,6 +11,10 @@ const record: SignalValidationRecord = {
   id: 'XAUUSD-M5-1',
   createdAt: new Date(sourceTime).toISOString(),
   sourceCandleTime: sourceTime,
+  generatedAt: new Date(sourceTime).toISOString(),
+  availableAt: new Date(sourceTime).toISOString(),
+  sourceCandleOpenTime: sourceTime,
+  sourceCandleCloseTime: sourceTime,
   expiresAt: sourceTime + 5 * 60_000,
   symbol: 'XAUUSD',
   direction: 'BUY',
@@ -61,6 +65,30 @@ describe('prospective signal validation', () => {
   it('does not consume the still-forming one-minute candle', () => {
     const formingTrigger = candle(sourceTime + 60_000, 99, 101);
     const unchanged = advanceSignalValidation(record, [formingTrigger], sourceTime + 90_000);
+    expect(unchanged.outcome).toBe('WATCHING');
+    expect(unchanged.triggeredAt).toBeUndefined();
+  });
+
+  it('does not credit trigger or target movement before the signal was discovered', () => {
+    const discoveredAt = Date.parse('2026-10-21T12:05:00Z');
+    const discovered = {
+      ...record,
+      createdAt: new Date(discoveredAt).toISOString(),
+      generatedAt: new Date(discoveredAt).toISOString(),
+      availableAt: new Date(discoveredAt).toISOString(),
+      expiresAt: discoveredAt + 5 * 60_000,
+      sourceCandleOpenTime: sourceTime,
+      sourceCandleCloseTime: discoveredAt,
+    };
+    const earlyTrigger = candle(Date.parse('2026-10-21T12:01:00Z'), 99, 101);
+    const earlyTarget = candle(Date.parse('2026-10-21T12:02:00Z'), 99, 111);
+
+    const unchanged = advanceSignalValidation(
+      discovered,
+      [earlyTrigger, earlyTarget],
+      Date.parse('2026-10-21T12:06:01Z')
+    );
+
     expect(unchanged.outcome).toBe('WATCHING');
     expect(unchanged.triggeredAt).toBeUndefined();
   });

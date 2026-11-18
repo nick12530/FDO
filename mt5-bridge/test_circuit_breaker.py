@@ -1,13 +1,14 @@
 import unittest
 import sqlite3
 import tempfile
+from contextlib import closing
 from pathlib import Path
 
 class TestCircuitBreakerState(unittest.TestCase):
     def setUp(self):
-        self.temp_db = tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False)
-        self.db_path = Path(self.temp_db.name)
-        with sqlite3.connect(self.db_path) as conn:
+        with tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False) as temp_db:
+            self.db_path = Path(temp_db.name)
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS control_state (
@@ -21,13 +22,10 @@ class TestCircuitBreakerState(unittest.TestCase):
             )
 
     def tearDown(self):
-        try:
-            self.db_path.unlink()
-        except Exception:
-            pass
+        self.db_path.unlink()
 
     def test_default_circuit_breaker_enabled(self):
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             row = conn.execute(
                 "SELECT state_value FROM control_state WHERE state_key = 'circuit_breaker_enabled'"
             ).fetchone()
@@ -36,7 +34,7 @@ class TestCircuitBreakerState(unittest.TestCase):
 
     def test_toggle_circuit_breaker_disabled_and_enabled(self):
         # 1. Disable
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute(
                 "INSERT OR REPLACE INTO control_state (state_key, state_value) VALUES ('circuit_breaker_enabled', 'false')"
             )
@@ -46,7 +44,7 @@ class TestCircuitBreakerState(unittest.TestCase):
             self.assertEqual(val, "false")
 
         # 2. Re-enable
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute(
                 "INSERT OR REPLACE INTO control_state (state_key, state_value) VALUES ('circuit_breaker_enabled', 'true')"
             )

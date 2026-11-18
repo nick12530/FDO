@@ -56,7 +56,8 @@ describe('Multi-Pair Market Scanner & Instrument System', () => {
       signal: {
         direction: 'BUY' as const,
         timeframe: 'M5' as const,
-        score: 4.5,
+        score: 45,
+        scoringPolicyVersion: 2,
         entry: 2000.1,
         sl: 1990,
         tp: 2032,
@@ -142,9 +143,11 @@ describe('Multi-Pair Market Scanner & Instrument System', () => {
       expect(['READY', 'WAITING', 'BLOCKED']).toContain(analysis.status);
       expect(analysis.riskRewardRatio).toBeGreaterThanOrEqual(0);
       expect(analysis.scoreBreakdown).toBeDefined();
-      expect(analysis.confluenceScore).toBe(
+      expect(analysis.rawConfluenceScore).toBe(
         Object.values(analysis.scoreBreakdown).reduce((total, score) => total + (score ?? 0), 0)
       );
+      expect(analysis.confluenceScore).toBe(Math.min(100, analysis.rawConfluenceScore));
+      expect(analysis.scoringPolicyVersion).toBe(2);
     }
   });
 
@@ -164,7 +167,6 @@ describe('Multi-Pair Market Scanner & Instrument System', () => {
     expect(ranked[0].rank).toBe(1);
     expect(ranked[1].rank).toBe(2);
     expect(ranked[2].rank).toBe(3);
-    expect(ranked[3].rank).toBe(4);
   });
 
   describe('Small Account ($10) Risk Protections', () => {
@@ -199,7 +201,7 @@ describe('Multi-Pair Market Scanner & Instrument System', () => {
     });
 
     it('rejects minimum volume when it exceeds the configured risk on larger accounts too', () => {
-      const sizing = calculateSmallAccountPositionSize(100, 1, 0.003, 'EURUSD', 0.01, 0.01);
+      const sizing = calculateSmallAccountPositionSize(100, 1, 0.0036, 'EURUSD', 0.01, 0.01);
 
       expect(sizing.safeVolume).toBeNull();
       expect(sizing.rejectionReason).toContain('TRADE_REJECTED: MINIMUM_LOT_EXCEEDS_RISK');

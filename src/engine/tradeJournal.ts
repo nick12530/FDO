@@ -263,6 +263,16 @@ function isSignalValidationRecord(value: unknown): value is SignalValidationReco
     typeof record.createdAt === 'string' &&
     Number.isFinite(Date.parse(record.createdAt)) &&
     Number.isFinite(record.sourceCandleTime) &&
+    (record.generatedAt === undefined ||
+      (typeof record.generatedAt === 'string' && Number.isFinite(Date.parse(record.generatedAt)))) &&
+    (record.availableAt === undefined ||
+      (typeof record.availableAt === 'string' && Number.isFinite(Date.parse(record.availableAt)))) &&
+    (record.sourceCandleOpenTime === undefined || Number.isFinite(record.sourceCandleOpenTime)) &&
+    (record.sourceCandleCloseTime === undefined || Number.isFinite(record.sourceCandleCloseTime)) &&
+    (record.scoringPolicyVersion === undefined || Number.isInteger(record.scoringPolicyVersion)) &&
+    (record.sourceCandleOpenTime === undefined ||
+      record.sourceCandleCloseTime === undefined ||
+      record.sourceCandleCloseTime >= record.sourceCandleOpenTime) &&
     Number.isFinite(record.expiresAt) &&
     typeof record.symbol === 'string' &&
     (record.direction === 'BUY' || record.direction === 'SELL') &&

@@ -34,6 +34,7 @@ import { evaluateMacroSurpriseConfluence } from './macroSurpriseEngine';
 import { newsSentimentEngine } from './newsSentimentEngine';
 import { intermarketEngine } from './intermarketEngine';
 import { isAdaptiveMicroFloorAllowed } from './riskConfig';
+import { normalizeWeightedScore, SIGNAL_SCORING_POLICY_VERSION } from './scorePolicy';
 
 export interface LiquidityLevels {
   equalHighs: number[];
@@ -85,7 +86,9 @@ export interface PairAnalysis {
   // Signal & Score
   bias: 'BUY' | 'SELL' | 'WAITING';
   signal: Signal | null;
+  rawConfluenceScore: number;
   confluenceScore: number; // 0 to 100
+  scoringPolicyVersion: number;
   scoreBreakdown: {
     htfAlignment: number;      // max 20
     structureConfirm: number;  // max 20
@@ -656,9 +659,10 @@ export function analyzeInstrument(
   }
   scoreMacro = Math.max(0, Math.min(10, scoreMacro));
 
-  const confluenceScore =
+  const rawConfluenceScore =
     scoreHtf + scoreStructure + scoreLiquidity + scoreBosChoch + scoreObFvg +
     scoreMomentum + scoreSession + scoreSpread + scoreCandle + scoreVolume + scoreMacro;
+  const confluenceScore = normalizeWeightedScore(rawConfluenceScore);
 
   // Determine active execution timeframe (M15 swing, M1 fast scalp on tight spreads, or M5 baseline)
   const isM15Setup =
@@ -756,7 +760,7 @@ export function analyzeInstrument(
     } else if (newsRisk.hasNewsRisk) {
       status = 'BLOCKED';
       rejectionReason = `TRADE_REJECTED: ${newsRisk.reason}`;
-    } else if (!correlationResult.allowed && (confluenceScore < 70 && (confluenceScore > 10 || confluenceScore < 7.0))) {
+    } else if (!correlationResult.allowed && confluenceScore < 70) {
       status = 'BLOCKED';
       rejectionReason = correlationResult.reason || 'TRADE_REJECTED: CORRELATION_LIMIT_EXCEEDED';
     } else if (sizingResult.rejectionReason) {
@@ -776,6 +780,9 @@ export function analyzeInstrument(
     : candlesM5[candlesM5.length - 1];
   const rawCandleTime = signalCandle?.time ?? Date.now();
   const signalCandleTime = rawCandleTime < 1_000_000_000_000 ? rawCandleTime * 1000 : rawCandleTime;
+  const signalCandleDurationMs =
+    signalTimeframe === 'M15' ? 15 * 60_000 : signalTimeframe === 'M5' ? 5 * 60_000 : 60_000;
+  const signalGeneratedAt = new Date().toISOString();
   const expiryTimestamp = signalCandleTime + validityDurationMs * 2;
   if (status === 'READY' && expiryTimestamp <= Date.now()) {
     status = 'BLOCKED';
@@ -830,7 +837,12 @@ export function analyzeInstrument(
     signalObj = {
       direction: tentativeBias,
       timeframe: signalTimeframe,
-      score: Number((confluenceScore / 10).toFixed(1)),
+      score: confluenceScore,
+      scoringPolicyVersion: SIGNAL_SCORING_POLICY_VERSION,
+      generatedAt: signalGeneratedAt,
+      availableAt: signalGeneratedAt,
+      sourceCandleOpenTime: signalCandleTime,
+      sourceCandleCloseTime: signalCandleTime + signalCandleDurationMs,
       entry: Number(price.toFixed(config.digits)),
       sl: suggestedSL,
       tp: suggestedTP,
@@ -895,7 +907,9 @@ export function analyzeInstrument(
     sentimentScore: sentiment.sentimentScore,
     bias: tentativeBias,
     signal: signalObj,
+    rawConfluenceScore,
     confluenceScore,
+    scoringPolicyVersion: SIGNAL_SCORING_POLICY_VERSION,
     scoreBreakdown: {
       htfAlignment: scoreHtf,
       structureConfirm: scoreStructure,

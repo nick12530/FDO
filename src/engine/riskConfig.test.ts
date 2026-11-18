@@ -11,12 +11,12 @@ const spec = {
 };
 
 describe('broker risk-based position sizing', () => {
-  it('rejects a broker minimum lot when it would exceed the risk budget', () => {
-    expect(calculateRiskBasedVolume(100, 0.1, 0.2, spec)).toBeNull();
+  it('can disable the adaptive minimum-lot allowance for strict risk-budget sizing', () => {
+    expect(calculateRiskBasedVolume(100, 0.1, 0.2, spec, false)).toBeNull();
   });
 
-  it('does not use a small-account allowance to exceed the configured risk budget', () => {
-    expect(calculateRiskBasedVolume(10, 1, 0.2, spec)).toBeNull();
+  it('requires minimum-lot risk to remain within both adaptive allowance caps', () => {
+    expect(calculateRiskBasedVolume(10, 1, 0.36, spec)).toBeNull();
   });
 
   it('rounds down to the broker volume step without exceeding risk', () => {

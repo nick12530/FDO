@@ -68,7 +68,7 @@ export function useAudioNotifications(): UseAudioNotificationsReturn {
   useEffect(() => {
     const sig = market.signal;
     if (!sig) return;
-    const minScore = sig.score <= 10 ? 3.0 : 55;
+    const minScore = 30;
     if (sig.score < minScore) return;
 
     const currentKey = `${ticker.symbol}_${sig.timeframe}_${sig.direction}_${sig.timestamp}`;

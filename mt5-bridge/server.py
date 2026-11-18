@@ -14,6 +14,7 @@ import threading
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request as UrlRequest, urlopen
+from contextlib import closing
 from functools import wraps
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,8 +23,28 @@ from zoneinfo import ZoneInfo
 
 logger = logging.getLogger("mt5_bridge")
 
-import MetaTrader5 as mt5  # type: ignore[attr-defined]
+class _UnavailableMT5Adapter:
+    def __getattr__(self, name: str) -> Any:
+        raise RuntimeError(
+            "The MetaTrader5 Python package is required for broker operations. "
+            "Inject an adapter when running broker-free tests."
+        )
+
+
+try:
+    import MetaTrader5 as mt5  # type: ignore[attr-defined]
+except ImportError:
+    mt5 = _UnavailableMT5Adapter()
 mt5 = cast(Any, mt5)
+
+
+def configure_mt5_adapter(adapter: Any) -> None:
+    if adapter is None:
+        raise ValueError("An MT5 adapter is required.")
+    global mt5
+    mt5 = adapter
+
+
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -55,11 +76,17 @@ _live_news_cache_ttl = 60.0
 RISK_CONFIG = json.loads((Path(__file__).resolve().parents[1] / "risk-config.json").read_text(encoding="utf-8"))
 STATE_DIRECTORY = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SMCBridge"
 STATE_DIRECTORY.mkdir(parents=True, exist_ok=True)
-STATE_DATABASE = STATE_DIRECTORY / "order-idempotency.sqlite3"
+STATE_DATABASE = Path(
+    os.environ.get(
+        "MT5_BRIDGE_STATE_DATABASE",
+        str(STATE_DIRECTORY / "order-idempotency.sqlite3"),
+    )
+)
+STATE_DATABASE.parent.mkdir(parents=True, exist_ok=True)
 
 
 def initialize_state_database() -> None:
-    with sqlite3.connect(STATE_DATABASE) as connection:
+    with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS order_requests (
@@ -239,7 +266,7 @@ def idempotent_order(handler):
         with _order_id_lock:
             if order_id in _inflight_order_requests:
                 raise HTTPException(status_code=409, detail="This order request is already being processed.")
-            with sqlite3.connect(STATE_DATABASE) as connection:
+            with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
                 cached = connection.execute(
                     """
                     SELECT account_login, account_server, symbol, direction, volume, sl, tp,
@@ -593,7 +620,7 @@ def read_snapshot(symbol: str) -> dict:
         now_utc,
     )
     account["daily_start_balance"] = round(float(reconstructed_day_start), 2)
-    with sqlite3.connect(STATE_DATABASE) as connection:
+    with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
         connection.execute(
             """
             INSERT OR IGNORE INTO daily_risk (account_login, account_server, utc_date, start_balance)
@@ -988,7 +1015,7 @@ def account(request: Request, symbol: str = "XAUUSD") -> dict:
 @app.post("/api/trading-control")
 def set_trading_control(payload: TradingControlRequest, request: Request) -> dict:
     require_bridge_token(request)
-    with sqlite3.connect(STATE_DATABASE) as connection:
+    with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
         connection.execute(
             "UPDATE control_state SET state_value = ? WHERE state_key = 'trading_halted'",
             ("true" if payload.tradingHalted else "false",),
@@ -999,7 +1026,7 @@ def set_trading_control(payload: TradingControlRequest, request: Request) -> dic
 @app.post("/api/auto-trade-control")
 def set_auto_trade_control(payload: AutoTradeControlRequest, request: Request) -> dict:
     require_bridge_token(request)
-    with sqlite3.connect(STATE_DATABASE) as connection:
+    with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
         connection.execute(
             "UPDATE control_state SET state_value = ? WHERE state_key = 'auto_trade'",
             ("true" if payload.autoTrade else "false",),
@@ -1010,7 +1037,7 @@ def set_auto_trade_control(payload: AutoTradeControlRequest, request: Request) -
 @app.post("/api/reset-circuit-breakers")
 def reset_circuit_breakers(request: Request) -> dict:
     require_bridge_token(request)
-    with sqlite3.connect(STATE_DATABASE) as connection:
+    with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
         connection.execute("UPDATE control_state SET state_value = 'false' WHERE state_key = 'trading_halted'")
         connection.execute("DELETE FROM daily_risk")
     logger.info("✅ Circuit breakers and kill switch reset successfully.")
@@ -1020,7 +1047,7 @@ def reset_circuit_breakers(request: Request) -> dict:
 @app.post("/api/circuit-breaker-control")
 def set_circuit_breaker_control(payload: CircuitBreakerControlRequest, request: Request) -> dict:
     require_bridge_token(request)
-    with sqlite3.connect(STATE_DATABASE) as connection:
+    with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
         connection.execute(
             "INSERT OR REPLACE INTO control_state (state_key, state_value) VALUES ('circuit_breaker_enabled', ?)",
             ("true" if payload.enabled else "false",),
@@ -1098,7 +1125,7 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
         # Signal timestamps identify the candle open; allow the candle to close plus its entry window.
         if is_signal_stale(signal_bar_time, now, payload.signalTimeframe):
             raise HTTPException(status_code=409, detail="Signal candle is stale; wait for a new broker-confirmed setup.")
-    with sqlite3.connect(STATE_DATABASE) as connection:
+    with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
         trading_halted = connection.execute(
             "SELECT state_value FROM control_state WHERE state_key = 'trading_halted'"
         ).fetchone()[0] == "true"
@@ -1176,7 +1203,7 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
             detail=f"Maximum open-position limit reached ({len(open_positions)}/{max_positions}). Non-bypassable hard risk protection."
         )
 
-    with sqlite3.connect(STATE_DATABASE) as connection:
+    with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
         day_row = connection.execute(
             """
             SELECT start_balance FROM daily_risk
@@ -1200,7 +1227,7 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
             day_start = day_row
 
     circuit_breaker_enabled = True
-    with sqlite3.connect(STATE_DATABASE) as connection:
+    with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
         cb_row = connection.execute(
             "SELECT state_value FROM control_state WHERE state_key = 'circuit_breaker_enabled'"
         ).fetchone()
@@ -1230,7 +1257,7 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
     else:
         logger.info(f"⚡ [Circuit Breaker Bypassed] Order #{payload.clientOrderId} permitted (Circuit Breaker toggled off by operator).")
 
-    with sqlite3.connect(STATE_DATABASE) as connection:
+    with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
         recent_count = connection.execute(
             "SELECT COUNT(*) FROM order_requests WHERE account_login = ? AND account_server = ? AND symbol = ? AND accepted_at >= ?",
             (account["login"], account["server"], symbol, (now - timedelta(hours=1)).isoformat()),
@@ -1751,7 +1778,7 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
 
     response_ticket = int(result.order or result.deal)
     execution_price = float(result.price or price)
-    with sqlite3.connect(STATE_DATABASE) as connection:
+    with closing(sqlite3.connect(STATE_DATABASE)) as connection, connection:
         connection.execute(
             """
             INSERT OR IGNORE INTO order_requests

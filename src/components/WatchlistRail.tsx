@@ -60,7 +60,12 @@ export const WatchlistRail: React.FC<WatchlistRailProps> = React.memo(({
   const autoFocus = engine.autoSelectBestScenario ?? true;
   const mt5Connected = Boolean(engine.mt5Account?.connected);
 
-  const [collapsedCards, setCollapsedCards] = useState<Record<string, boolean>>({});
+  const [collapsedCards, setCollapsedCards] = useState<Record<string, boolean>>(() =>
+    SUPPORTED_SYMBOLS.reduce<Record<string, boolean>>((states, symbol) => {
+      states[symbol] = true;
+      return states;
+    }, {})
+  );
   const [sendingSym, setSendingSym] = useState<string | null>(null);
   const [tgToast, setTgToast] = useState<{ sym: string; ok: boolean; msg: string } | null>(null);
 
@@ -173,7 +178,7 @@ export const WatchlistRail: React.FC<WatchlistRailProps> = React.memo(({
       </div>
 
       {/* 4-Pair Collapsible Square Card Grid */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 items-start">
+      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3 items-start">
         {SUPPORTED_SYMBOLS.map((sym) => {
           const item = analyzedMap.get(sym);
           const cfg = getInstrumentConfig(sym);
@@ -220,8 +225,6 @@ export const WatchlistRail: React.FC<WatchlistRailProps> = React.memo(({
               key={sym}
               onClick={() => onSelectSymbol(sym)}
               className={`ws-surface border rounded-xl transition-all cursor-pointer flex flex-col justify-between overflow-hidden ${
-                isCollapsed ? '' : 'lg:aspect-square'
-              } ${
                 isActive
                   ? 'border-sky-500 dark:border-sky-400 ring-2 ring-sky-500/30 dark:ring-sky-400/25'
                   : 'hover:border-slate-400 dark:hover:border-[#3b527a]'

@@ -12,6 +12,11 @@ export interface SignalValidationRecord {
   id: string;
   createdAt: string;
   sourceCandleTime: number;
+  generatedAt?: string;
+  availableAt?: string;
+  sourceCandleOpenTime?: number;
+  sourceCandleCloseTime?: number;
+  scoringPolicyVersion?: number;
   expiresAt: number;
   symbol: string;
   direction: 'BUY' | 'SELL';
@@ -64,6 +69,12 @@ export function advanceSignalValidation(
 ): SignalValidationRecord {
   if (record.outcome !== 'WATCHING') return record;
 
+  const availableAt = Date.parse(record.availableAt || record.generatedAt || record.createdAt);
+  const sourceCandleCloseTime = record.sourceCandleCloseTime ?? record.sourceCandleTime;
+  const earliestCandleTime = Math.max(
+    Number.isFinite(availableAt) ? availableAt : record.sourceCandleTime,
+    sourceCandleCloseTime
+  );
   const closedCandles = oneMinuteCandles
     .filter((candle) => {
       const time = candleTimeMs(candle);
@@ -72,7 +83,7 @@ export function advanceSignalValidation(
         Number.isFinite(candle.high) &&
         Number.isFinite(candle.low) &&
         candle.high >= candle.low &&
-        time > record.sourceCandleTime &&
+        time >= earliestCandleTime &&
         time + 60_000 <= now &&
         time < record.expiresAt
       );

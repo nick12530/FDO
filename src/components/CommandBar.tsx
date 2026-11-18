@@ -389,6 +389,44 @@ export const CommandBar: React.FC<CommandBarProps> = React.memo(({
           </div>
         </div>
       </div>
+      <div
+        role="group"
+        aria-label="Broker account balances"
+        className="2xl:hidden border-t border-slate-200/70 dark:border-[#2b3b59]/70"
+      >
+        <div className="max-w-[1680px] mx-auto px-3 sm:px-5 py-1.5 flex items-center justify-between gap-2 text-[10px] sm:text-[11px]">
+          <div className="min-w-0 shrink text-slate-500 dark:text-slate-400">
+            <span className="hidden sm:inline">Account </span>
+            <strong className="font-mono text-slate-700 dark:text-slate-200 truncate">
+              {mt5?.connected ? `#${mt5.login}` : 'MT5 offline'}
+            </strong>
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-3 sm:gap-x-5 text-right tabular-nums">
+            <div>
+              <span className="text-slate-400 dark:text-slate-500">Balance </span>
+              <strong className="font-mono text-slate-800 dark:text-slate-100">
+                {mt5?.connected ? `$${formatCurrency(ticker.balance)}` : '—'}
+              </strong>
+            </div>
+            <div>
+              <span className="text-slate-400 dark:text-slate-500">Equity </span>
+              <strong
+                className={`font-mono ${
+                  isProfit ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'
+                }`}
+              >
+                {mt5?.connected ? `$${formatCurrency(ticker.equity)}` : '—'}
+              </strong>
+            </div>
+            <div className="hidden sm:block">
+              <span className="text-slate-400 dark:text-slate-500">Free margin </span>
+              <strong className="font-mono text-slate-800 dark:text-slate-100">
+                {mt5?.connected ? `$${formatCurrency(mt5.freeMargin)}` : '—'}
+              </strong>
+            </div>
+          </div>
+        </div>
+      </div>
     </header>
   );
 });

@@ -24,7 +24,7 @@ An algorithmic Smart Money Concepts (SMC) workstation for **Gold (XAUUSD)** and 
 - **Direct Article Navigation**: Inspect source links directly from the news feed to read complete verified financial publications in your browser.
 
 ### 4. 🛡️ Risk Controls & Broker Preflight
-- **Risk-Budget Sizing**: Volume is rounded down to the broker step. The configured adaptive minimum-lot allowance permits risk above the per-trade budget only up to $15 or 3.5% of equity; larger excesses are rejected.
+- **Risk-Budget Sizing**: Volume is rounded down to the broker step. The configured adaptive minimum-lot allowance permits risk above the per-trade budget only when it stays within both $15 and 3.5% of equity; larger excesses are rejected.
 - **Portfolio Stop-Risk Cap**: The MT5 bridge sums estimated downside at current stops across open positions and pending broker orders, then limits new exposure to the configured portfolio cap (3% of equity by default).
 - **Fail-Closed Exposure Checks**: Missing stops or symbol risk specifications make total exposure unknown and block new orders.
 - **Pre-Order Validation**: The bridge checks refreshed quotes, recalculates risk, and uses MT5 `order_check` before sending order requests.
@@ -40,8 +40,10 @@ An algorithmic Smart Money Concepts (SMC) workstation for **Gold (XAUUSD)** and 
 
 ### 6. 📈 Signal Quality & System Health
 - **Feed Diagnostics**: The dashboard shows broker quote/candle freshness and scanner readiness/rejection reasons.
+- **Versioned Signal Scores**: Signal scores use a consistent 0–100 scale (policy v2); weighted scanner components and their raw total remain available separately from the capped normalized score.
 - **Closed-Trade Statistics**: Win rate, broker-reported net P&L, profit factor, and average outcome are calculated from observed closed MT5 deal history.
-- **Prospective Signal Validation**: A local journal logs READY signal triggers using subsequent closed broker M1 candles.
+- **Prospective Signal Validation**: A local journal logs READY signal triggers using closed broker M1 candles that begin no earlier than the signal's availability time.
+- **Compact Account Scanner**: Broker balance, equity, and free margin remain visible on narrow screens; scanner cards start compact and expand on demand.
 
 ---
 

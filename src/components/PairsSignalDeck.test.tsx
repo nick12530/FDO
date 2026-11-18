@@ -17,9 +17,7 @@ describe('PairsSignalDeck', () => {
       />
     );
 
-    expect(screen.getByText(`0 READY / ${SUPPORTED_SYMBOLS.length} PAIRS`)).toBeTruthy();
-    for (const symbol of SUPPORTED_SYMBOLS) {
-      expect(screen.getByText(`${symbol} · NO FRESH SCAN`)).toBeTruthy();
-    }
+    expect(screen.getByText('Waiting for live quotes and broker candles...')).toBeTruthy();
+    expect(screen.queryByText(new RegExp(`${SUPPORTED_SYMBOLS.length} PAIRS`))).toBeNull();
   });
 });

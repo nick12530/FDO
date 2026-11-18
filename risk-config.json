@@ -6,6 +6,7 @@
   "maxOpenPositions": 5,
   "adaptiveMicroFloorEnabled": true,
   "maxMicroFloorRiskDollar": 15.0,
+  "maxMicroFloorRiskPercent": 3.5,
   "maxTradesPerHour": 100,
   "directionCooldownMinutes": 0,
   "samePoiCooldownMinutes": 0,

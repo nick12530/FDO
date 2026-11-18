@@ -94,7 +94,7 @@ import { dispatchExecutionNotification, dispatchSniperAlert } from '../utils/web
 const MAGIC = 20261001;
 export const MAX_SPREAD_POINTS = 40; // 40 points = 4.0 pips on gold
 const AUTO_RR = 2.0;
-const SCORE_THRESHOLD = 4.5;
+const MIN_SMC_SCORE_PERCENT = 45;
 
 export interface RiskSizingInfo {
   riskPercent: number;
@@ -418,6 +418,8 @@ export class TradingEngine {
   private autoTraderIntervalId: ReturnType<typeof setInterval> | null = null;
   private pairMarketDataIntervalId: ReturnType<typeof setInterval> | null = null;
   private pairMarketDataInFlight = false;
+  private brokerAccountGeneration = 0;
+  private symbolSelectionGeneration = 0;
   private partialCloseInFlight = new Set<number>();
   private initialSlByTicket = new Map<number, number>();
   private liveInitialVolByTicket = new Map<number, number>();
@@ -958,6 +960,7 @@ export class TradingEngine {
     this.connected = connected;
     this.mt5Account.connected = connected;
     if (!connected) {
+      this.brokerAccountGeneration += 1;
       this.hasBrokerMarketData = false;
       this.lastBrokerQuoteAt = 0;
       this.candlesM1 = [];
@@ -1065,6 +1068,8 @@ export class TradingEngine {
 
   private async refreshBrokerPairData() {
     if (!this.mt5Account.connected || !mt5Bridge.getStatus().connected || this.pairMarketDataInFlight) return;
+    const accountGeneration = this.brokerAccountGeneration;
+    const symbolGeneration = this.symbolSelectionGeneration;
     this.pairMarketDataInFlight = true;
     try {
       const symbols = SUPPORTED_SYMBOLS.filter((symbol) => symbol !== this.activeSymbol);
@@ -1074,6 +1079,13 @@ export class TradingEngine {
           snapshot: await mt5Bridge.fetchSymbolSnapshot(symbol),
         }))
       );
+      if (
+        accountGeneration !== this.brokerAccountGeneration ||
+        !this.mt5Account.connected ||
+        !mt5Bridge.getStatus().connected
+      ) {
+        return;
+      }
       let allDataValid = true;
       for (const result of results) {
         if (result.status !== 'fulfilled') {
@@ -1129,9 +1141,16 @@ export class TradingEngine {
         };
       }
       if (allDataValid) this.lastPairDataError = '';
-      this.refreshScanner();
+      this.refreshScanner(symbolGeneration === this.symbolSelectionGeneration);
     } finally {
       this.pairMarketDataInFlight = false;
+      if (
+        accountGeneration !== this.brokerAccountGeneration &&
+        this.mt5Account.connected &&
+        mt5Bridge.getStatus().connected
+      ) {
+        void this.refreshBrokerPairData();
+      }
     }
   }
 
@@ -1313,7 +1332,7 @@ export class TradingEngine {
                     this.candlesM1,
                     this.candlesM5,
                     this.account.auto_rr,
-                    SCORE_THRESHOLD,
+                    MIN_SMC_SCORE_PERCENT,
                     'M1',
                     {
                       symbol: this.activeSymbol,
@@ -1324,7 +1343,7 @@ export class TradingEngine {
                     this.candlesM5,
                     this.candlesM15,
                     this.account.auto_rr,
-                    SCORE_THRESHOLD,
+                    MIN_SMC_SCORE_PERCENT,
                     'M5',
                     {
                       symbol: this.activeSymbol,
@@ -1336,7 +1355,7 @@ export class TradingEngine {
                     this.candlesM15,
                     this.candlesH1.length > 5 ? this.candlesH1 : this.candlesM15,
                     this.account.auto_rr,
-                    SCORE_THRESHOLD,
+                    MIN_SMC_SCORE_PERCENT,
                     'M15',
                     {
                       symbol: this.activeSymbol,
@@ -1634,6 +1653,7 @@ export class TradingEngine {
   }
 
   linkMt5Account(login: string, server: string, balance?: number, equity?: number) {
+    this.brokerAccountGeneration += 1;
     const brokerName = server.split(/[-_]/)[0] || 'MT5 Broker';
     this.activateAccountScope(login, server, {
       balance,
@@ -1684,6 +1704,7 @@ export class TradingEngine {
   }
 
   unlinkMt5Account() {
+    this.brokerAccountGeneration += 1;
     this.mt5Account = {
       connected: false,
       login: '',
@@ -1760,7 +1781,7 @@ export class TradingEngine {
     this.slog(`Auto-Focus Best Opportunity Setup: ${enabled ? 'ENABLED' : 'DISABLED'}`, 'info');
   }
 
-  refreshScanner() {
+  refreshScanner(allowAutoSelect = true) {
     if (!this.connected || !this.mt5Account.connected) {
       this.scannerAnalyses = [];
       this.bestOpportunity = null;
@@ -1840,12 +1861,17 @@ export class TradingEngine {
             : analysis.signal.timeframe === 'M15'
               ? 'M15'
               : 'M5';
-        const sourceCandleTime = Date.parse(analysis.signal.timestamp);
+        const sourceCandleTime = analysis.signal.sourceCandleOpenTime;
         if (Number.isFinite(sourceCandleTime)) {
           recordSignalValidation({
             id: `${sym}-${timeframe}-${sourceCandleTime}-${analysis.signal.direction}`,
-            createdAt: new Date().toISOString(),
+            createdAt: analysis.signal.generatedAt,
             sourceCandleTime,
+            generatedAt: analysis.signal.generatedAt,
+            availableAt: analysis.signal.availableAt,
+            sourceCandleOpenTime: analysis.signal.sourceCandleOpenTime,
+            sourceCandleCloseTime: analysis.signal.sourceCandleCloseTime,
+            scoringPolicyVersion: analysis.signal.scoringPolicyVersion,
             expiresAt: analysis.expiryTimestamp,
             symbol: sym,
             direction: analysis.signal.direction,
@@ -1879,6 +1905,7 @@ export class TradingEngine {
 
     // Automatically select the best scenario in the chart if enabled
     if (
+      allowAutoSelect &&
       this.autoSelectBestScenario &&
       this.bestOpportunity &&
       this.bestOpportunity.symbol !== this.activeSymbol &&
@@ -1899,7 +1926,6 @@ export class TradingEngine {
       const activeSig = marketSnap.signal;
       if (activeSig) {
         const cfg = getInstrumentConfig(this.activeSymbol);
-        const rawScore = activeSig.score <= 10 ? Math.round(activeSig.score * 10) : Math.round(activeSig.score);
         const stopDist = Math.abs(activeSig.entry - activeSig.sl);
         const tp1 = activeSig.tp1 ?? Number((activeSig.direction === 'BUY' ? activeSig.entry + stopDist * 1.8 : activeSig.entry - stopDist * 1.8).toFixed(cfg.digits));
         const tp2 = activeSig.tp2 ?? activeSig.tp;
@@ -1928,7 +1954,7 @@ export class TradingEngine {
             tp1Pips,
             tp2Pips,
             tp3Pips,
-            confluenceScore: rawScore,
+            confluenceScore: activeSig.score,
             recommendedLot: activeSig.recommendedLot,
             isSniper: Boolean(activeSig.isSniper),
             sniperGrade: activeSig.sniperGrade,
@@ -1944,6 +1970,7 @@ export class TradingEngine {
   switchSymbol(newSymbol: SupportedSymbol) {
     if (!SUPPORTED_SYMBOLS.includes(newSymbol)) return;
     if (this.activeSymbol === newSymbol) return;
+    this.symbolSelectionGeneration += 1;
 
     // Cache current state back to pairData
     this.pairData[this.activeSymbol] = {
@@ -2135,7 +2162,7 @@ export class TradingEngine {
         signal.isSniper === true ||
         (signal.timeframe === 'M15' &&
           signal.strategy === 'SMC POI Retest' &&
-          (signal.score <= 10 ? signal.score >= 7.0 : signal.score >= 70))
+          signal.score >= 70)
       )
     );
     const resolvedSymbol = (
@@ -2174,17 +2201,16 @@ export class TradingEngine {
       }
     }
 
-    // Determine if we have a valid profitable signal
-    // Distinguish between 0-10 scale (e.g. 6.5, 7.2) and 0-100 scale (e.g. 55, 70, 82)
+    // Signal scores use the normalized 0-100 scale.
     const riskDist = signal ? Math.abs(signal.entry - signal.sl) : 0;
     const rewardDist = signal ? Math.abs(signal.tp - signal.entry) : 0;
     const rewardRiskRatio = riskDist > 0 ? rewardDist / riskDist : 0;
 
-    const isTenScale = Boolean(signal && signal.score <= 10);
     const hasValidProfitableSignal = Boolean(
       signal && (
         signal.isOutOfSessionException ||
-        (isTenScale ? signal.score >= 6.0 : (signal.score >= 65 || (signal.score >= 60 && rewardRiskRatio >= 1.5))) ||
+        signal.score >= 65 ||
+        (signal.score >= 60 && rewardRiskRatio >= 1.5) ||
         rewardRiskRatio >= 2.0
       )
     );
@@ -2204,7 +2230,8 @@ export class TradingEngine {
     const isHighQualitySignal = Boolean(
       signal && (
         signal.isOutOfSessionException ||
-        (isTenScale ? signal.score >= 6.5 : (signal.score >= 70 || (signal.score >= 65 && rewardRiskRatio >= 2.0)))
+        signal.score >= 70 ||
+        (signal.score >= 65 && rewardRiskRatio >= 2.0)
       )
     );
     const bypassDailyLimit = this.allowHighConfluenceOverride && isHighQualitySignal;
@@ -2339,23 +2366,23 @@ export class TradingEngine {
     // Low-liquidity Asian Consolidation (21:00–05:00 UTC / 00:00–08:00 EAT)
     // SMART GATE:
     // 1) Manual discretionary orders and direct trades are never suppressed by session filter.
-    // 2) If a valid profitable signal is present (score >= 6.0, score >= 60, RR >= 1.5, or isOutOfSessionException), allow it!
+    // 2) Strong normalized scores and high reward-to-risk setups can pass the session filter.
     if (this.instrumentType === 'standard' && !isManual) {
       const sess = sessionFilter(new Date(now));
       if (sess.asianConsolidation) {
         const isHighProfitException = Boolean(
           signal && (
             signal.isOutOfSessionException ||
-            signal.score >= 6.5 ||
+            signal.score >= 65 ||
             (signal.score >= 60 && rewardRiskRatio >= 2.0) ||
-            (signal.score >= 6.0 && rewardRiskRatio >= 1.5)
+            (signal.score >= 60 && rewardRiskRatio >= 1.5)
           )
         );
 
         if (isHighProfitException) {
           this.slog(`⭐ SMART GATE: High-profit entry authorized for ${resolvedSymbol} (Score: ${signal?.score}, RR: ${rewardRiskRatio.toFixed(1)}) during Asian consolidation (21:00–05:00 UTC / 00:00–08:00 EAT).`, 'info');
         } else {
-          return 'TRADE_REJECTED: ASIAN_CONSOLIDATION_SUPPRESSED (Low-liquidity Asian consolidation 21:00–05:00 UTC / 00:00–08:00 EAT. High-profit exception available for score ≥ 6.5 / RR ≥ 2.5).';
+          return 'TRADE_REJECTED: ASIAN_CONSOLIDATION_SUPPRESSED (Low-liquidity Asian consolidation 21:00–05:00 UTC / 00:00–08:00 EAT. High-profit exception available for score ≥ 65/100 or strong reward-to-risk).';
         }
       }
     }
@@ -3076,18 +3103,13 @@ export class TradingEngine {
 
     const market = this.getMarketSnapshot();
 
-    // High-expectancy institutional filter:
-    // Requires minimum score (>= 6.0/10 or >= 65/100) and positive expectancy RR >= 1.4:1
+    // High-expectancy institutional filter uses normalized 0-100 scores.
     const isQualifyingSignal = (candidate: Signal) => {
       const risk = Math.abs(candidate.entry - candidate.sl);
       const reward = Math.abs(candidate.tp - candidate.entry);
       const rr = risk > 0 ? reward / risk : 0;
       if (rr < 1.4) return false;
-      const isTenScale = candidate.score <= 10;
-      const minRequired = isTenScale
-        ? 6.0
-        : Math.max(65, this.minScoreThreshold);
-      return candidate.score >= minRequired;
+      return candidate.score >= Math.max(60, this.minScoreThreshold);
     };
 
     let sig = market.signals.find(isQualifyingSignal);

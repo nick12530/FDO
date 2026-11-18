@@ -23,6 +23,7 @@ import { evaluateMacroSurpriseConfluence } from './macroSurpriseEngine';
 import { newsSentimentEngine } from './newsSentimentEngine';
 import { intermarketEngine } from './intermarketEngine';
 import { getInstrumentConfig, type SupportedSymbol } from './instrumentConfig';
+import { normalizeTenPointScore, SIGNAL_SCORING_POLICY_VERSION } from './scorePolicy';
 
 // ============================================================
 // 1. INDICATORS: Wilder's ATR
@@ -497,7 +498,7 @@ export function evaluateConfluence(
   dfExec: Candle[],
   dfHtf: Candle[],
   rr: number = 2.0,
-  minScoreThreshold: number = 4.5,
+  minScorePercentThreshold: number = 45,
   timeframe: 'M1' | 'M5' | 'M15' = 'M5',
   context?: {
     symbol?: SupportedSymbol;
@@ -810,7 +811,7 @@ export function evaluateConfluence(
   };
 
   const triggerConfirmed = isAbsorptionWick || isDisplacementBody;
-  if (!triggerConfirmed || score < minScoreThreshold) return null;
+  if (!triggerConfirmed || normalizeTenPointScore(score) < minScorePercentThreshold) return null;
   const wickRatio = isBear
     ? `${((upperWick / range) * 100).toFixed(0)}% Upper Wick`
     : `${((lowerWick / range) * 100).toFixed(0)}% Lower Wick`;
@@ -893,12 +894,19 @@ export function evaluateConfluence(
     : zone
     ? `${zone.kind} (${zone.bullish ? 'Demand' : 'Supply'})`
     : 'Structural POI Retest';
+  const generatedAt = new Date().toISOString();
+  const sourceCandleOpenTime = toMilliseconds(lastCandle.time);
 
   return {
     strategy: 'SMC POI Retest',
     direction,
     timeframe,
-    score: Number(score.toFixed(2)),
+    score: normalizeTenPointScore(score),
+    scoringPolicyVersion: SIGNAL_SCORING_POLICY_VERSION,
+    generatedAt,
+    availableAt: generatedAt,
+    sourceCandleOpenTime,
+    sourceCandleCloseTime: sourceCandleOpenTime + timeframeMs,
     entry: Number(price.toFixed(digits)),
     sl: Number(sl.toFixed(digits)),
     tp: Number(tp.toFixed(digits)),

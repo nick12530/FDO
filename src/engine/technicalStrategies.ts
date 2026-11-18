@@ -2,6 +2,7 @@ import type { Candle, InstrumentType, Signal, TradeDirection, VolumeMetrics } fr
 import { calculateATR, hasRecentCandleGap } from './smcCore';
 import { getInstrumentConfig } from './instrumentConfig';
 import { calculateRVOL } from './volumeEngine';
+import { normalizeTenPointScore, SIGNAL_SCORING_POLICY_VERSION } from './scorePolicy';
 
 const EMA_FAST = 20;
 const EMA_SLOW = 50;
@@ -77,6 +78,7 @@ function createSignal(
   const timeframeMs = timeframe === 'M15' ? 15 * 60_000 : timeframe === 'M5' ? 5 * 60_000 : 60_000;
   const validityDurationMs = timeframe === 'M1' ? 90_000 : timeframeMs;
   const candleTimeMs = candle.time < 1_000_000_000_000 ? candle.time * 1000 : candle.time;
+  const generatedAt = new Date().toISOString();
   const expiryTimestamp = candleTimeMs + timeframeMs + validityDurationMs;
   const validitySeconds = Math.max(0, Math.round((expiryTimestamp - Date.now()) / 1000));
   const isSniper =
@@ -92,7 +94,12 @@ function createSignal(
     strategy,
     direction,
     timeframe,
-    score,
+    score: normalizeTenPointScore(score),
+    scoringPolicyVersion: SIGNAL_SCORING_POLICY_VERSION,
+    generatedAt,
+    availableAt: generatedAt,
+    sourceCandleOpenTime: candleTimeMs,
+    sourceCandleCloseTime: candleTimeMs + timeframeMs,
     entry,
     sl,
     tp,

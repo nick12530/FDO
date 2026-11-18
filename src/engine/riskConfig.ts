@@ -20,8 +20,8 @@ export function isAdaptiveMicroFloorAllowed(equity: number, minimumLotRisk: numb
     equity > 0 &&
     Number.isFinite(minimumLotRisk) &&
     minimumLotRisk >= 0 &&
-    (minimumLotRisk <= RISK_CONFIG.maxMicroFloorRiskDollar ||
-      (minimumLotRisk / equity) * 100 <= 3.5)
+    minimumLotRisk <= RISK_CONFIG.maxMicroFloorRiskDollar &&
+    minimumLotRisk <= equity * (RISK_CONFIG.maxMicroFloorRiskPercent / 100)
   );
 }
 
