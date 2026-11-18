@@ -2,7 +2,7 @@ import type { Candle, InstrumentType, Signal, TradeDirection, VolumeMetrics } fr
 import { calculateATR, hasRecentCandleGap } from './smcCore';
 import { getInstrumentConfig } from './instrumentConfig';
 import { calculateRVOL } from './volumeEngine';
-import { normalizeTenPointScore, SIGNAL_SCORING_POLICY_VERSION } from './scorePolicy';
+import { normalizeRawStrategyScore, SIGNAL_SCORING_POLICY_VERSION } from './scorePolicy';
 
 const EMA_FAST = 20;
 const EMA_SLOW = 50;
@@ -81,10 +81,11 @@ function createSignal(
   const generatedAt = new Date().toISOString();
   const expiryTimestamp = candleTimeMs + timeframeMs + validityDurationMs;
   const validitySeconds = Math.max(0, Math.round((expiryTimestamp - Date.now()) / 1000));
+  const normalizedScore = normalizeRawStrategyScore(score);
   const isSniper =
     timeframe === 'M1'
-      ? score >= 6.4
-      : (timeframe === 'M15' || timeframe === 'M5') && score >= 4.2;
+      ? normalizedScore >= 64
+      : (timeframe === 'M15' || timeframe === 'M5') && normalizedScore >= 42;
 
   const optimalTradeEntry = oteTarget !== undefined ? normalizePrice(oteTarget) : entry;
   const executionMode: Signal['executionMode'] =
@@ -94,7 +95,7 @@ function createSignal(
     strategy,
     direction,
     timeframe,
-    score: normalizeTenPointScore(score),
+    score: normalizedScore,
     scoringPolicyVersion: SIGNAL_SCORING_POLICY_VERSION,
     generatedAt,
     availableAt: generatedAt,
@@ -216,7 +217,8 @@ export function evaluateTechnicalStrategies(
 
   const lookback = executionCandles.slice(-21, -1);
   // Gate thin dead-volume breakout fakeouts on live standard pairs while keeping rvol >= 0.65 active
-  const isDeadVolumeChop = instrumentType === 'standard' && volMetrics.rvol < 0.65;
+  const isDeadVolumeChop =
+    instrumentType === 'standard' && volMetrics.available && volMetrics.rvol < 0.65;
   if (lookback.length === 20 && !isDeadVolumeChop) {
     const resistance = Math.max(...lookback.map((candle) => candle.high));
     const support = Math.min(...lookback.map((candle) => candle.low));

@@ -140,7 +140,7 @@ export const PairsSignalDeck: React.FC<PairsSignalDeckProps> = React.memo(({
                       : 'text-slate-400 dark:text-slate-500'
                   }`}
                 >
-                  {statusLabel} · {item.confluenceScore}
+                  {statusLabel} · Confluence {item.confluenceScore}
                 </span>
               </button>
             );
@@ -204,7 +204,9 @@ export const PairsSignalDeck: React.FC<PairsSignalDeckProps> = React.memo(({
                       {item.signal ? item.signal.direction : item.bias}
                     </span>
                   </div>
-                  <span>Score: <strong className="text-slate-900 dark:text-white">{item.confluenceScore}</strong></span>
+                  <span title="Rule-based confluence, not win probability">
+                    Confluence: <strong className="text-slate-900 dark:text-white">{item.confluenceScore}</strong>
+                  </span>
                 </div>
 
                 {/* Action button */}

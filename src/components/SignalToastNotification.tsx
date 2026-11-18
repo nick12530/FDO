@@ -1,7 +1,7 @@
 /**
  * SignalToastNotification.tsx - Sniper Entry Beacon & Floating High-Pip Cockpit
  * Remade specifically for Sniper Entries:
- * - Only activates for verified Sniper setups (M15/M5 high-confluence institutional POI)
+ * - Only activates for M15/M5 high-confluence POI setups
  * - Automatically calculates safe lot size from balance, equity, and stop distance
  * - Real-time countdown timer towards entry time (auto-expires/passes once timer hits 0:00)
  * - Structured with Entry, TP 1, TP 2, TP 3, and Stop Loss (SL)
@@ -68,6 +68,9 @@ export const SignalToastNotification: React.FC<SignalToastNotificationProps> = (
         signal: candidatePairs[0].signal,
         symbol: candidatePairs[0].symbol,
         safeLotSize: candidatePairs[0].safeLotSize,
+        bid: candidatePairs[0].bid,
+        ask: candidatePairs[0].ask,
+        symbolSpec: candidatePairs[0].symbolSpec,
       };
     }
 
@@ -151,7 +154,14 @@ export const SignalToastNotification: React.FC<SignalToastNotificationProps> = (
 
   const activeDirection = signal.direction;
   const isBuy = activeDirection === 'BUY';
-  const activeEntry = signal.entry;
+  const liveQuotePrice = isBuy ? targetSniperInfo?.ask : targetSniperInfo?.bid;
+  const intendedEntry =
+    signal.executionMode === 'PULLBACK_LIMIT'
+      ? signal.optimalTradeEntry
+      : liveQuotePrice;
+  const hasIntendedEntry =
+    typeof intendedEntry === 'number' && Number.isFinite(intendedEntry) && intendedEntry > 0;
+  const activeEntry = hasIntendedEntry ? intendedEntry : signal.entry;
   const activeSL = signal.sl;
 
   // Active lot: either user-customized or optimal auto risk-sized
@@ -166,19 +176,32 @@ export const SignalToastNotification: React.FC<SignalToastNotificationProps> = (
   const activeTP3 = signal.tp3 ?? Number((isBuy ? activeEntry + riskDist * 5.5 : activeEntry - riskDist * 5.5).toFixed(cfg.digits));
 
   // Pip measurements
-  const slPips = signal.slPips ?? Number((riskDist / cfg.pipSize).toFixed(1));
-  const tp1Pips = signal.targetPips1 ?? Number((Math.abs(activeTP1 - activeEntry) / cfg.pipSize).toFixed(1));
-  const tp2Pips = signal.targetPips2 ?? signal.targetPips ?? Number((Math.abs(activeTP2 - activeEntry) / cfg.pipSize).toFixed(1));
-  const tp3Pips = signal.targetPips3 ?? Number((Math.abs(activeTP3 - activeEntry) / cfg.pipSize).toFixed(1));
+  const slPips = Number((riskDist / cfg.pipSize).toFixed(1));
+  const tp1Pips = Number((Math.abs(activeTP1 - activeEntry) / cfg.pipSize).toFixed(1));
+  const tp2Pips = Number((Math.abs(activeTP2 - activeEntry) / cfg.pipSize).toFixed(1));
+  const tp3Pips = Number((Math.abs(activeTP3 - activeEntry) / cfg.pipSize).toFixed(1));
 
   // Chosen TP for execution
   const chosenTp = selectedTpTarget === 'tp1' ? activeTP1 : selectedTpTarget === 'tp3' ? activeTP3 : activeTP2;
   const chosenPips = selectedTpTarget === 'tp1' ? tp1Pips : selectedTpTarget === 'tp3' ? tp3Pips : tp2Pips;
 
   // Dollars at risk and potential reward based on ACTIVE ADJUSTED lot
-  const pipVal = cfg.pipValuePerMicroLot * (activeLot / 0.01);
-  const potentialRiskUsd = Number((slPips * pipVal).toFixed(2));
-  const potentialRewardUsd = Number((chosenPips * pipVal).toFixed(2));
+  const symbolSpec = targetSniperInfo?.symbolSpec;
+  const hasBrokerRiskSpec = Boolean(
+    symbolSpec &&
+    Number.isFinite(symbolSpec.tickSize) &&
+    symbolSpec.tickSize > 0 &&
+    Number.isFinite(symbolSpec.tickValue) &&
+    symbolSpec.tickValue > 0 &&
+    hasIntendedEntry &&
+    activeLot > 0
+  );
+  const potentialRiskUsd = hasBrokerRiskSpec && symbolSpec
+    ? Number((riskDist / symbolSpec.tickSize * symbolSpec.tickValue * activeLot).toFixed(2))
+    : null;
+  const potentialRewardUsd = hasBrokerRiskSpec && symbolSpec
+    ? Number((Math.abs(chosenTp - activeEntry) / symbolSpec.tickSize * symbolSpec.tickValue * activeLot).toFixed(2))
+    : null;
 
   // Timer phase calculations
   const totalDurationSec = signal.timeframe === 'M15' ? 15 * 60 : 5 * 60;
@@ -284,7 +307,7 @@ export const SignalToastNotification: React.FC<SignalToastNotificationProps> = (
                       {signal.timeframe} Setup
                     </span>
                     <span className="text-[10px] font-bold px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30">
-                      {signal.sniperGrade} · {signal.sniperQualityIndex ?? Math.round(signal.score)}%
+                      {signal.sniperGrade} · Confluence {Math.round(signal.score)}/100
                     </span>
                   </div>
                   <h3 className="font-extrabold text-sm text-white mt-0.5">
@@ -322,7 +345,7 @@ export const SignalToastNotification: React.FC<SignalToastNotificationProps> = (
             <div className="space-y-1">
               <div className="flex items-center justify-between text-[9px] uppercase tracking-wider font-bold">
                 <span className={timerPhase === 'optimal' ? 'text-emerald-400' : timerPhase === 'retest' ? 'text-amber-400' : 'text-rose-400'}>
-                  {timerPhase === 'optimal' ? '● Optimal Entry Window' : timerPhase === 'retest' ? '▲ Institutional POI Retest' : '⚠ Expiring Soon - Last Call'}
+                  {timerPhase === 'optimal' ? '● Optimal Entry Window' : timerPhase === 'retest' ? '▲ POI Retest' : '⚠ Expiring Soon - Last Call'}
                 </span>
                 <span className="text-zinc-500 font-mono">
                   {Math.round(timerProgressPct)}% window remaining ({signal.timeframe})
@@ -374,12 +397,16 @@ export const SignalToastNotification: React.FC<SignalToastNotificationProps> = (
               <div className="grid grid-cols-2 gap-2 text-xs">
                 <div className="p-2.5 rounded-xl bg-zinc-900/90 border border-zinc-800">
                   <span className="text-[9px] uppercase tracking-wider text-zinc-400 block font-bold">
-                    Live Quote
+                    {isBuy ? 'Live Ask' : 'Live Bid'}
                   </span>
                   <span className="font-black text-white tabular-nums block text-sm mt-0.5">
-                    ${activeEntry.toFixed(cfg.digits)}
+                    {typeof liveQuotePrice === 'number' && Number.isFinite(liveQuotePrice)
+                      ? `$${liveQuotePrice.toFixed(cfg.digits)}`
+                      : 'Unavailable'}
                   </span>
-                  <span className="text-[9px] text-zinc-500">Current market price</span>
+                  <span className="text-[9px] text-zinc-500">
+                    {signal.executionMode === 'PULLBACK_LIMIT' ? `Planned entry: $${activeEntry.toFixed(cfg.digits)}` : 'Market entry reference'}
+                  </span>
                   <span className="text-[9px] text-amber-300 block">
                     OTE trigger: ${Number(signal.optimalTradeEntry ?? activeEntry).toFixed(cfg.digits)}
                   </span>
@@ -393,7 +420,7 @@ export const SignalToastNotification: React.FC<SignalToastNotificationProps> = (
                     ${activeSL.toFixed(cfg.digits)}
                   </span>
                   <span className="text-[9px] text-rose-400/80 block">
-                    -{slPips} pips (-${potentialRiskUsd})
+                    -{slPips} pips ({potentialRiskUsd === null ? 'risk unavailable' : `-$${potentialRiskUsd} price-only`})
                   </span>
                 </div>
               </div>
@@ -635,15 +662,19 @@ export const SignalToastNotification: React.FC<SignalToastNotificationProps> = (
               {/* Risk & Reward Readouts dynamically driven by adjusted lot */}
               <div className="border-t border-zinc-800/80 pt-2 space-y-1.5 text-[11px]">
                 <div className="flex items-center justify-between text-zinc-400">
-                  <span>Selected Potential Reward:</span>
+                  <span>Selected Reward (before fees):</span>
                   <span className="font-bold text-emerald-400">
-                    +${potentialRewardUsd} USD (+{chosenPips} pips)
+                    {potentialRewardUsd === null
+                      ? `Unavailable (+${chosenPips} pips)`
+                      : `+$${potentialRewardUsd} price-only (+${chosenPips} pips)`}
                   </span>
                 </div>
                 <div className="flex items-center justify-between text-zinc-400">
-                  <span>Capital Risk at SL:</span>
+                  <span title="Price-to-stop estimate; excludes broker commission, swap and slippage.">Price Risk at SL (fees excluded):</span>
                   <span className="font-bold text-rose-400">
-                    -${potentialRiskUsd} USD (-{slPips} pips)
+                    {potentialRiskUsd === null
+                      ? `Unavailable (-${slPips} pips)`
+                      : `-$${potentialRiskUsd} price-only (-${slPips} pips)`}
                   </span>
                 </div>
                 <div className="flex items-center justify-between text-zinc-400">

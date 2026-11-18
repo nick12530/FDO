@@ -157,23 +157,21 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
   };
 
   const tradeMetrics = useMemo(() => {
-    const config = instrumentConfig;
     const totalLots = Number(((riskLimitedLotSize ?? lotSize) * positionCount).toFixed(2));
     const spec = market.symbolSpec;
-    let riskDollar = 0;
-    let rewardDollar = 0;
+    let riskDollar: number | null = null;
+    let rewardDollar: number | null = null;
 
-    if (spec && spec.tickSize > 0 && spec.tickValue > 0) {
+    if (
+      spec &&
+      Number.isFinite(spec.tickSize) &&
+      spec.tickSize > 0 &&
+      Number.isFinite(spec.tickValue) &&
+      spec.tickValue > 0 &&
+      totalLots > 0
+    ) {
       riskDollar = Number((riskPts / spec.tickSize * spec.tickValue * totalLots).toFixed(2));
       rewardDollar = Number((rewardPts / spec.tickSize * spec.tickValue * totalLots).toFixed(2));
-    } else {
-      if (config.category === 'metals') {
-        riskDollar = Number((riskPts * totalLots * config.contractSize).toFixed(2));
-        rewardDollar = Number((rewardPts * totalLots * config.contractSize).toFixed(2));
-      } else {
-        riskDollar = Number((riskPts * totalLots * config.contractSize).toFixed(2));
-        rewardDollar = Number((rewardPts * totalLots * config.contractSize).toFixed(2));
-      }
     }
 
     const rrRatio = riskPts > 0 ? (rewardPts / riskPts).toFixed(1) : '—';
@@ -250,8 +248,11 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
 
         <div className="flex items-center gap-1.5 shrink-0">
           {rawSig && (
-            <span className="font-mono text-xs font-bold text-slate-900 dark:text-white tabular-nums mr-1">
-              {rawSig.score.toFixed(1)}/100
+            <span
+              className="font-mono text-xs font-bold text-slate-900 dark:text-white tabular-nums mr-1"
+              title="Rule-based market confluence score; not a win-probability estimate."
+            >
+              Confluence {rawSig.score.toFixed(1)}/100
             </span>
           )}
           <button
@@ -403,7 +404,13 @@ export const SignalEngineCard: React.FC<SignalEngineCardProps> = React.memo(({ o
                 {slPrice === null ? '—' : slPrice.toFixed(instrumentConfig.digits)}
               </span>
               <span className="font-mono text-[11px] text-slate-500 dark:text-slate-400 tabular-nums block mt-0.5">
-                {rawSig ? `-${riskPips.toFixed(1)}p · -$${tradeMetrics.riskDollar}` : 'Pending'}
+                {rawSig
+                  ? `-${riskPips.toFixed(1)}p · ${
+                      tradeMetrics.riskDollar === null
+                        ? 'risk unavailable'
+                        : `-$${tradeMetrics.riskDollar} price-only`
+                    }`
+                  : 'Pending'}
               </span>
             </div>
 

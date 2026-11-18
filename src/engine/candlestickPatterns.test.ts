@@ -32,7 +32,7 @@ describe('Gold Candlestick Pattern Engine', () => {
     expect(result.activePattern.reliability).toBeGreaterThanOrEqual(90);
   });
 
-  it('detects Bearish Institutional Engulfing displacement on Gold', () => {
+  it('detects bearish engulfing displacement on Gold', () => {
     const candles: Candle[] = [
       { time: 1000, timeStr: '10:00', open: 3840, high: 3845, low: 3838, close: 3842, volume: 140 },
       { time: 2000, timeStr: '10:15', open: 3842, high: 3846, low: 3840, close: 3845, volume: 160 },

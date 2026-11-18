@@ -34,7 +34,12 @@ import { evaluateMacroSurpriseConfluence } from './macroSurpriseEngine';
 import { newsSentimentEngine } from './newsSentimentEngine';
 import { intermarketEngine } from './intermarketEngine';
 import { isAdaptiveMicroFloorAllowed } from './riskConfig';
-import { normalizeWeightedScore, SIGNAL_SCORING_POLICY_VERSION } from './scorePolicy';
+import {
+  normalizeRawConfluenceScore,
+  SCANNER_RAW_SCORE_MAX,
+  SIGNAL_SCORING_POLICY_VERSION,
+  capPositiveMacroContribution,
+} from './scorePolicy';
 
 export interface LiquidityLevels {
   equalHighs: number[];
@@ -91,14 +96,14 @@ export interface PairAnalysis {
   scoringPolicyVersion: number;
   scoreBreakdown: {
     htfAlignment: number;      // max 20
-    structureConfirm: number;  // max 20
+    structureConfirm: number;  // max 16
     liquiditySweep: number;    // max 15
-    bosChoch: number;          // max 10
+    bosChoch: number;          // max 5 (reduced overlap with structure confirmation)
     obFvgReaction: number;     // max 10
-    momentumConfirm: number;   // max 10
+    momentumConfirm: number;   // max 8
     sessionConfirm: number;    // max 5
     spreadAcceptable: number;  // max 5
-    candleConfirm?: number;    // max 5
+    candleConfirm?: number;    // max 3 (reduced overlap with displacement)
     volumeConfirm?: number;    // max 10
     macroConfirm?: number;     // max 10
   };
@@ -133,7 +138,7 @@ export interface PairAnalysis {
 
 export type PrecisionEntryCandidate = Pick<
   PairAnalysis,
-  'symbol' | 'price' | 'atr' | 'spreadAcceptable' | 'confluenceScore' | 'scoreBreakdown' |
+  'symbol' | 'price' | 'bid' | 'ask' | 'atr' | 'spreadAcceptable' | 'confluenceScore' | 'scoreBreakdown' |
   'riskRewardRatio' | 'expiryTimestamp' | 'status' | 'signal'
 >;
 
@@ -153,9 +158,11 @@ export function hasDirectionalMovement(
 
 export function isPrecisionEntryReady(analysis: PrecisionEntryCandidate, now = Date.now()): boolean {
   const signal = analysis.signal;
+  const executionPrice = getPrecisionEntryPrice(analysis);
   const tolerance = getPrecisionEntryTolerance(analysis);
   if (
     !signal ||
+    executionPrice === null ||
     tolerance === null ||
     analysis.status !== 'READY' ||
     !analysis.spreadAcceptable ||
@@ -172,15 +179,17 @@ export function isPrecisionEntryReady(analysis: PrecisionEntryCandidate, now = D
 
   return (
     hasPrecisionEntryConfirmation(analysis) &&
-    Math.abs(analysis.price - signal.optimalTradeEntry) <= tolerance
+    Math.abs(executionPrice - signal.optimalTradeEntry) <= tolerance
   );
 }
 
 export function isPrecisionEntryImminent(analysis: PrecisionEntryCandidate, now = Date.now()): boolean {
   const signal = analysis.signal;
+  const executionPrice = getPrecisionEntryPrice(analysis);
   const tolerance = getPrecisionEntryTolerance(analysis);
   if (
     !signal ||
+    executionPrice === null ||
     tolerance === null ||
     analysis.status !== 'READY' ||
     !analysis.spreadAcceptable ||
@@ -196,12 +205,26 @@ export function isPrecisionEntryImminent(analysis: PrecisionEntryCandidate, now 
     return false;
   }
 
-  const distance = Math.abs(analysis.price - signal.optimalTradeEntry);
+  const distance = Math.abs(executionPrice - signal.optimalTradeEntry);
   const approachingFromValidSide =
     signal.direction === 'BUY'
-      ? analysis.price > signal.optimalTradeEntry
-      : analysis.price < signal.optimalTradeEntry;
+      ? executionPrice > signal.optimalTradeEntry
+      : executionPrice < signal.optimalTradeEntry;
   return approachingFromValidSide && distance > tolerance && distance <= tolerance * 2;
+}
+
+function getPrecisionEntryPrice(analysis: PrecisionEntryCandidate): number | null {
+  if (!analysis.signal) return null;
+  if (
+    !Number.isFinite(analysis.bid) ||
+    !Number.isFinite(analysis.ask) ||
+    analysis.bid <= 0 ||
+    analysis.ask < analysis.bid
+  ) {
+    return null;
+  }
+  const price = analysis.signal.direction === 'BUY' ? analysis.ask : analysis.bid;
+  return Number.isFinite(price) && price > 0 ? price : null;
 }
 
 function getPrecisionEntryTolerance(analysis: PrecisionEntryCandidate): number | null {
@@ -214,10 +237,10 @@ function hasPrecisionEntryConfirmation(analysis: PrecisionEntryCandidate): boole
   const hasLocationConfirmation =
     scoreBreakdown.liquiditySweep >= 10 || scoreBreakdown.obFvgReaction >= 10;
   const hasTriggerConfirmation =
-    scoreBreakdown.momentumConfirm >= 10 || (scoreBreakdown.candleConfirm ?? 0) >= 3;
+    scoreBreakdown.momentumConfirm >= 8 || (scoreBreakdown.candleConfirm ?? 0) >= 2;
 
   return (
-    scoreBreakdown.structureConfirm >= 15 &&
+    scoreBreakdown.structureConfirm >= 12 &&
     hasLocationConfirmation &&
     hasTriggerConfirmation &&
     scoreBreakdown.spreadAcceptable >= 5
@@ -359,8 +382,7 @@ export function calculateSmallAccountPositionSize(
   minLot: number = 0.01,
   lotStep: number = 0.01,
   symbolSpec?: SymbolTradingSpec | null
-): { safeVolume: number | null; riskAmount: number; rejectionReason?: string } {
-  const config = getInstrumentConfig(symbol);
+): { safeVolume: number | null; riskAmount: number | null; rejectionReason?: string } {
   if (
     ![equity, riskPct, stopDistancePrice, minLot, lotStep].every(Number.isFinite) ||
     equity <= 0 ||
@@ -371,35 +393,41 @@ export function calculateSmallAccountPositionSize(
   ) {
     return {
       safeVolume: null,
-      riskAmount: 0,
+      riskAmount: null,
       rejectionReason: 'TRADE_REJECTED: INVALID_POSITION_SIZING_INPUT',
     };
   }
-  const riskBudget = equity * (riskPct / 100);
-
-  // Use verified broker tick economics when available; the fallback is for isolated unit tests only.
-  let pipValuePerLot = 10;
-  if (symbolSpec) {
-    if (
-      !Number.isFinite(symbolSpec.tickSize) ||
-      symbolSpec.tickSize <= 0 ||
-      !Number.isFinite(symbolSpec.tickValue) ||
-      symbolSpec.tickValue <= 0
-    ) {
-      return {
-        safeVolume: null,
-        riskAmount: 0,
-        rejectionReason: 'TRADE_REJECTED: BROKER_SYMBOL_SPEC_UNAVAILABLE',
-      };
-    }
-    pipValuePerLot = (symbolSpec.tickValue / symbolSpec.tickSize) * config.pipSize;
-    minLot = symbolSpec.volumeMin;
-    lotStep = symbolSpec.volumeStep;
+  if (!symbolSpec) {
+    return {
+      safeVolume: null,
+      riskAmount: null,
+      rejectionReason: 'TRADE_REJECTED: BROKER_SYMBOL_SPEC_UNAVAILABLE',
+    };
   }
-
-  const riskPerStandardLot = symbolSpec
-    ? (stopDistancePrice / symbolSpec.tickSize) * symbolSpec.tickValue
-    : (stopDistancePrice / config.pipSize) * pipValuePerLot;
+  const riskBudget = equity * (riskPct / 100);
+  if (
+    ![
+      symbolSpec.tickSize,
+      symbolSpec.tickValue,
+      symbolSpec.volumeMin,
+      symbolSpec.volumeMax,
+      symbolSpec.volumeStep,
+    ].every(Number.isFinite) ||
+    symbolSpec.tickSize <= 0 ||
+    symbolSpec.tickValue <= 0 ||
+    symbolSpec.volumeMin <= 0 ||
+    symbolSpec.volumeMax < symbolSpec.volumeMin ||
+    symbolSpec.volumeStep <= 0
+  ) {
+    return {
+      safeVolume: null,
+      riskAmount: null,
+      rejectionReason: 'TRADE_REJECTED: BROKER_SYMBOL_SPEC_UNAVAILABLE',
+    };
+  }
+  minLot = symbolSpec.volumeMin;
+  lotStep = symbolSpec.volumeStep;
+  const riskPerStandardLot = (stopDistancePrice / symbolSpec.tickSize) * symbolSpec.tickValue;
   const riskPerMinLot = riskPerStandardLot * minLot;
 
   if (riskPerMinLot > riskBudget && !isAdaptiveMicroFloorAllowed(equity, riskPerMinLot)) {
@@ -414,7 +442,9 @@ export function calculateSmallAccountPositionSize(
   const rawVolume = riskPerStandardLot > 0 ? riskBudget / riskPerStandardLot : minLot;
   const steps = Math.floor((rawVolume - minLot) / lotStep + 1e-9);
   const precision = Math.min(8, (String(lotStep).split('.')[1] || '').length);
-  const finalVolume = Number(Math.min(5.0, minLot + Math.max(0, steps) * lotStep).toFixed(precision));
+  const finalVolume = Number(
+    Math.min(5.0, symbolSpec.volumeMax, minLot + Math.max(0, steps) * lotStep).toFixed(precision)
+  );
   if (finalVolume < minLot) {
     return {
       safeVolume: null,
@@ -547,11 +577,11 @@ export function analyzeInstrument(
 
   // +20 Market structure confirmation
   if (tentativeBias === 'BUY' && (m5Trend === 'bullish' || m1Trend === 'bullish')) {
-    scoreStructure = 20;
+    scoreStructure = 16;
   } else if (tentativeBias === 'SELL' && (m5Trend === 'bearish' || m1Trend === 'bearish')) {
-    scoreStructure = 20;
+    scoreStructure = 16;
   } else if (m5Trend !== 'ranging') {
-    scoreStructure = 10;
+    scoreStructure = 8;
   }
 
   // +15 Liquidity sweep (check both M15 and M5 3-bar sweep windows so multi-bar SFPs are caught)
@@ -570,7 +600,7 @@ export function analyzeInstrument(
     scoreLiquidity = 5;
   }
 
-  // +10 for the latest directionally aligned structural break, decayed by age.
+  // BOS/CHoCH is related to the structure score, so its independent contribution is capped at 5.
   const eventAgeBars = lastStructureEvent
     ? Math.max(0, candlesM15.length - 1 - lastStructureEvent.bar)
     : Number.POSITIVE_INFINITY;
@@ -578,7 +608,7 @@ export function analyzeInstrument(
     (tentativeBias === 'BUY' && lastStructureEvent?.direction === 'bullish') ||
     (tentativeBias === 'SELL' && lastStructureEvent?.direction === 'bearish');
   if (eventMatchesBias && eventAgeBars < 20) {
-    scoreBosChoch = Math.round(10 * (1 - eventAgeBars / 20));
+    scoreBosChoch = Math.round(5 * (1 - eventAgeBars / 20));
   }
 
   // +10 Order Block / FVG reaction in discount/premium
@@ -602,8 +632,8 @@ export function analyzeInstrument(
     }
   }
 
-  // +10 momentum requires a meaningful, direction-aligned M5 displacement, not just one candle's color.
-  if (hasMovement) scoreMomentum = 10;
+  // Momentum overlaps the structure/candle evidence; retain a smaller independent contribution.
+  if (hasMovement) scoreMomentum = 8;
 
   // +5 Session confirmation
   if (isPreferredSession) {
@@ -631,15 +661,18 @@ export function analyzeInstrument(
       (tentativeBias === 'SELL' && candlePattern.bias === 'BEARISH')) &&
     candlePattern.reliability >= 60
   ) {
-    scoreCandle = Math.round((candlePattern.reliability / 100) * 5);
+    scoreCandle = Math.round((candlePattern.reliability / 100) * 3);
   }
 
-  // 8b. Institutional Volume & RVOL Analysis (digits-calibrated for FX & XAUUSD)
-  const volMetrics = calculateRVOL(candlesM5.length > 0 ? candlesM5 : candlesM15, 20, config.digits);
+  // 8b. Broker tick-volume proxy; it does not identify participant type or trade direction.
+  const volumeCandles = candlesM5.length >= 6 ? candlesM5 : candlesM15;
+  const volMetrics = calculateRVOL(volumeCandles, 20, config.digits);
   let scoreVolume = 0;
-  if (volMetrics.rvol >= 2.0) scoreVolume = 10;
-  else if (volMetrics.rvol >= 1.4) scoreVolume = 6;
-  else if (volMetrics.rvol >= 1.0) scoreVolume = 3;
+  if (volMetrics.available) {
+    if (volMetrics.rvol >= 2.0) scoreVolume = 10;
+    else if (volMetrics.rvol >= 1.4) scoreVolume = 6;
+    else if (volMetrics.rvol >= 1.0) scoreVolume = 3;
+  }
 
   // 8c. Macroeconomic Surprise & Headline Sentiment Analysis
   const macroConfluence = tentativeBias !== 'WAITING'
@@ -657,12 +690,12 @@ export function analyzeInstrument(
   ) {
     scoreMacro += 4;
   }
-  scoreMacro = Math.max(0, Math.min(10, scoreMacro));
+  scoreMacro = capPositiveMacroContribution(scoreMacro);
 
   const rawConfluenceScore =
     scoreHtf + scoreStructure + scoreLiquidity + scoreBosChoch + scoreObFvg +
     scoreMomentum + scoreSession + scoreSpread + scoreCandle + scoreVolume + scoreMacro;
-  const confluenceScore = normalizeWeightedScore(rawConfluenceScore);
+  const confluenceScore = normalizeRawConfluenceScore(rawConfluenceScore, SCANNER_RAW_SCORE_MAX);
 
   // Determine active execution timeframe (M15 swing, M1 fast scalp on tight spreads, or M5 baseline)
   const isM15Setup =
@@ -720,14 +753,15 @@ export function analyzeInstrument(
     suggestedTP = suggestedTP2;
   }
 
-  const stopDistance = Math.abs(price - suggestedSL);
-  const targetDistance = Math.abs(suggestedTP - price);
+  const executionPrice = tentativeBias === 'BUY' ? liveAsk : tentativeBias === 'SELL' ? liveBid : price;
+  const stopDistance = Math.abs(executionPrice - suggestedSL);
+  const targetDistance = Math.abs(suggestedTP - executionPrice);
   const riskRewardRatio = Number((targetDistance / Math.max(0.00001, stopDistance)).toFixed(2));
 
   const slPips = Number((stopDistance / config.pipSize).toFixed(1));
-  const targetPips1 = Number((Math.abs(suggestedTP1 - price) / config.pipSize).toFixed(1));
-  const targetPips2 = Number((Math.abs(suggestedTP2 - price) / config.pipSize).toFixed(1));
-  const targetPips3 = Number((Math.abs(suggestedTP3 - price) / config.pipSize).toFixed(1));
+  const targetPips1 = Number((Math.abs(suggestedTP1 - executionPrice) / config.pipSize).toFixed(1));
+  const targetPips2 = Number((Math.abs(suggestedTP2 - executionPrice) / config.pipSize).toFixed(1));
+  const targetPips3 = Number((Math.abs(suggestedTP3 - executionPrice) / config.pipSize).toFixed(1));
   const targetPips = targetPips2;
 
   // 10. Position sizing & Correlation checks
@@ -771,7 +805,7 @@ export function analyzeInstrument(
     }
   }
 
-  // 11. Expiry & Institutional POI-anchored OTE
+  // 11. Expiry and POI-anchored OTE
   const validityDurationMs = signalTimeframe === 'M15' ? 15 * 60_000 : signalTimeframe === 'M5' ? 5 * 60_000 : 90_000;
   const signalCandle = signalTimeframe === 'M15'
     ? candlesM15[candlesM15.length - 1]
@@ -827,12 +861,12 @@ export function analyzeInstrument(
     if (scoreHtf >= 15) reasons.push(`HTF ${h1Trend.toUpperCase()} Trend Alignment (+${scoreHtf})`);
     if (isM15Setup) reasons.push(`M15 Swing Entry Alignment (+15)`);
     else if (isM1ScalpSetup) reasons.push(`M1 Precision Scalp Displacement (+15)`);
-    if (scoreStructure >= 15) reasons.push(`M5 Structure Confirmation (+${scoreStructure})`);
+    if (scoreStructure >= 12) reasons.push(`M5 Structure Confirmation (+${scoreStructure})`);
     if (scoreLiquidity >= 10) reasons.push(`Liquidity Pool Sweep (+${scoreLiquidity})`);
-    if (scoreBosChoch >= 5) reasons.push(`Recent aligned BOS/CHoCH (+${scoreBosChoch})`);
+    if (scoreBosChoch >= 3) reasons.push(`Recent aligned BOS/CHoCH (+${scoreBosChoch})`);
     if (scoreObFvg >= 5) reasons.push(`Discount/Premium POI Retest (+${scoreObFvg})`);
     if (scoreSession >= 5) reasons.push(`${sessions.activeSessionName} (+${scoreSession})`);
-    if (scoreCandle >= 5) reasons.push(`${candlePattern.name} (${candlePattern.bias}) (+${scoreCandle})`);
+    if (scoreCandle >= 2) reasons.push(`${candlePattern.name} (${candlePattern.bias}) (+${scoreCandle})`);
 
     signalObj = {
       direction: tentativeBias,
@@ -843,7 +877,7 @@ export function analyzeInstrument(
       availableAt: signalGeneratedAt,
       sourceCandleOpenTime: signalCandleTime,
       sourceCandleCloseTime: signalCandleTime + signalCandleDurationMs,
-      entry: Number(price.toFixed(config.digits)),
+      entry: Number(executionPrice.toFixed(config.digits)),
       sl: suggestedSL,
       tp: suggestedTP,
       tp1: suggestedTP1,
@@ -860,7 +894,7 @@ export function analyzeInstrument(
       sniperQualityIndex,
       sniperGrade,
       optimalTradeEntry,
-      executionMode: Math.abs(price - optimalTradeEntry) > execAtr * 0.25 ? 'PULLBACK_LIMIT' : 'MARKET',
+      executionMode: Math.abs(executionPrice - optimalTradeEntry) > execAtr * 0.25 ? 'PULLBACK_LIMIT' : 'MARKET',
       mitigationType,
       recommendedLot: sizingResult.safeVolume || undefined,
       reasons,
@@ -924,7 +958,7 @@ export function analyzeInstrument(
       macroConfirm: scoreMacro,
     },
     candlestickPattern: candlePattern,
-    entryPrice: Number(price.toFixed(config.digits)),
+    entryPrice: Number(executionPrice.toFixed(config.digits)),
     suggestedSL,
     suggestedTP,
     suggestedTP1,

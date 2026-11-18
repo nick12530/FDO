@@ -276,7 +276,7 @@ describe('scanner signals in the active signal engine', () => {
       direction: 'BUY' as const,
       timeframe: 'M5' as const,
       score: 65,
-      scoringPolicyVersion: 2,
+      scoringPolicyVersion: 3,
       entry: 1.1,
       sl: 1.099,
       tp: 1.103,
@@ -314,7 +314,7 @@ describe('scanner signals in the active signal engine', () => {
       direction: 'BUY' as const,
       timeframe: 'M5' as const,
       score: 55,
-      scoringPolicyVersion: 2,
+      scoringPolicyVersion: 3,
       entry: 1.1,
       sl: 1.099,
       tp: 1.103,
@@ -353,7 +353,7 @@ describe('scanner signals in the active signal engine', () => {
       direction: 'BUY' as const,
       timeframe: 'M5' as const,
       score: 68,
-      scoringPolicyVersion: 2,
+      scoringPolicyVersion: 3,
       entry: 1.1,
       sl: 1.099,
       tp: 1.103,
@@ -486,7 +486,7 @@ describe('final execution-boundary risk validation', () => {
       sl: 1990,
       tp: 2032,
       score: 68,
-      scoringPolicyVersion: 2,
+      scoringPolicyVersion: 3,
       strategy: 'Trend Pullback' as const,
       timeframe: 'M5' as const,
       timestamp: new Date().toISOString(),
@@ -524,7 +524,7 @@ describe('final execution-boundary risk validation', () => {
       sl: 1990,
       tp: 2032,
       score: 75,
-      scoringPolicyVersion: 2,
+      scoringPolicyVersion: 3,
       strategy: 'Trend Pullback' as const,
       timeframe: 'M5' as const,
       timestamp: new Date().toISOString(),
@@ -741,6 +741,8 @@ describe('TradingEngine Store Architecture', () => {
   it('allows high-confluence signal fallback override when daily limit is reached', () => {
     engine.account.balance = 1000;
     engine.account.equity = 1000;
+    engine.activeSymbol = 'XAUUSD';
+    (engine as any).symbolSpec = getDefaultSymbolSpec('XAUUSD');
     const today = new Date().toISOString();
     // Simulate 5 closed trades today
     engine.closedTrades = [
@@ -1011,6 +1013,8 @@ describe('TradingEngine Store Architecture', () => {
     // Reset closed trades so daily trade limit is clear
     engine.account.balance = 1000;
     engine.account.equity = 1000;
+    engine.activeSymbol = 'XAUUSD';
+    (engine as any).symbolSpec = getDefaultSymbolSpec('XAUUSD');
     engine.closedTrades = [];
     (engine as any).entryHistory = [];
     // 23:00 UTC is inside Asian consolidation (21:00 - 05:00 UTC / 00:00 - 08:00 EAT)
@@ -1054,6 +1058,8 @@ describe('TradingEngine Store Architecture', () => {
   it('decouples execution gates and allows profitable trades during direction cooldown', () => {
     engine.account.balance = 5000;
     engine.account.equity = 5000;
+    engine.activeSymbol = 'XAUUSD';
+    (engine as any).symbolSpec = getDefaultSymbolSpec('XAUUSD');
     engine.closedTrades = [];
     (engine as any).entryHistory = [];
     const now = Date.now();

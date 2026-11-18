@@ -1,26 +1,28 @@
 /**
- * volumeEngine.ts - Institutional Volume & Order Flow Footprint Engine
+ * volumeEngine.ts - Broker tick-volume proxy metrics
  *
  * Provides:
- * - Relative Volume (RVOL) normalized to rolling 20-period baseline
- * - Institutional Volume Footprint classification:
+ * - Broker tick-volume ratio normalized to a rolling baseline
+ * - Tick-volume activity classification:
  *     * DISPLACEMENT: High RVOL (>= 1.8) + Large expansion body (> 50% range)
  *     * ABSORPTION: High RVOL (>= 2.0) + Rejection wick (>= 40% range) soaking up liquidity
  *     * LOW_LIQUIDITY: Thin volume (RVOL < 0.75) prone to retail fakeouts
  *     * NEUTRAL: Normal baseline flow
- * - Cumulative Volume Delta (CVD) proxy
- * - Volume-Weighted Point of Control (POC) and Value Area
+ * - Candle-direction volume delta proxy
+ * - Tick-volume-weighted price-bin proxy
  * - Volume Confluence evaluation for SMC setups
  */
 
 import { Candle, VolumeMetrics } from '../types/smc';
 
 export function calculateRVOL(candles: Candle[], lookback: number = 20, digits: number = 2): VolumeMetrics {
-  if (candles.length === 0) {
+  const baselinePeriods = Number.isFinite(lookback) ? Math.max(1, Math.floor(lookback)) : 20;
+  if (candles.length < 2) {
     return {
+      available: false,
       currentVolume: 0,
       avgVolume20: 0,
-      rvol: 1.0,
+      rvol: 0,
       volumeType: 'NEUTRAL',
       cvdDelta: 0,
       isInstitutionalSpike: false,
@@ -29,15 +31,31 @@ export function calculateRVOL(candles: Candle[], lookback: number = 20, digits: 
   }
 
   const latest = candles[candles.length - 1];
-  const start = Math.max(0, candles.length - 1 - lookback);
-  const baselineSlice = candles.slice(start, candles.length - 1);
+  const start = Math.max(0, candles.length - 1 - baselinePeriods);
+  const baselineSlice = candles
+    .slice(start, candles.length - 1)
+    .filter((candle) => Number.isFinite(candle.volume) && candle.volume > 0);
 
-  const avgVol = baselineSlice.length > 0
-    ? baselineSlice.reduce((sum, c) => sum + (c.volume || 1), 0) / baselineSlice.length
-    : (latest.volume || 1);
+  if (
+    !Number.isFinite(latest.volume) ||
+    latest.volume <= 0 ||
+    baselineSlice.length < Math.min(baselinePeriods, 5)
+  ) {
+    return {
+      available: false,
+      currentVolume: 0,
+      avgVolume20: 0,
+      rvol: 0,
+      volumeType: 'NEUTRAL',
+      cvdDelta: 0,
+      isInstitutionalSpike: false,
+      isAbsorptionWick: false,
+    };
+  }
 
-  const curVol = latest.volume || 1;
-  const rawRvol = avgVol > 0 ? curVol / avgVol : 1.0;
+  const avgVol = baselineSlice.reduce((sum, candle) => sum + candle.volume, 0) / baselineSlice.length;
+  const curVol = latest.volume;
+  const rawRvol = curVol / avgVol;
   const rvol = Number(rawRvol.toFixed(2));
 
   const totalRange = Math.max(1e-7, latest.high - latest.low);
@@ -58,18 +76,20 @@ export function calculateRVOL(candles: Candle[], lookback: number = 20, digits: 
   else if (isAbsorption) volumeType = 'ABSORPTION';
   else if (rvol < 0.75) volumeType = 'LOW_LIQUIDITY';
 
-  // Calculate Cumulative Volume Delta (CVD) proxy over the last 20 bars
+  // Estimate candle-direction volume over the last 20 bars; this is not exchange-side CVD.
   let cvdDelta = 0;
   for (const c of candles.slice(-20)) {
+    if (!Number.isFinite(c.volume) || c.volume <= 0) continue;
     const barRange = Math.max(1e-7, c.high - c.low);
     const barDeltaRatio = (c.close - c.open) / barRange; // -1.0 to +1.0
-    cvdDelta += (c.volume || 1) * barDeltaRatio;
+    cvdDelta += c.volume * barDeltaRatio;
   }
 
-  // Calculate Point of Control (POC) - price bin with maximum tick volume
-  const pocPrice = calculatePOC(candles.slice(-20), 15, digits);
+  // Tick-volume-weighted price bin; not an exchange volume profile.
+  const pocPrice = calculatePOC(candles.slice(-20).filter((candle) => candle.volume > 0), 15, digits);
 
   return {
+    available: true,
     currentVolume: curVol,
     avgVolume20: Math.round(avgVol),
     rvol,
@@ -82,7 +102,7 @@ export function calculateRVOL(candles: Candle[], lookback: number = 20, digits: 
 }
 
 /**
- * Calculates the Point of Control (POC) price level where maximum volume occurred.
+ * Calculates the price bin with maximum broker tick volume.
  */
 function calculatePOC(candles: Candle[], bins: number = 15, digits: number = 2): number | undefined {
   if (candles.length < 5) return undefined;
@@ -100,9 +120,10 @@ function calculatePOC(candles: Candle[], bins: number = 15, digits: number = 2):
   const volumeBins = new Array(bins).fill(0);
 
   for (const c of candles) {
+    if (!Number.isFinite(c.volume) || c.volume <= 0) continue;
     const mid = (c.open + c.close + c.high + c.low) / 4;
     const binIdx = Math.min(bins - 1, Math.max(0, Math.floor((mid - minPrice) / binSize)));
-    volumeBins[binIdx] += c.volume || 1;
+    volumeBins[binIdx] += c.volume;
   }
 
   let maxVolIdx = 0;
@@ -135,32 +156,50 @@ export function evaluateVolumeConfluence(
   const reasons: string[] = [];
   let scoreBonus = 0;
 
+  if (!metrics.available) {
+    return {
+      scoreBonus,
+      metrics,
+      reasons: ['Tick-volume proxy unavailable; omitted from confluence.'],
+    };
+  }
+
   if (metrics.rvol >= 2.5) {
     scoreBonus += 1.5;
-    reasons.push(`🔥 Climax Institutional Volume (${metrics.rvol}x RVOL): Massive smart money order execution (+1.5)`);
+    reasons.push(`High tick-volume proxy (${metrics.rvol}x rolling baseline) (+1.5)`);
   } else if (metrics.rvol >= 1.5) {
     scoreBonus += 1.0;
-    reasons.push(`⚡ High Institutional Participation (${metrics.rvol}x RVOL): Clean order flow follow-through (+1.0)`);
+    reasons.push(`Elevated tick-volume proxy (${metrics.rvol}x rolling baseline) (+1.0)`);
   } else if (metrics.rvol < 0.70) {
     scoreBonus -= 0.5;
-    reasons.push(`⚠️ Low Relative Volume (${metrics.rvol}x RVOL): Sub-baseline liquidity, retail chop risk (-0.5)`);
+    reasons.push(`Low tick-volume proxy (${metrics.rvol}x rolling baseline) (-0.5)`);
   }
 
   if (metrics.volumeType === 'DISPLACEMENT') {
     scoreBonus += 0.5;
-    reasons.push('Institutional Displacement: Expansion body confirms aggressive smart money positioning (+0.5)');
+    reasons.push('Tick-volume proxy coincides with a wide candle body (+0.5)');
   } else if (metrics.volumeType === 'ABSORPTION') {
     scoreBonus += 0.5;
-    reasons.push('Institutional Absorption: High-volume rejection wick shows limit orders soaking up counter-liquidity (+0.5)');
+    reasons.push('Tick-volume proxy coincides with a rejection wick (+0.5)');
   }
 
   // Relative CVD alignment check (works on both low-tick FX brokers and high-volume metals)
-  const totalVol20 = Math.max(1, candles.slice(-20).reduce((sum, c) => sum + (c.volume || 1), 0));
+  const totalVol20 = candles.slice(-20).reduce(
+    (sum, candle) => sum + (Number.isFinite(candle.volume) && candle.volume > 0 ? candle.volume : 0),
+    0
+  );
+  if (totalVol20 <= 0) {
+    return {
+      scoreBonus: Number(scoreBonus.toFixed(2)),
+      metrics,
+      reasons: ['Tick-volume proxy unavailable; omitted from confluence.'],
+    };
+  }
   const cvdRatio = Math.abs(metrics.cvdDelta) / totalVol20;
   const cvdAligned = (direction === 'BUY' && metrics.cvdDelta > 0) || (direction === 'SELL' && metrics.cvdDelta < 0);
   if (cvdAligned && (cvdRatio >= 0.12 || Math.abs(metrics.cvdDelta) > 500)) {
     scoreBonus += 0.25;
-    reasons.push(`Cumulative Volume Delta (${metrics.cvdDelta > 0 ? '+' : ''}${metrics.cvdDelta}, ${(cvdRatio * 100).toFixed(0)}% net bias) aligns with ${direction} momentum (+0.25)`);
+    reasons.push(`Candle-direction volume proxy (${metrics.cvdDelta > 0 ? '+' : ''}${metrics.cvdDelta}) aligns with ${direction} (+0.25)`);
   }
 
   return {

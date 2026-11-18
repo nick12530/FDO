@@ -10,6 +10,7 @@ import {
   isPrecisionEntryImminent,
   isPrecisionEntryReady,
 } from './multiPairScanner';
+import { normalizeRawConfluenceScore, SCANNER_RAW_SCORE_MAX } from './scorePolicy';
 import { generatePairCandles } from './dataFeed';
 import { getGlobalSessionStatus, evaluateNewsRisk, isSessionPreferredForPair } from './sessionTimezones';
 import { tradingEngine } from './tradingEngine';
@@ -36,19 +37,21 @@ describe('Multi-Pair Market Scanner & Instrument System', () => {
     const candidate = {
       symbol: 'XAUUSD' as const,
       price: 2000.1,
+      bid: 2000.0,
+      ask: 2000.2,
       atr: 10,
       spreadAcceptable: true,
       confluenceScore: 90,
       scoreBreakdown: {
         htfAlignment: 20,
-        structureConfirm: 20,
+        structureConfirm: 16,
         liquiditySweep: 15,
-        bosChoch: 15,
+        bosChoch: 5,
         obFvgReaction: 10,
-        momentumConfirm: 10,
+        momentumConfirm: 8,
         sessionConfirm: 5,
         spreadAcceptable: 5,
-        candleConfirm: 8,
+        candleConfirm: 3,
       },
       riskRewardRatio: 3,
       expiryTimestamp: 120_000,
@@ -57,7 +60,7 @@ describe('Multi-Pair Market Scanner & Instrument System', () => {
         direction: 'BUY' as const,
         timeframe: 'M5' as const,
         score: 45,
-        scoringPolicyVersion: 2,
+        scoringPolicyVersion: 3,
         entry: 2000.1,
         sl: 1990,
         tp: 2032,
@@ -71,10 +74,40 @@ describe('Multi-Pair Market Scanner & Instrument System', () => {
     };
 
     expect(isPrecisionEntryReady(candidate, 60_000)).toBe(true);
-    expect(isPrecisionEntryReady({ ...candidate, price: 2002 }, 60_000)).toBe(false);
+    const boundaryCandidates = [99, 100, 101].map((rawScore) => ({
+      ...candidate,
+      confluenceScore: normalizeRawConfluenceScore(rawScore, SCANNER_RAW_SCORE_MAX),
+    }));
+    expect(boundaryCandidates.every((item) => isPrecisionEntryReady(item, 60_000))).toBe(true);
+    expect(isPrecisionEntryReady({
+      ...candidate,
+      price: 2002,
+      bid: 2001.9,
+      ask: 2002.1,
+    }, 60_000)).toBe(false);
+    expect(isPrecisionEntryReady({
+      ...candidate,
+      price: 2001.5,
+      bid: 2001.4,
+      ask: 2001.6,
+    }, 60_000)).toBe(false);
+    expect(isPrecisionEntryReady({
+      ...candidate,
+      bid: 0,
+    }, 60_000)).toBe(false);
     expect(isPrecisionEntryReady(candidate, 120_000)).toBe(false);
-    expect(isPrecisionEntryImminent({ ...candidate, price: 2002 }, 60_000)).toBe(true);
-    expect(isPrecisionEntryImminent({ ...candidate, price: 1999 }, 60_000)).toBe(false);
+    expect(isPrecisionEntryImminent({
+      ...candidate,
+      price: 2002,
+      bid: 2001.9,
+      ask: 2002.1,
+    }, 60_000)).toBe(true);
+    expect(isPrecisionEntryImminent({
+      ...candidate,
+      price: 1999,
+      bid: 1998.9,
+      ask: 1999.1,
+    }, 60_000)).toBe(false);
   });
 
   it('detects liquidity sweeps only when a wick breaches and closes back inside prior liquidity', () => {
@@ -146,8 +179,19 @@ describe('Multi-Pair Market Scanner & Instrument System', () => {
       expect(analysis.rawConfluenceScore).toBe(
         Object.values(analysis.scoreBreakdown).reduce((total, score) => total + (score ?? 0), 0)
       );
-      expect(analysis.confluenceScore).toBe(Math.min(100, analysis.rawConfluenceScore));
-      expect(analysis.scoringPolicyVersion).toBe(2);
+      const expectedEntryPrice = analysis.bias === 'BUY'
+        ? data.currentAsk
+        : analysis.bias === 'SELL'
+          ? data.currentBid
+          : analysis.price;
+      expect(analysis.entryPrice).toBe(Number(expectedEntryPrice.toFixed(getInstrumentConfig(sym).digits)));
+      if (analysis.signal) {
+        expect(analysis.signal.entry).toBe(analysis.entryPrice);
+      }
+      expect(analysis.confluenceScore).toBe(
+        normalizeRawConfluenceScore(analysis.rawConfluenceScore, SCANNER_RAW_SCORE_MAX)
+      );
+      expect(analysis.scoringPolicyVersion).toBe(3);
     }
   });
 
@@ -170,16 +214,25 @@ describe('Multi-Pair Market Scanner & Instrument System', () => {
   });
 
   describe('Small Account ($10) Risk Protections', () => {
+    const eurusdSpec = {
+      tickSize: 0.00001,
+      tickValue: 1,
+      contractSize: 100_000,
+      volumeMin: 0.01,
+      volumeMax: 100,
+      volumeStep: 0.01,
+    };
+
     it('rejects trade with TRADE_REJECTED: MINIMUM_LOT_EXCEEDS_RISK when stop distance is too wide on micro account', () => {
       // On a $10 account with 1% risk ($0.10 budget), a wide 80-pip stop on EURUSD would risk $8 on 0.01 lots
-      const sizing = calculateSmallAccountPositionSize(10.0, 1.0, 0.0080, 'EURUSD', 0.01, 0.01);
+      const sizing = calculateSmallAccountPositionSize(10.0, 1.0, 0.0080, 'EURUSD', 0.01, 0.01, eurusdSpec);
       expect(sizing.safeVolume).toBeNull();
       expect(sizing.rejectionReason).toContain('TRADE_REJECTED: MINIMUM_LOT_EXCEEDS_RISK');
     });
 
     it('calculates safe volume when within risk parameters', () => {
       // On a $100 account with 1% risk ($1.00 budget), a tight 10-pip stop on EURUSD ($1.00 risk on 0.01 lots)
-      const sizing = calculateSmallAccountPositionSize(100.0, 1.0, 0.0010, 'EURUSD', 0.01, 0.01);
+      const sizing = calculateSmallAccountPositionSize(100.0, 1.0, 0.0010, 'EURUSD', 0.01, 0.01, eurusdSpec);
       expect(sizing.safeVolume).toBe(0.01);
       expect(sizing.rejectionReason).toBeUndefined();
     });
@@ -201,10 +254,19 @@ describe('Multi-Pair Market Scanner & Instrument System', () => {
     });
 
     it('rejects minimum volume when it exceeds the configured risk on larger accounts too', () => {
-      const sizing = calculateSmallAccountPositionSize(100, 1, 0.0036, 'EURUSD', 0.01, 0.01);
+      const sizing = calculateSmallAccountPositionSize(100, 1, 0.0036, 'EURUSD', 0.01, 0.01, eurusdSpec);
 
       expect(sizing.safeVolume).toBeNull();
       expect(sizing.rejectionReason).toContain('TRADE_REJECTED: MINIMUM_LOT_EXCEEDS_RISK');
+    });
+
+    it('does not estimate a safe lot or dollar risk without broker symbol specifications', () => {
+      const sizing = calculateSmallAccountPositionSize(100, 1, 0.001, 'EURUSD');
+      expect(sizing).toMatchObject({
+        safeVolume: null,
+        riskAmount: null,
+        rejectionReason: 'TRADE_REJECTED: BROKER_SYMBOL_SPEC_UNAVAILABLE',
+      });
     });
   });
 

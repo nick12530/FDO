@@ -1087,6 +1087,50 @@ def resolve_filling_mode(info) -> int:
         return getattr(mt5, "ORDER_FILLING_IOC", 1)
 
 
+def validate_execution_quote(
+    tick,
+    direction: str,
+    point_size: float,
+    max_spread_points: float,
+    symbol: str,
+) -> tuple[float, float]:
+    if tick is None:
+        raise HTTPException(status_code=503, detail=f"No current MT5 quote for {symbol!r}.")
+    try:
+        bid = float(tick.bid)
+        ask = float(tick.ask)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise HTTPException(status_code=503, detail=f"MT5 quote for {symbol!r} is incomplete.") from error
+    if (
+        not math.isfinite(bid)
+        or not math.isfinite(ask)
+        or bid <= 0
+        or ask < bid
+        or not math.isfinite(point_size)
+        or point_size <= 0
+        or not math.isfinite(max_spread_points)
+        or max_spread_points < 0
+    ):
+        raise HTTPException(status_code=503, detail=f"MT5 quote for {symbol!r} is invalid.")
+
+    spread_points = (ask - bid) / point_size
+    if spread_points > max_spread_points:
+        logger.warning(
+            "Spread %.1f points exceeds maximum %.1f points on %s.",
+            spread_points,
+            max_spread_points,
+            symbol,
+        )
+        raise HTTPException(
+            status_code=423,
+            detail=(
+                f"TRADE_REJECTED: SPREAD_TOO_WIDE ({spread_points:.1f} points exceeds "
+                f"maximum allowable {max_spread_points:.1f} points). Wait for normal liquidity."
+            ),
+        )
+    return (ask if direction == "BUY" else bid), spread_points
+
+
 @app.post("/api/trade")
 @idempotent_order
 def place_trade(payload: TradeRequest, request: Request) -> dict:
@@ -1157,8 +1201,6 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
         raise HTTPException(status_code=400, detail=f"MT5 could not select symbol {symbol!r} (requested as {raw_symbol!r}).")
 
     tick = mt5.symbol_info_tick(symbol)
-    if info is None or tick is None:
-        raise HTTPException(status_code=503, detail=f"No current MT5 quote for {symbol!r}.")
     symbol_spec = get_symbol_spec(account["login"], account["server"], symbol, info)
     if (
         symbol_spec["tickSize"] <= 0
@@ -1168,21 +1210,19 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
         or symbol_spec["volumeStep"] <= 0
     ):
         raise HTTPException(status_code=503, detail="Broker symbol risk specifications are incomplete; order sizing is disabled.")
-    price = tick.ask if payload.direction == "BUY" else tick.bid
     if not all(math.isfinite(value) for value in (payload.volume, payload.sl, payload.tp)):
         raise HTTPException(status_code=400, detail="Volume and protective levels must be finite numbers.")
 
     # BRIDGE-LEVEL SPREAD GATE: Protect against spread blowout during rollover or news spikes
     point_size = float(getattr(info, "point", symbol_spec["tickSize"])) or symbol_spec["tickSize"]
-    spread_points = abs(tick.ask - tick.bid) / point_size if point_size > 0 else 0.0
     max_allowed_spread = INSTRUMENT_MAX_SPREADS.get(symbol.upper(), 45.0)
-    if spread_points > max_allowed_spread:
-        logger.warning(f"🚫 [423 Locked] Spread {spread_points:.1f}pts exceeds max allowable {max_allowed_spread:.1f}pts on {symbol}.")
-        raise HTTPException(
-            status_code=423,
-            detail=f"TRADE_REJECTED: SPREAD_TOO_WIDE ({spread_points:.1f} points exceeds maximum allowable {max_allowed_spread:.1f} points). Wait for normal liquidity.",
-        )
-
+    price, spread_points = validate_execution_quote(
+        tick,
+        payload.direction,
+        point_size,
+        max_allowed_spread,
+        symbol,
+    )
     vol_min = symbol_spec["volumeMin"]
     vol_max = symbol_spec["volumeMax"]
     vol_step = symbol_spec["volumeStep"]
@@ -1545,7 +1585,14 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
             for fill in candidate_fillings:
                 # Refresh tick for accurate live price on each pass
                 cur_tick = mt5.symbol_info_tick(symbol)
-                cur_price = entry_reference_price if use_pending_limit else ((cur_tick.ask if payload.direction == "BUY" else cur_tick.bid) if cur_tick else price)
+                refreshed_price, _ = validate_execution_quote(
+                    cur_tick,
+                    payload.direction,
+                    point_size,
+                    max_allowed_spread,
+                    symbol,
+                )
+                cur_price = entry_reference_price if use_pending_limit else refreshed_price
                 current_risk_per_lot = abs(cur_price - desired_sl) / symbol_spec["tickSize"] * symbol_spec["tickValue"]
                 current_portfolio_budget = max(0.0, portfolio_risk_budget - current_portfolio_risk)
                 current_trade_safe_volume = volume_for_risk(

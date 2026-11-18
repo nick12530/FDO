@@ -3,7 +3,7 @@
  *
  * Quantifies economic releases (CPI, NFP, GDP, Central Bank Rate Decisions):
  * - Computes Surprise Delta: (Actual - Forecast)
- * - Identifies Post-News Institutional Drift windows (5m - 60m post-print)
+ * - Identifies post-news directional-bias windows (5m - 60m post-print)
  * - Maps macroeconomic surprises to instrument bias (XAUUSD, EURUSD, GBPUSD)
  * - Scores macro confluence bonus (+1.5) or warns against macro headwinds (-2.0)
  */
@@ -126,7 +126,7 @@ export function evaluateMacroSurpriseConfluence(
         if (expectedPairDir === direction) {
           scoreBonus += 1.5;
           reasons.push(
-            `🏛️ Macroeconomic Surprise Aligned: ${ev.currency} ${ev.event} (Act: ${ev.actual || 'Beat'}, Est: ${ev.forecast}) confirms institutional ${direction} drift (+1.5)`
+            `🏛️ Macroeconomic Surprise Aligned: ${ev.currency} ${ev.event} (Act: ${ev.actual || 'Beat'}, Est: ${ev.forecast}) supports ${direction} bias (+1.5)`
           );
         } else {
           scoreBonus -= 2.0;

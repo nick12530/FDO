@@ -24,10 +24,10 @@ An algorithmic Smart Money Concepts (SMC) workstation for **Gold (XAUUSD)** and 
 - **Direct Article Navigation**: Inspect source links directly from the news feed to read complete verified financial publications in your browser.
 
 ### 4. 🛡️ Risk Controls & Broker Preflight
-- **Risk-Budget Sizing**: Volume is rounded down to the broker step. The configured adaptive minimum-lot allowance permits risk above the per-trade budget only when it stays within both $15 and 3.5% of equity; larger excesses are rejected.
+- **Risk-Budget Sizing**: Volume is rounded down to the broker step using the executable bid/ask and verified broker tick economics. Missing symbol specifications block sizing; stop-price estimates exclude costs that are not supplied by the broker.
 - **Portfolio Stop-Risk Cap**: The MT5 bridge sums estimated downside at current stops across open positions and pending broker orders, then limits new exposure to the configured portfolio cap (3% of equity by default).
 - **Fail-Closed Exposure Checks**: Missing stops or symbol risk specifications make total exposure unknown and block new orders.
-- **Pre-Order Validation**: The bridge checks refreshed quotes, recalculates risk, and uses MT5 `order_check` before sending order requests.
+- **Pre-Order Validation**: The bridge revalidates executable quotes and spread before each send attempt, recalculates risk, and uses MT5 `order_check`. Missing, crossed, or over-limit quotes block the order.
 - **Daily Loss Circuit Breaker & Kill Switch**: Independent controls block new trading when configured loss limits are reached and provide an emergency close action.
 
 ### 5. 🔊 Distinct Procedural Audio Synthesizer
@@ -40,10 +40,11 @@ An algorithmic Smart Money Concepts (SMC) workstation for **Gold (XAUUSD)** and 
 
 ### 6. 📈 Signal Quality & System Health
 - **Feed Diagnostics**: The dashboard shows broker quote/candle freshness and scanner readiness/rejection reasons.
-- **Versioned Signal Scores**: Signal scores use a consistent 0–100 scale (policy v2); weighted scanner components and their raw total remain available separately from the capped normalized score.
+- **Versioned Signal Scores**: Signal scores use a consistent 0–100 confluence scale (policy v3), not a win-probability estimate. The scanner compresses only its upper score tail, retains the raw component total, and preserves negative macro contributions.
 - **Closed-Trade Statistics**: Win rate, broker-reported net P&L, profit factor, and average outcome are calculated from observed closed MT5 deal history.
 - **Prospective Signal Validation**: A local journal logs READY signal triggers using closed broker M1 candles that begin no earlier than the signal's availability time.
 - **Compact Account Scanner**: Broker balance, equity, and free margin remain visible on narrow screens; scanner cards start compact and expand on demand.
+- **Volume Source Clarity**: Volume and candle-direction delta are broker tick-volume proxies; they do not identify institutional participants or exchange-side buy/sell flow.
 
 ---
 

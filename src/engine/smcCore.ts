@@ -1,5 +1,5 @@
 /**
- * smcCore.ts - Institutional-grade SMC + TA engine for XAUUSD
+ * smcCore.ts - Broker-data SMC + TA candidate engine for FX and XAU
  * Direct TypeScript implementation of smc_core.py
  * Design goals: lookahead-safe, high fidelity, confluence scoring.
  */
@@ -23,7 +23,7 @@ import { evaluateMacroSurpriseConfluence } from './macroSurpriseEngine';
 import { newsSentimentEngine } from './newsSentimentEngine';
 import { intermarketEngine } from './intermarketEngine';
 import { getInstrumentConfig, type SupportedSymbol } from './instrumentConfig';
-import { normalizeTenPointScore, SIGNAL_SCORING_POLICY_VERSION } from './scorePolicy';
+import { normalizeRawStrategyScore, SIGNAL_SCORING_POLICY_VERSION } from './scorePolicy';
 
 // ============================================================
 // 1. INDICATORS: Wilder's ATR
@@ -344,7 +344,7 @@ export function sessionFilter(dateOrTimestamp: Date | number): SessionInfo {
   const eatHours = (utcHours + 3) % 24;
   const currentEatTime = `${pad(eatHours)}:${pad(utcMinutes)}:${pad(d.getUTCSeconds())} EAT`;
 
-  // High-Institutional-Volume Windows
+  // High-activity session windows
   // London Open: 07:00 – 10:00 UTC (10:00 – 13:00 EAT)
   const londonOpenWindow = utcHours >= 7 && utcHours < 10;
   // New York AM / Silver Bullet: 13:00 – 16:00 UTC (16:00 – 19:00 EAT)
@@ -604,7 +604,7 @@ export function evaluateConfluence(
     reasons.push('Price in DISCOUNT of HTF dealing range (< Equilibrium) (+1.0)');
     if (inOteZone) {
       score += 1.0;
-      reasons.push('⭐ Price in Golden OTE Zone (61.8% – 78.6% institutional Fibonacci sweet spot) (+1.0)');
+      reasons.push('⭐ Price in Fibonacci OTE zone (61.8% – 78.6%) (+1.0)');
     }
     zone = pickBestZone(true);
   } else if (ms.trend === 'bearish' && inPremium) {
@@ -612,7 +612,7 @@ export function evaluateConfluence(
     reasons.push('Price in PREMIUM of HTF dealing range (> Equilibrium) (+1.0)');
     if (inOteZone) {
       score += 1.0;
-      reasons.push('⭐ Price in Golden OTE Zone (61.8% – 78.6% institutional Fibonacci sweet spot) (+1.0)');
+      reasons.push('⭐ Price in Fibonacci OTE zone (61.8% – 78.6%) (+1.0)');
     }
     zone = pickBestZone(false);
   }
@@ -632,10 +632,10 @@ export function evaluateConfluence(
       `${zone.kind} retest (${zone.bullish ? 'Demand' : 'Supply'}, ${zone.tests} prior test${zone.tests === 1 ? '' : 's'}) (+1.5)`
     );
 
-    // High Win-Rate Rule: Fresh POI bonus
+    // Fresh POI confluence bonus
     if (zone.tests === 0) {
       score += 0.5;
-      reasons.push('Virgin unmitigated POI - Maximum institutional order flow (+0.5)');
+      reasons.push('Fresh, unmitigated point of interest (+0.5)');
     }
 
     const base = zone.bullish ? zone.bottom : zone.top;
@@ -676,7 +676,7 @@ export function evaluateConfluence(
     const lastInternal = recentInternal[recentInternal.length - 1];
     if (lastInternal && lastInternal.direction === (direction === 'BUY' ? 'bullish' : 'bearish')) {
       score += 1.0;
-      reasons.push(`Micro internal ${lastInternal.kind} (${lastInternal.direction}) confirms institutional displacement at POI (+1.0)`);
+      reasons.push(`Micro internal ${lastInternal.kind} (${lastInternal.direction}) confirms displacement at POI (+1.0)`);
     }
   }
 
@@ -719,7 +719,7 @@ export function evaluateConfluence(
     return null;
   }
   if (inAsianConsolidation && isHighProfitException) {
-    reasons.push('⭐ High-Profit Exception: Out-of-session institutional setup approved during Asian consolidation');
+    reasons.push('⭐ High-confluence exception: setup allowed during Asian consolidation');
   }
 
   // Instrument-neutral Candlestick Pattern Engine (pip-scaled for FX + XAUUSD)
@@ -728,7 +728,7 @@ export function evaluateConfluence(
   const targetBias = direction === 'BUY' ? 'BULLISH' : 'BEARISH';
   if (activePattern.bias !== targetBias || activePattern.reliability < 80) return null;
   score += (activePattern.reliability / 100) * 0.75;
-  reasons.push(`${activePattern.name} (${activePattern.wickRatio}, ${activePattern.reliability}% reliability) (+${((activePattern.reliability / 100) * 0.75).toFixed(2)})`);
+  reasons.push(`${activePattern.name} (${activePattern.wickRatio}, pattern score ${activePattern.reliability}/100) (+${((activePattern.reliability / 100) * 0.75).toFixed(2)})`);
 
   // Determine the triggering candle pattern and mechanics
   const isBear = direction === 'SELL';
@@ -747,7 +747,7 @@ export function evaluateConfluence(
     ? lastCandle.close > lastCandle.open && (body >= 0.50 * range || lastCandle.close > prevCandle.high)
     : lastCandle.close < lastCandle.open && (body >= 0.50 * range || lastCandle.close < prevCandle.low);
 
-  // 1. Institutional Volume Footprint & RVOL Confluence
+  // 1. Broker tick-volume proxy confluence; this does not establish institutional order flow.
   const volResult = evaluateVolumeConfluence(closed, direction, digits);
   const smcBaseScore = score;
   score += volResult.scoreBonus;
@@ -762,7 +762,7 @@ export function evaluateConfluence(
     reasons.push(...macroResult.reasons);
   }
 
-  // 3. Institutional Real-Time News Headline Sentiment
+  // 3. News headline sentiment
   let sentimentBonus = 0;
   if (context?.symbol) {
     const sentiment = newsSentimentEngine.evaluatePairSentiment(context.symbol);
@@ -772,7 +772,7 @@ export function evaluateConfluence(
     ) {
       sentimentBonus = 0.5;
       score += 0.5;
-      reasons.push(`📰 Institutional News Sentiment aligned with ${direction} (+0.5)`);
+      reasons.push(`📰 News headline sentiment aligns with ${direction} (+0.5)`);
     } else if (
       (direction === 'BUY' && sentiment.sentimentBias === 'BEARISH') ||
       (direction === 'SELL' && sentiment.sentimentBias === 'BULLISH')
@@ -811,7 +811,8 @@ export function evaluateConfluence(
   };
 
   const triggerConfirmed = isAbsorptionWick || isDisplacementBody;
-  if (!triggerConfirmed || normalizeTenPointScore(score) < minScorePercentThreshold) return null;
+  const normalizedScore = normalizeRawStrategyScore(score);
+  if (!triggerConfirmed || normalizedScore < minScorePercentThreshold) return null;
   const wickRatio = isBear
     ? `${((upperWick / range) * 100).toFixed(0)}% Upper Wick`
     : `${((lowerWick / range) * 100).toFixed(0)}% Lower Wick`;
@@ -819,12 +820,12 @@ export function evaluateConfluence(
   const patternName = activePattern.name;
   const tf = timeframe;
   const explanation = isBear
-    ? `${tf} candle at ${lastCandle.timeStr} swept into premium supply at ${pricePrefix}${fmt(lastCandle.high)}, meeting heavy institutional sell volume and closing down at ${pricePrefix}${fmt(lastCandle.close)}. ${zone ? `Rejection confirmed off ${zone.kind} Supply (${fmt(zone.bottom)}-${fmt(zone.top)}).` : ''}`
-    : `${tf} candle at ${lastCandle.timeStr} tapped discount demand at ${pricePrefix}${fmt(lastCandle.low)}, soaking up sell-side liquidity with buyers pushing price up to close at ${pricePrefix}${fmt(lastCandle.close)}. ${zone ? `Rejection confirmed off ${zone.kind} Demand (${fmt(zone.bottom)}-${fmt(zone.top)}).` : ''}`;
+    ? `${tf} candle at ${lastCandle.timeStr} reached premium supply at ${pricePrefix}${fmt(lastCandle.high)} and closed lower at ${pricePrefix}${fmt(lastCandle.close)}. ${zone ? `Rejection confirmed off ${zone.kind} Supply (${fmt(zone.bottom)}-${fmt(zone.top)}).` : ''}`
+    : `${tf} candle at ${lastCandle.timeStr} reached discount demand at ${pricePrefix}${fmt(lastCandle.low)} and closed higher at ${pricePrefix}${fmt(lastCandle.close)}. ${zone ? `Rejection confirmed off ${zone.kind} Demand (${fmt(zone.bottom)}-${fmt(zone.top)}).` : ''}`;
 
   const actionReason = isBear
-    ? `SELL triggered: ${activePattern.name} swept into premium supply (${zone ? `${fmt(zone.bottom)}-${fmt(zone.top)}` : 'POI'}) with strong sell displacement, rejecting ${wickRatio}. ${activePattern.marketInsight}`
-    : `BUY triggered: ${activePattern.name} absorbed into discount demand (${zone ? `${fmt(zone.bottom)}-${fmt(zone.top)}` : 'POI'}) with aggressive buyer response, rejecting ${wickRatio}. ${activePattern.marketInsight}`;
+    ? `SELL candidate: ${activePattern.name} reached premium supply (${zone ? `${fmt(zone.bottom)}-${fmt(zone.top)}` : 'POI'}) and shows ${wickRatio}. ${activePattern.marketInsight}`
+    : `BUY candidate: ${activePattern.name} reached discount demand (${zone ? `${fmt(zone.bottom)}-${fmt(zone.top)}` : 'POI'}) and shows ${wickRatio}. ${activePattern.marketInsight}`;
 
   const riskPts = Math.abs(price - sl);
   const rewardPts = Math.abs(tp - price);
@@ -843,14 +844,14 @@ export function evaluateConfluence(
 
   const humanExplanation = {
     headline: isBear
-      ? `Institutional SELL Setup: High-Probability Short on ${symbolLabel}`
-      : `Institutional BUY Setup: High-Probability Long on ${symbolLabel}`,
+      ? `SELL confluence setup on ${symbolLabel}`
+      : `BUY confluence setup on ${symbolLabel}`,
     simpleSummary: isBear
-      ? `${symbolLabel} reached a premium resistance zone where institutional sellers distributed inventory, rejecting higher prices.`
-      : `${symbolLabel} dipped into a discounted demand zone where institutional buyers absorbed sell orders for upside continuation.`,
+      ? `${symbolLabel} reached a premium area and showed bearish price rejection.`
+      : `${symbolLabel} reached a discount area and showed bullish price rejection.`,
     marketCondition: isBear
-      ? `Higher-timeframe structure favors distribution. Push higher met heavy institutional supply imbalance.`
-      : `Higher-timeframe market structure is bullish. Sellers failed to hold lower support, confirming buyer control.`,
+      ? `Higher-timeframe structure is bearish; the latest price action rejected higher levels.`
+      : `Higher-timeframe structure is bullish; the latest price action rejected lower levels.`,
     tradeRationale: isBear
       ? `Formed a ${patternName} (${wickRatio}) rejecting supply at ${pricePrefix}${fmt(price)}. Risk is capped just above the swing high.`
       : `Formed a ${patternName} (${wickRatio}) defending demand at ${pricePrefix}${fmt(price)}. Risk is capped just below the swing low.`,
@@ -869,9 +870,10 @@ export function evaluateConfluence(
   // Sniper setup criteria: M15/M5 POI or high-score M1 sweep scalp
   const isSniper =
     timeframe === 'M1'
-      ? score >= 5.2 && sweep.hasSweep
-      : (timeframe === 'M15' || timeframe === 'M5') && (score >= 4.2 || (sweep.hasSweep && score >= 3.8));
-  const sniperQualityIndex = Math.min(100, Math.max(50, Math.round((score / 6.0) * 100)));
+      ? normalizedScore >= 52 && sweep.hasSweep
+      : (timeframe === 'M15' || timeframe === 'M5') &&
+        (normalizedScore >= 42 || (sweep.hasSweep && normalizedScore >= 38));
+  const sniperQualityIndex = normalizedScore;
   const sniperGrade: 'A+' | 'A' | 'B' = sniperQualityIndex >= 88 ? 'A+' : sniperQualityIndex >= 75 ? 'A' : 'B';
 
   const rawOte = zone
@@ -901,7 +903,7 @@ export function evaluateConfluence(
     strategy: 'SMC POI Retest',
     direction,
     timeframe,
-    score: normalizeTenPointScore(score),
+    score: normalizedScore,
     scoringPolicyVersion: SIGNAL_SCORING_POLICY_VERSION,
     generatedAt,
     availableAt: generatedAt,

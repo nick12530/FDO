@@ -122,9 +122,9 @@ export interface Signal {
   targetPips?: number;
   expiryTimestamp?: number; // Unix timestamp in ms when entry window passes
   validitySeconds?: number; // Countdown seconds remaining for entry
-  isSniper?: boolean; // Sniper setup flag (M15/M5 institutional POI + high score)
-  sniperQualityIndex?: number; // 0 - 100% precision rating
-  sniperGrade?: 'A+' | 'A' | 'B'; // Institutional quality grade
+  isSniper?: boolean;
+  sniperQualityIndex?: number; // Legacy alias for normalized confluence score, not a probability.
+  sniperGrade?: 'A+' | 'A' | 'B'; // Heuristic confluence tier.
   optimalTradeEntry?: number; // Pinpoint OTE Retest Price (62% fib / POI equilibrium)
   mitigationType?: string; // Type of institutional mitigation (+OB, -OB, FVG, SFP)
   recommendedLot?: number; // Auto-calculated safe lot size
@@ -263,14 +263,15 @@ export interface EconomicEvent {
 }
 
 export interface VolumeMetrics {
+  available: boolean;
   currentVolume: number;
   avgVolume20: number;
   rvol: number; // e.g. 2.4 = 240% of 20-period baseline
   volumeType: 'DISPLACEMENT' | 'ABSORPTION' | 'NEUTRAL' | 'LOW_LIQUIDITY';
-  cvdDelta: number; // Cumulative Volume Delta proxy
-  isInstitutionalSpike: boolean; // rvol >= 1.8
+  cvdDelta: number; // Candle-direction tick-volume proxy, not exchange-side volume delta
+  isInstitutionalSpike: boolean; // Legacy field name; only reflects elevated broker tick volume.
   isAbsorptionWick: boolean;
-  pocPrice?: number; // Point of Control
+  pocPrice?: number; // Tick-volume-weighted price-bin proxy
 }
 
 export interface NewsSentimentItem {

@@ -184,7 +184,7 @@ export const BottomWorkbench: React.FC<BottomWorkbenchProps> = React.memo(({
         symbol: analysis.symbol,
         direction: analysis.signal.direction,
         timeframe: analysis.signal.timeframe,
-        strategy: analysis.signal.strategy || 'Institutional SMC POI',
+        strategy: analysis.signal.strategy || 'SMC POI Retest',
         entry: analysis.signal.entry,
         sl: analysis.signal.sl,
         tp: analysis.signal.tp,
@@ -554,9 +554,11 @@ export const BottomWorkbench: React.FC<BottomWorkbenchProps> = React.memo(({
                 </span>
               </div>
               <div>
-                <span className="text-[11px] text-slate-400 block">RVOL ({activeSymbol})</span>
+                <span className="text-[11px] text-slate-400 block">Tick RVOL ({activeSymbol})</span>
                 <span className="font-mono font-semibold text-slate-900 dark:text-white tabular-nums">
-                  {currentCandles.length >= 5 ? `${volumeMetrics.rvol}x · ${volumeMetrics.volumeType}` : '—'}
+                  {currentCandles.length >= 5 && volumeMetrics.available
+                    ? `${volumeMetrics.rvol}x · ${volumeMetrics.volumeType}`
+                    : 'Unavailable'}
                 </span>
               </div>
               <div>
@@ -685,27 +687,35 @@ export const BottomWorkbench: React.FC<BottomWorkbenchProps> = React.memo(({
             {macroSubTab === 'volume' && (
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-1 text-xs">
                 <div>
-                  <span className="text-[11px] text-slate-400 block">Relative Volume</span>
+                  <span className="text-[11px] text-slate-400 block">Tick RVOL Proxy</span>
                   <span className="font-mono font-semibold text-slate-900 dark:text-white">
-                    {currentCandles.length >= 5 ? `${volumeMetrics.rvol}x` : '—'}
+                    {currentCandles.length >= 5 && volumeMetrics.available
+                      ? `${volumeMetrics.rvol}x`
+                      : 'Unavailable'}
                   </span>
                 </div>
                 <div>
-                  <span className="text-[11px] text-slate-400 block">Footprint</span>
+                  <span className="text-[11px] text-slate-400 block">Tick-volume Pattern</span>
                   <span className="font-mono font-semibold text-slate-900 dark:text-white">
-                    {currentCandles.length >= 5 ? volumeMetrics.volumeType : 'Awaiting Candles'}
+                    {currentCandles.length >= 5 && volumeMetrics.available
+                      ? volumeMetrics.volumeType
+                      : 'Unavailable'}
                   </span>
                 </div>
                 <div>
-                  <span className="text-[11px] text-slate-400 block">CVD Delta</span>
+                  <span className="text-[11px] text-slate-400 block">Candle-volume Proxy</span>
                   <span className="font-mono font-semibold text-slate-900 dark:text-white">
-                    {currentCandles.length >= 5 ? (volumeMetrics.cvdDelta > 0 ? `+${volumeMetrics.cvdDelta}` : volumeMetrics.cvdDelta) : '—'}
+                    {currentCandles.length >= 5 && volumeMetrics.available
+                      ? (volumeMetrics.cvdDelta > 0 ? `+${volumeMetrics.cvdDelta}` : volumeMetrics.cvdDelta)
+                      : 'Unavailable'}
                   </span>
                 </div>
                 <div>
-                  <span className="text-[11px] text-slate-400 block">Point of Control</span>
+                  <span className="text-[11px] text-slate-400 block">Tick-volume POC Proxy</span>
                   <span className="font-mono font-semibold text-slate-900 dark:text-white">
-                    {volumeMetrics.pocPrice ? volumeMetrics.pocPrice.toFixed(getInstrumentConfig(activeSymbol).digits) : '—'}
+                    {volumeMetrics.available && volumeMetrics.pocPrice
+                      ? volumeMetrics.pocPrice.toFixed(getInstrumentConfig(activeSymbol).digits)
+                      : 'Unavailable'}
                   </span>
                 </div>
               </div>

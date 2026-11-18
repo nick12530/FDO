@@ -64,6 +64,32 @@ class TestServerTestDependencies(unittest.TestCase):
         self.assertIn("order_requests", tables)
         self.assertIn("control_state", tables)
 
+    def test_execution_quote_validation_uses_executable_side_and_fails_closed(self):
+        buy_price, spread = self.server.validate_execution_quote(
+            SimpleNamespace(bid=1.1000, ask=1.1002), "BUY", 0.0001, 5, "EURUSD"
+        )
+        sell_price, _ = self.server.validate_execution_quote(
+            SimpleNamespace(bid=1.1000, ask=1.1002), "SELL", 0.0001, 5, "EURUSD"
+        )
+
+        self.assertEqual((buy_price, sell_price), (1.1002, 1.1000))
+        self.assertAlmostEqual(spread, 2.0)
+        for invalid_tick in (
+            None,
+            SimpleNamespace(bid=0, ask=1.1002),
+            SimpleNamespace(bid=1.1003, ask=1.1002),
+            SimpleNamespace(bid=float("nan"), ask=1.1002),
+        ):
+            with self.subTest(tick=invalid_tick), self.assertRaises(self.server.HTTPException) as error:
+                self.server.validate_execution_quote(invalid_tick, "BUY", 0.0001, 5, "EURUSD")
+            self.assertEqual(error.exception.status_code, 503)
+
+        with self.assertRaises(self.server.HTTPException) as error:
+            self.server.validate_execution_quote(
+                SimpleNamespace(bid=1.1000, ask=1.1006), "BUY", 0.0001, 5, "EURUSD"
+            )
+        self.assertEqual(error.exception.status_code, 423)
+
 
 if __name__ == "__main__":
     unittest.main()

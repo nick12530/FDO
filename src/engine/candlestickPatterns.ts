@@ -124,7 +124,7 @@ export function analyzeCandlestickPatterns(
       name: 'Bearish Liquidity Sweep Pinbar (Shooting Star)',
       bias: 'BEARISH',
       reliability: 94,
-      description: `Long upper rejection wick (${upperWickPct0}%) sweeps buy-side liquidity into premium institutional supply.`,
+      description: `Long upper rejection wick (${upperWickPct0}%) rejects prices above the recent range.`,
       marketInsight: `Check for nearby resistance or swept highs on ${instrumentName}.`,
       wickRatio: `${upperWickPct0}% Upper Wick`,
       displacementScore: 5,
@@ -135,7 +135,7 @@ export function analyzeCandlestickPatterns(
   if (!isBull1 && isBull0 && c0.close > c1.open && c0.open <= c1.close && body0 > body1 * 1.25) {
     detected.push({
       type: 'BULLISH_ENGULFING',
-      name: 'Bullish Institutional Engulfing (Displacement)',
+      name: 'Bullish Engulfing (Displacement)',
       bias: 'BULLISH',
       reliability: 91,
       description: 'Massive bullish displacement candle completely engulfs prior bearish range, creating fresh Fair Value Gaps.',
@@ -146,10 +146,10 @@ export function analyzeCandlestickPatterns(
   } else if (isBull1 && !isBull0 && c0.close < c1.open && c0.open >= c1.close && body0 > body1 * 1.25) {
     detected.push({
       type: 'BEARISH_ENGULFING',
-      name: 'Bearish Institutional Engulfing (Displacement)',
+      name: 'Bearish Engulfing (Displacement)',
       bias: 'BEARISH',
       reliability: 91,
-      description: 'Aggressive institutional sell candle completely engulfs prior bullish candle, fracturing lower-timeframe market structure.',
+      description: 'Bearish candle completely engulfs the prior bullish candle.',
       marketInsight: 'Check whether the displacement breaks structure and leaves room to the next support.',
       wickRatio: `${bodyPct0}% Expansion Body`,
       displacementScore: 5,
@@ -164,7 +164,7 @@ export function analyzeCandlestickPatterns(
       name: 'Bullish Morning Star Reversal Cluster',
       bias: 'BULLISH',
       reliability: 89,
-      description: '3-candle reversal cluster: Bearish impulse followed by absorption doji, followed by aggressive bullish expansion.',
+      description: 'Three-candle reversal pattern: bearish candle, small middle candle, then bullish expansion.',
       marketInsight: 'Confirmation is stronger when the reversal forms at a pre-identified support zone.',
       wickRatio: '3-Bar Cluster',
       displacementScore: 4,
@@ -175,7 +175,7 @@ export function analyzeCandlestickPatterns(
       name: 'Bearish Evening Star Reversal Cluster',
       bias: 'BEARISH',
       reliability: 89,
-      description: '3-candle reversal cluster: Bullish push met by supply exhaustion doji and confirmed by heavy sell displacement.',
+      description: 'Three-candle reversal pattern: bullish candle, small middle candle, then bearish expansion.',
       marketInsight: 'Confirmation is stronger when the reversal forms at a pre-identified resistance zone.',
       wickRatio: '3-Bar Cluster',
       displacementScore: 4,
@@ -192,7 +192,7 @@ export function analyzeCandlestickPatterns(
       name: 'Tweezer Bottoms (Double Key Level Defense)',
       bias: 'BULLISH',
       reliability: 87,
-      description: 'Consecutive candles rejected at exact same low boundary, confirming institutional limit order defense.',
+      description: 'Consecutive candles rejected at a similar low; this marks a level, not confirmed order flow.',
       marketInsight: 'Treat the repeated low as a level to monitor; it is not a confirmed reversal on its own.',
       wickRatio: `${lowerWickPct0}% Defense Wick`,
       displacementScore: 4,
@@ -214,7 +214,7 @@ export function analyzeCandlestickPatterns(
   if (isBull0 && isBull1 && c2.close >= c2.open && c0.close > c1.close && c1.close > c2.close && bodyPct0 > 55) {
     detected.push({
       type: 'THREE_WHITE_SOLDIERS',
-      name: 'Three White Soldiers (Sustained Institutional Inflow)',
+      name: 'Three White Soldiers (Bullish Momentum)',
       bias: 'BULLISH',
       reliability: 86,
       description: 'Three consecutive strong bullish candles with progressive higher closes and minimal upper wicks.',
@@ -228,21 +228,21 @@ export function analyzeCandlestickPatterns(
       name: 'Three Black Crows (Aggressive Sell-Off Expansion)',
       bias: 'BEARISH',
       reliability: 86,
-      description: 'Three consecutive strong bearish candles with progressive lower closes, confirming institutional distribution.',
+      description: 'Three consecutive strong bearish candles with progressively lower closes.',
       marketInsight: 'Momentum may be extended; check trend context and avoid chasing after a large move.',
       wickRatio: `${bodyPct0}% Momentum`,
       displacementScore: 5,
     });
   }
 
-  // 6. INSIDE BAR (Institutional Volatility Compression)
+  // 6. INSIDE BAR (Volatility Compression)
   if (c0.high < c1.high && c0.low > c1.low) {
     detected.push({
       type: 'INSIDE_BAR',
       name: 'Inside Bar (Volatility Compression Coil)',
       bias: 'NEUTRAL',
       reliability: 82,
-      description: 'Current candle range completely inside mother bar, signaling institutional order accumulation before breakout.',
+      description: 'Current candle range is inside the prior candle; breakout direction is not yet known.',
       marketInsight: 'Compression can precede expansion, but the breakout direction is not known until confirmed.',
       wickRatio: 'Coiled Range',
       displacementScore: 3,

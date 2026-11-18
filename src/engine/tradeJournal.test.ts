@@ -11,7 +11,7 @@ const exampleSignal: Signal = {
   direction: 'BUY',
   timeframe: 'M15',
   score: 50,
-  scoringPolicyVersion: 2,
+  scoringPolicyVersion: 3,
   entry: 2300,
   sl: 2295,
   tp: 2310,
