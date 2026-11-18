@@ -262,6 +262,19 @@ export interface EconomicEvent {
   surpriseDirection?: 'BULLISH' | 'BEARISH' | 'INLINE' | 'PENDING';
 }
 
+export interface EconomicCalendarStatus {
+  available: boolean;
+  source?: string;
+  updatedAt?: string;
+  error?: string;
+}
+
+export interface EconomicCalendarSnapshot {
+  events: EconomicEvent[];
+  source: string;
+  updatedAt: string;
+}
+
 export interface VolumeMetrics {
   available: boolean;
   currentVolume: number;
@@ -451,6 +464,7 @@ export interface EngineState {
     login: string;
     server: string;
     broker: string;
+    currency?: string;
     balance: number;
     equity: number;
     freeMargin: number;
@@ -475,6 +489,7 @@ export interface MacroSentimentState {
 export interface EventsState {
   log: EngineLog[];
   economicEvents: EconomicEvent[];
+  economicCalendarStatus: EconomicCalendarStatus;
   macroSentiment?: MacroSentimentState;
 }
 

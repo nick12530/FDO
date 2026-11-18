@@ -1,4 +1,4 @@
-import { Candle, ClosedTrade, EconomicEvent, InstrumentType, PendingOrder, TradeDirection, NewsSentimentItem } from '../types/smc';
+import { Candle, ClosedTrade, EconomicCalendarSnapshot, EconomicEvent, InstrumentType, PendingOrder, TradeDirection, NewsSentimentItem } from '../types/smc';
 import type { SymbolRiskSpec } from './riskConfig';
 import { getSupportedSymbol } from './instrumentConfig';
 
@@ -6,6 +6,7 @@ export interface BridgeAccountSnapshot {
   account: {
     login: number;
     server: string;
+    currency?: string;
     balance: number;
     equity: number;
     margin_free: number;
@@ -152,7 +153,7 @@ export class MT5BridgeConnector {
   private calendarInFlight = false;
   private onDataCallback: ((data: BridgeAccountSnapshot) => void) | null = null;
   private onClosedTradesCallback: ((trades: ClosedTrade[]) => void) | null = null;
-  private onEconomicCalendarCallback: ((events: EconomicEvent[] | null) => void) | null = null;
+  private onEconomicCalendarCallback: ((snapshot: EconomicCalendarSnapshot | null, error?: string) => void) | null = null;
   private onConnectionChangeCallback: ((connected: boolean, error?: string) => void) | null = null;
   private lastPing: number | null = null;
   private lastError: string | null = null;
@@ -216,7 +217,7 @@ export class MT5BridgeConnector {
     this.onClosedTradesCallback = callback;
   }
 
-  setEconomicCalendarCallback(callback: (events: EconomicEvent[] | null) => void) {
+  setEconomicCalendarCallback(callback: (snapshot: EconomicCalendarSnapshot | null, error?: string) => void) {
     this.onEconomicCalendarCallback = callback;
   }
 
@@ -932,14 +933,26 @@ export class MT5BridgeConnector {
       const response = await this.request<{
         available: boolean;
         events: EconomicEvent[];
+        source: string;
+        updatedAt: string;
       }>('/api/economic-calendar', {});
-      if (!response.available || !Array.isArray(response.events)) {
+      if (
+        !response.available ||
+        !Array.isArray(response.events) ||
+        typeof response.source !== 'string' ||
+        typeof response.updatedAt !== 'string' ||
+        Number.isNaN(Date.parse(response.updatedAt))
+      ) {
         throw new Error('The economic calendar returned an invalid response.');
       }
-      this.onEconomicCalendarCallback?.(response.events);
+      this.onEconomicCalendarCallback?.({
+        events: response.events,
+        source: response.source,
+        updatedAt: response.updatedAt,
+      });
     } catch (error) {
       const detail = error instanceof Error ? error.message : 'Unknown economic calendar error.';
-      this.onEconomicCalendarCallback?.(null);
+      this.onEconomicCalendarCallback?.(null, detail);
       console.warn(`[MT5 Bridge] Economic calendar unavailable; standard setups remain blocked: ${detail}`);
     } finally {
       this.calendarInFlight = false;

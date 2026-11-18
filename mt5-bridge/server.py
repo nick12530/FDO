@@ -67,7 +67,7 @@ _inflight_order_requests: set[str] = set()
 _symbol_spec_cache: dict[tuple[int, str, str], dict] = {}
 _closed_trades_cache: dict[str, tuple[float, list[dict]]] = {}
 _closed_trades_cache_ttl = 5.0  # Cache closed trades for 5s to eliminate redundant heavy deal processing
-_economic_calendar_cache: tuple[float, str, list[dict]] | None = None
+_economic_calendar_cache: tuple[float, str, list[dict], str] | None = None
 _economic_calendar_cache_lock = threading.Lock()
 _economic_calendar_cache_ttl = 15 * 60
 _live_news_cache: tuple[float, list[dict]] | None = None
@@ -506,6 +506,7 @@ def require_account() -> dict:
     return {
         "login": int(account.login),
         "server": str(account.server),
+        "currency": str(getattr(account, "currency", "") or ""),
         "balance": float(account.balance),
         "equity": float(account.equity),
         "margin_free": float(account.margin_free),
@@ -842,18 +843,22 @@ def economic_calendar(request: Request) -> dict:
             _economic_calendar_cache is not None
             and now_monotonic - _economic_calendar_cache[0] < _economic_calendar_cache_ttl
         ):
-            cached_at = datetime.now(timezone.utc)
-            source, raw_events = _economic_calendar_cache[1], _economic_calendar_cache[2]
+            now = datetime.now(timezone.utc)
+            source, raw_events, fetched_at = (
+                _economic_calendar_cache[1],
+                _economic_calendar_cache[2],
+                _economic_calendar_cache[3],
+            )
             events = (
-                normalize_forexfactory_calendar(raw_events, cached_at)
+                normalize_forexfactory_calendar(raw_events, now)
                 if source == "Forex Factory"
-                else normalize_finnhub_calendar(raw_events, cached_at)
+                else normalize_finnhub_calendar(raw_events, now)
             )
             return {
                 "available": True,
                 "events": events,
                 "source": source,
-                "updatedAt": cached_at.isoformat(),
+                "updatedAt": fetched_at,
             }
 
     now = datetime.now(timezone.utc)
@@ -905,13 +910,14 @@ def economic_calendar(request: Request) -> dict:
                 continue
             events = normalize_finnhub_calendar(raw_events, now)
 
+        fetched_at = now.isoformat()
         with _economic_calendar_cache_lock:
-            _economic_calendar_cache = (time.monotonic(), source, raw_events)
+            _economic_calendar_cache = (time.monotonic(), source, raw_events, fetched_at)
         return {
             "available": True,
             "events": events,
             "source": source,
-            "updatedAt": now.isoformat(),
+            "updatedAt": fetched_at,
         }
 
     failure_summary = "; ".join(provider_failures) or "No calendar providers are configured"

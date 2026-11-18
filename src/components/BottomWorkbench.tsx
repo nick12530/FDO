@@ -19,7 +19,7 @@ import {
   useTicker,
   useEngine,
   useMarket,
-  useMacroSentiment,
+  useEvents,
   useScannerAnalyses,
   useWebhookState,
   useSignalValidations,
@@ -72,13 +72,16 @@ export const BottomWorkbench: React.FC<BottomWorkbenchProps> = React.memo(({
   const ticker = useTicker();
   const engine = useEngine();
   const market = useMarket();
-  const macro = useMacroSentiment();
+  const eventsState = useEvents();
+  const macro = eventsState.macroSentiment;
+  const calendarStatus = eventsState.economicCalendarStatus;
   const analyses = useScannerAnalyses();
   const webhook = useWebhookState();
   const validations = useSignalValidations();
 
   const [activeTab, setActiveTab] = useState<WorkbenchTab>('positions');
   const [macroSubTab, setMacroSubTab] = useState<'news' | 'calendar' | 'volume'>('news');
+  const [calendarImpactFilter, setCalendarImpactFilter] = useState<'all' | 'high' | 'medium' | 'low'>('all');
   const [isRefreshingNews, setIsRefreshingNews] = useState(false);
   const [customHeadline, setCustomHeadline] = useState('');
   const [sendingSymbol, setSendingSymbol] = useState<string | null>(null);
@@ -105,6 +108,18 @@ export const BottomWorkbench: React.FC<BottomWorkbenchProps> = React.memo(({
   const intermarket = macro?.intermarket;
   const hasIntermarket = Boolean(intermarket?.hasLiveData);
   const newsStatus = newsSentimentEngine.getStatus();
+  const calendarEvents = macro?.economicEvents ?? [];
+  const upcomingCalendarEvents = useMemo(
+    () => calendarEvents.filter((event) => {
+      const timestamp = Date.parse(event.time);
+      return Number.isFinite(timestamp) && timestamp >= now;
+    }),
+    [calendarEvents, now]
+  );
+  const filteredCalendarEvents = useMemo(
+    () => upcomingCalendarEvents.filter((event) => calendarImpactFilter === 'all' || event.impact === calendarImpactFilter),
+    [upcomingCalendarEvents, calendarImpactFilter]
+  );
 
   const metrics = useMemo(() => summarizeClosedTrades(closedTrades), [closedTrades]);
   const strategyAttribution = useMemo(
@@ -680,24 +695,86 @@ export const BottomWorkbench: React.FC<BottomWorkbenchProps> = React.memo(({
             )}
 
             {macroSubTab === 'calendar' && (
-              <div className="divide-y divide-slate-100 dark:divide-[#2b3b59] max-h-52 overflow-y-auto">
-                {macro?.economicEvents && macro.economicEvents.length > 0 ? (
-                  macro.economicEvents.map((event: EconomicEvent) => (
-                    <div key={event.id} className="py-2 flex items-center justify-between text-xs">
-                      <div>
-                        <div className="font-semibold text-slate-900 dark:text-slate-100">{event.event}</div>
-                        <div className="text-[11px] text-slate-400 font-mono">
-                          {event.currency} · Forecast: {event.forecast} · Prev: {event.previous}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-2 flex-wrap text-[11px] text-slate-500 dark:text-slate-400">
+                  <span>
+                    {calendarStatus.available
+                      ? `Source: ${calendarStatus.source || 'Unavailable'} · Updated ${
+                          calendarStatus.updatedAt
+                            ? new Date(calendarStatus.updatedAt).toLocaleString()
+                            : 'time unavailable'
+                        }`
+                      : engine.mt5Account?.connected
+                        ? `Calendar unavailable${calendarStatus.error ? `: ${calendarStatus.error}` : ''}`
+                        : 'Waiting for MT5 calendar connection'}
+                  </span>
+                  {calendarStatus.available && (
+                    <span>Upcoming provider events only · local time</span>
+                  )}
+                </div>
+                <div className="flex items-center gap-1" role="group" aria-label="Filter calendar by impact">
+                  {(['all', 'high', 'medium', 'low'] as const).map((impact) => (
+                    <button
+                      key={impact}
+                      type="button"
+                      aria-pressed={calendarImpactFilter === impact}
+                      onClick={() => setCalendarImpactFilter(impact)}
+                      className={`px-2 py-1 rounded-md capitalize cursor-pointer ${
+                        calendarImpactFilter === impact
+                          ? 'bg-slate-900 text-white dark:bg-white dark:text-slate-950'
+                          : 'text-slate-500 hover:bg-slate-100 dark:hover:bg-[#1e2230]'
+                      }`}
+                    >
+                      {impact}
+                    </button>
+                  ))}
+                </div>
+                <div className="divide-y divide-slate-100 dark:divide-[#2b3b59] max-h-52 overflow-y-auto">
+                  {filteredCalendarEvents.length > 0 ? (
+                    filteredCalendarEvents.map((event: EconomicEvent) => {
+                      const eventTime = new Date(event.time);
+                      const validTime = !Number.isNaN(eventTime.getTime());
+                      const minutesUntil = validTime
+                        ? Math.max(0, Math.ceil((eventTime.getTime() - now) / 60_000))
+                        : null;
+                      const impactClass =
+                        event.impact === 'high'
+                          ? 'bg-rose-500/10 text-rose-600 dark:text-rose-400'
+                          : event.impact === 'medium'
+                            ? 'bg-amber-500/10 text-amber-700 dark:text-amber-400'
+                            : 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300';
+                      return (
+                        <div key={event.id} className="py-2 flex items-start justify-between gap-3 text-xs">
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span className={`px-1.5 py-0.5 rounded uppercase text-[9px] font-bold ${impactClass}`}>
+                                {event.impact}
+                              </span>
+                              <span className="font-mono text-slate-500 dark:text-slate-400">{event.currency}</span>
+                              <span className="font-semibold text-slate-900 dark:text-slate-100">{event.event}</span>
+                            </div>
+                            <div className="mt-1 text-[11px] text-slate-400 font-mono">
+                              Forecast: {event.forecast || 'Unavailable'} · Previous: {event.previous || 'Unavailable'}
+                            </div>
+                          </div>
+                          <span className="shrink-0 text-right font-mono font-semibold text-slate-600 dark:text-slate-300 tabular-nums">
+                            {validTime
+                              ? `${eventTime.toLocaleString()}${minutesUntil !== null && minutesUntil < 60 ? ` · ${minutesUntil}m` : ''}`
+                              : 'Time unavailable'}
+                          </span>
                         </div>
-                      </div>
-                      <span className="font-mono font-semibold text-slate-600 dark:text-slate-300 tabular-nums">
-                        {event.time}
-                      </span>
+                      );
+                    })
+                  ) : (
+                    <div className="py-4 text-center text-slate-400">
+                      {!calendarStatus.available
+                        ? 'Unavailable — no calendar response from the provider.'
+                        : calendarEvents.length === 0 || upcomingCalendarEvents.length === 0
+                          ? "No upcoming events in the provider's seven-day window."
+                          : 'No events match this impact filter.'}
                     </div>
-                  ))
-                ) : (
-                  <div className="py-4 text-center text-slate-400">No upcoming high-impact events loaded.</div>
-                )}
+                  )}
+                </div>
               </div>
             )}
 

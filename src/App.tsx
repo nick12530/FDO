@@ -98,7 +98,9 @@ export default function App() {
   useEffect(() => {
     mt5Bridge.setCallback((snapshot) => tradingEngine.syncMt5Snapshot(snapshot));
     mt5Bridge.setClosedTradesCallback((trades) => tradingEngine.syncMt5ClosedTrades(trades));
-    mt5Bridge.setEconomicCalendarCallback((events) => tradingEngine.syncEconomicCalendar(events));
+    mt5Bridge.setEconomicCalendarCallback((snapshot, error) =>
+      tradingEngine.syncEconomicCalendar(snapshot, error)
+    );
     mt5Bridge.setConnectionChangeCallback((connected, error) =>
       tradingEngine.setMt5BridgeConnectionStatus(connected, error)
     );

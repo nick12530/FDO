@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 
@@ -47,6 +48,7 @@ class FakeMT5Adapter:
         return SimpleNamespace(
             login=self.login,
             server="Broker-Demo",
+            currency="USD",
             balance=1000,
             equity=1000,
             margin_free=1000,
@@ -99,6 +101,11 @@ class TestServerTestDependencies(unittest.TestCase):
 
         self.assertEqual(self.server.resolve_broker_symbol("XAUUSD"), "XAUUSD")
         self.assertEqual(adapter.calls, [("symbol_info", "XAUUSD")])
+
+    def test_account_snapshot_includes_broker_currency(self):
+        self.server.configure_mt5_adapter(FakeMT5Adapter())
+
+        self.assertEqual(self.server.require_account()["currency"], "USD")
 
     def test_server_state_database_is_initialized_in_temporary_directory(self):
         self.assertTrue(self.server.STATE_DATABASE.is_relative_to(self.temp_directory.name))
@@ -238,6 +245,38 @@ class TestServerTestDependencies(unittest.TestCase):
         with self.assertRaises(self.server.HTTPException) as error:
             self.server.research_ticks(request, "EURUSD", now - 7 * 60 * 60, now)
         self.assertEqual(error.exception.status_code, 400)
+
+    def test_calendar_cache_preserves_provider_fetch_time(self):
+        request = SimpleNamespace(
+            headers={},
+            query_params={},
+            client=SimpleNamespace(host="testclient"),
+        )
+        original_cache = self.server._economic_calendar_cache
+        fetched_at = "2026-10-21T11:00:00+00:00"
+        event_time = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+        self.server._economic_calendar_cache = (
+            time.monotonic(),
+            "Forex Factory",
+            [{
+                "title": "CPI",
+                "country": "USD",
+                "date": event_time,
+                "impact": "High",
+                "forecast": "2.1%",
+                "previous": "2.0%",
+            }],
+            fetched_at,
+        )
+
+        try:
+            response = self.server.economic_calendar(request)
+        finally:
+            self.server._economic_calendar_cache = original_cache
+
+        self.assertEqual(response["updatedAt"], fetched_at)
+        self.assertEqual(response["source"], "Forex Factory")
+        self.assertEqual(response["events"][0]["event"], "CPI")
 
 
 if __name__ == "__main__":

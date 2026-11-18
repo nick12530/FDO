@@ -57,6 +57,14 @@ export const DailyReportModal: React.FC<DailyReportModalProps> = ({
 
   const mt5 = engine.mt5Account;
   const accountLabel = mt5?.connected ? `MT5 #${mt5.login} · ${mt5.server}` : 'No MT5 Account Connected';
+  const accountCurrency = mt5?.connected ? mt5.currency : undefined;
+  const formatMoney = (value: number) =>
+    accountCurrency
+      ? `${value < 0 ? '-' : ''}${Math.abs(value).toLocaleString(undefined, {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2,
+        })} ${accountCurrency}`
+      : 'Unavailable';
 
   const stats = useMemo(() => {
     const dayTrades = closedTrades.filter((trade) => closedTradeDayKey(trade) === activeDate);
@@ -65,25 +73,26 @@ export const DailyReportModal: React.FC<DailyReportModalProps> = ({
     const losingTrades = dayTrades.filter((t) => t.profit < 0);
     const winCount = winningTrades.length;
     const lossCount = losingTrades.length;
-    const winRate = totalCount > 0 ? ((winCount / totalCount) * 100).toFixed(1) : '0.0';
+    const breakevenCount = totalCount - winCount - lossCount;
+    const winRate = totalCount > 0 ? ((winCount / totalCount) * 100).toFixed(1) : '—';
 
     const grossProfit = winningTrades.reduce((acc, t) => acc + t.profit, 0);
     const grossLoss = Math.abs(losingTrades.reduce((acc, t) => acc + t.profit, 0));
     const netPnl = Number((grossProfit - grossLoss).toFixed(2));
-    const profitFactor = grossLoss > 0 ? (grossProfit / grossLoss).toFixed(2) : grossProfit > 0 ? 'MAX' : '0.00';
+    const profitFactor = grossLoss > 0 ? (grossProfit / grossLoss).toFixed(2) : grossProfit > 0 ? '∞' : '—';
 
     const totalVolume = dayTrades.reduce((acc, t) => acc + t.volume, 0);
     const totalPips = dayTrades.reduce((acc, t) => acc + t.pips, 0);
 
-    const avgWin = winCount > 0 ? (grossProfit / winCount).toFixed(2) : '0.00';
-    const avgLoss = lossCount > 0 ? (grossLoss / lossCount).toFixed(2) : '0.00';
+    const avgWin = winCount > 0 ? (grossProfit / winCount).toFixed(2) : '—';
+    const avgLoss = lossCount > 0 ? (grossLoss / lossCount).toFixed(2) : '—';
 
     const longTrades = dayTrades.filter((t) => t.type === 'BUY');
     const shortTrades = dayTrades.filter((t) => t.type === 'SELL');
     const longWins = longTrades.filter((t) => t.profit > 0).length;
     const shortWins = shortTrades.filter((t) => t.profit > 0).length;
-    const longWinRate = longTrades.length > 0 ? ((longWins / longTrades.length) * 100).toFixed(0) : '0';
-    const shortWinRate = shortTrades.length > 0 ? ((shortWins / shortTrades.length) * 100).toFixed(0) : '0';
+    const longWinRate = longTrades.length > 0 ? ((longWins / longTrades.length) * 100).toFixed(0) : '—';
+    const shortWinRate = shortTrades.length > 0 ? ((shortWins / shortTrades.length) * 100).toFixed(0) : '—';
 
     const startBalance =
       tradingEngine.account.daily_start_balance > 0
@@ -91,20 +100,21 @@ export const DailyReportModal: React.FC<DailyReportModalProps> = ({
         : ticker.balance > 0
           ? Math.max(1, ticker.balance - netPnl)
           : 0;
-    const returnPct = startBalance > 0 ? ((netPnl / startBalance) * 100).toFixed(2) : '0.00';
+    const returnPct = startBalance > 0 && totalCount > 0 ? ((netPnl / startBalance) * 100).toFixed(2) : '—';
 
     return {
       dayTrades,
       totalCount,
       winCount,
       lossCount,
+      breakevenCount,
       winRate,
       grossProfit: grossProfit.toFixed(2),
       grossLoss: grossLoss.toFixed(2),
       netPnl,
       profitFactor,
-      totalVolume: totalVolume.toFixed(2),
-      totalPips: totalPips.toFixed(1),
+      totalVolume: totalCount > 0 ? totalVolume.toFixed(2) : '—',
+      totalPips: totalCount > 0 ? totalPips.toFixed(1) : '—',
       avgWin,
       avgLoss,
       longCount: longTrades.length,
@@ -147,16 +157,16 @@ NIFTY TERMINAL - DAILY PERFORMANCE REPORT
 Account:         ${accountLabel}
 Session Date:    ${activeDate} (Local)
 -------------------------------------------
-Net Realized PnL:   ${stats.netPnl >= 0 ? '+' : ''}$${stats.netPnl.toFixed(2)} USD (${stats.returnPct}%)
-Total Trades:       ${stats.totalCount} (${stats.winCount}W / ${stats.lossCount}L)
-Win Rate:           ${stats.winRate}%
+Net Realized PnL:   ${stats.totalCount > 0 ? formatMoney(stats.netPnl) : 'No closed trades'} (${stats.returnPct}%)
+Total Trades:       ${stats.totalCount} (${stats.winCount}W / ${stats.lossCount}L / ${stats.breakevenCount}BE)
+Win Rate:           ${stats.totalCount > 0 ? `${stats.winRate}%` : 'Unavailable'}
 Profit Factor:      ${stats.profitFactor}
 Total Pips:         ${stats.totalPips} pips
 Volume Executed:    ${stats.totalVolume} Lots
-Avg Win / Loss:     +$${stats.avgWin} / -$${stats.avgLoss}
-Long Win Rate:      ${stats.longWinRate}% (${stats.longCount} trades)
-Short Win Rate:     ${stats.shortWinRate}% (${stats.shortCount} trades)
-Current Equity:     $${ticker.equity.toFixed(2)}
+Avg Win / Loss:     ${stats.avgWin === '—' ? 'Unavailable' : `${formatMoney(Number(stats.avgWin))} / ${stats.avgLoss === '—' ? 'Unavailable' : formatMoney(Number(stats.avgLoss))}`}
+Long Win Rate:      ${stats.longWinRate}${stats.longWinRate !== '—' ? '%' : ''} (${stats.longCount} trades)
+Short Win Rate:     ${stats.shortWinRate}${stats.shortWinRate !== '—' ? '%' : ''} (${stats.shortCount} trades)
+Current Equity:     ${formatMoney(ticker.equity)}
 Daily Drawdown:     ${tradingEngine.account.daily_drawdown_pct}% (Max: ${tradingEngine.account.max_daily_loss_pct}%)
 ===========================================`;
 
@@ -268,17 +278,21 @@ Daily Drawdown:     ${tradingEngine.account.daily_drawdown_pct}% (Max: ${trading
               <div className="flex items-baseline gap-2.5 mt-0.5">
                 <span
                   className={`text-2xl font-black font-mono tabular-nums tracking-tight ${
-                    stats.netPnl >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'
+                    stats.totalCount === 0
+                      ? 'text-slate-500 dark:text-slate-400'
+                      : stats.netPnl >= 0
+                        ? 'text-emerald-600 dark:text-emerald-400'
+                        : 'text-rose-600 dark:text-rose-400'
                   }`}
                 >
-                  {stats.netPnl >= 0 ? '+' : ''}${stats.netPnl.toFixed(2)}
+                  {stats.totalCount > 0 ? formatMoney(stats.netPnl) : 'No closed trades'}
                 </span>
                 <span
                   className={`text-xs font-mono font-bold ${
                     stats.netPnl >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'
                   }`}
                 >
-                  ({stats.netPnl >= 0 ? '+' : ''}{stats.returnPct}%)
+                  {stats.totalCount > 0 ? `(${stats.netPnl >= 0 ? '+' : ''}${stats.returnPct}%)` : ''}
                 </span>
               </div>
             </div>
@@ -289,7 +303,7 @@ Daily Drawdown:     ${tradingEngine.account.daily_drawdown_pct}% (Max: ${trading
                   Balance
                 </span>
                 <span className="text-sm font-extrabold text-slate-900 dark:text-white tabular-nums">
-                  ${ticker.balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  {formatMoney(ticker.balance)}
                 </span>
               </div>
               <div className="w-px h-8 bg-slate-200 dark:bg-[#2b3b59]" />
@@ -298,7 +312,9 @@ Daily Drawdown:     ${tradingEngine.account.daily_drawdown_pct}% (Max: ${trading
                   Daily Drawdown
                 </span>
                 <span className="text-sm font-extrabold text-emerald-600 dark:text-emerald-400 tabular-nums">
-                  {tradingEngine.account.daily_drawdown_pct}% / {tradingEngine.account.max_daily_loss_pct}%
+                  {mt5?.connected
+                    ? `${tradingEngine.account.daily_drawdown_pct}% / ${tradingEngine.account.max_daily_loss_pct}%`
+                    : 'Unavailable'}
                 </span>
               </div>
             </div>
@@ -309,10 +325,10 @@ Daily Drawdown:     ${tradingEngine.account.daily_drawdown_pct}% (Max: ${trading
             <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-white dark:bg-[#141f35]">
               <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400 block">Win Rate</span>
               <div className="text-base font-extrabold font-mono text-slate-900 dark:text-white tabular-nums mt-0.5">
-                {stats.winRate}%
+                {stats.winRate}{stats.totalCount > 0 ? '%' : ''}
               </div>
               <div className="text-[10px] font-mono text-slate-500 dark:text-slate-400">
-                {stats.winCount}W · {stats.lossCount}L ({stats.totalCount} total)
+                {stats.winCount}W · {stats.lossCount}L · {stats.breakevenCount}BE ({stats.totalCount} total)
               </div>
             </div>
 
@@ -322,14 +338,16 @@ Daily Drawdown:     ${tradingEngine.account.daily_drawdown_pct}% (Max: ${trading
                 {stats.profitFactor}
               </div>
               <div className="text-[10px] font-mono text-slate-500 dark:text-slate-400">
-                +${stats.grossProfit} / -${stats.grossLoss}
+                {stats.totalCount > 0
+                  ? `Gross profit ${formatMoney(Number(stats.grossProfit))} · gross loss ${formatMoney(Number(stats.grossLoss))}`
+                  : 'No closed trades'}
               </div>
             </div>
 
             <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-white dark:bg-[#141f35]">
               <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400 block">Pips &amp; Volume</span>
               <div className="text-base font-extrabold font-mono text-slate-900 dark:text-white tabular-nums mt-0.5">
-                {stats.totalPips} pips
+                {stats.totalPips}{stats.totalCount > 0 ? ' pips' : ''}
               </div>
               <div className="text-[10px] font-mono text-slate-500 dark:text-slate-400">
                 {stats.totalVolume} lots
@@ -339,14 +357,14 @@ Daily Drawdown:     ${tradingEngine.account.daily_drawdown_pct}% (Max: ${trading
             <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-white dark:bg-[#141f35]">
               <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400 block">Avg Win / Loss</span>
               <div className="text-sm font-extrabold font-mono text-slate-900 dark:text-white tabular-nums mt-0.5">
-                +${stats.avgWin} / -${stats.avgLoss}
+                {stats.avgWin === '—' ? '—' : `${formatMoney(Number(stats.avgWin))} / ${stats.avgLoss === '—' ? '—' : formatMoney(Number(stats.avgLoss))}`}
               </div>
             </div>
 
             <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-white dark:bg-[#141f35]">
               <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400 block">Long (BUY)</span>
               <div className="text-sm font-extrabold font-mono text-emerald-600 dark:text-emerald-400 tabular-nums mt-0.5">
-                {stats.longWinRate}% Win
+                {stats.longWinRate}{stats.longWinRate !== '—' ? '% Win' : ''}
               </div>
               <div className="text-[10px] font-mono text-slate-500 dark:text-slate-400">
                 {stats.longCount} trades
@@ -356,7 +374,7 @@ Daily Drawdown:     ${tradingEngine.account.daily_drawdown_pct}% (Max: ${trading
             <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-white dark:bg-[#141f35]">
               <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400 block">Short (SELL)</span>
               <div className="text-sm font-extrabold font-mono text-rose-600 dark:text-rose-400 tabular-nums mt-0.5">
-                {stats.shortWinRate}% Win
+                {stats.shortWinRate}{stats.shortWinRate !== '—' ? '% Win' : ''}
               </div>
               <div className="text-[10px] font-mono text-slate-500 dark:text-slate-400">
                 {stats.shortCount} trades
@@ -476,7 +494,7 @@ Daily Drawdown:     ${tradingEngine.account.daily_drawdown_pct}% (Max: ${trading
                           <td className="py-2.5 px-2 text-slate-500 dark:text-slate-400">{t.reason}</td>
                           <td className="py-2.5 px-3 text-right font-mono font-extrabold tabular-nums">
                             <span className={t.profit >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}>
-                              {t.profit >= 0 ? '+' : ''}${t.profit.toFixed(2)}
+                              {formatMoney(t.profit)}
                             </span>
                           </td>
                         </tr>

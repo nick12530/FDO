@@ -19,6 +19,7 @@ import {
   PositionsState,
   EngineState,
   EventsState,
+  EconomicCalendarSnapshot,
   EconomicEvent,
   StoreChannel,
   TradeDirection,
@@ -341,6 +342,7 @@ export class TradingEngine {
   private lastPairDataError = '';
   private economicEvents: EconomicEvent[] = [];
   private economicCalendarAvailable = false;
+  private economicCalendarStatus: EventsState['economicCalendarStatus'] = { available: false };
   private entryHistory: Array<{
     at: number;
     direction: TradeDirection;
@@ -386,6 +388,7 @@ export class TradingEngine {
     login: string;
     server: string;
     broker: string;
+    currency?: string;
     balance: number;
     equity: number;
     freeMargin: number;
@@ -583,6 +586,7 @@ export class TradingEngine {
     account: {
       login: number;
       server: string;
+      currency?: string;
       balance: number;
       equity: number;
       margin_free: number;
@@ -642,6 +646,7 @@ export class TradingEngine {
       login: String(account.login),
       server: account.server,
       broker: brokerName,
+      currency: account.currency || undefined,
       balance: account.balance,
       equity: account.equity,
       freeMargin: account.margin_free,
@@ -1058,9 +1063,12 @@ export class TradingEngine {
     this.emit('positions');
   }
 
-  syncEconomicCalendar(events: EconomicEvent[] | null): void {
-    this.economicCalendarAvailable = events !== null;
-    this.economicEvents = events ?? [];
+  syncEconomicCalendar(snapshot: EconomicCalendarSnapshot | null, error?: string): void {
+    this.economicCalendarAvailable = snapshot !== null;
+    this.economicEvents = snapshot?.events ?? [];
+    this.economicCalendarStatus = snapshot
+      ? { available: true, source: snapshot.source, updatedAt: snapshot.updatedAt }
+      : { available: false, error };
     this.invalidateEvents();
     this.emit('events');
     this.refreshScanner();
@@ -1669,6 +1677,7 @@ export class TradingEngine {
       login,
       server,
       broker: brokerName,
+      currency: undefined,
       balance: bal,
       equity: eq,
       freeMargin: bal,
@@ -1710,6 +1719,7 @@ export class TradingEngine {
       login: '',
       server: '',
       broker: '',
+      currency: undefined,
       balance: 0,
       equity: 0,
       freeMargin: 0,
@@ -2025,6 +2035,7 @@ export class TradingEngine {
       this._cachedEvents = {
         log: this.logs,
         economicEvents: this.economicEvents,
+        economicCalendarStatus: this.economicCalendarStatus,
         macroSentiment: {
           newsItems: newsSentimentEngine.getNews(),
           economicEvents: this.economicEvents,

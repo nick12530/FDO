@@ -12,17 +12,15 @@ import {
   useJournalSignals,
   useJournalTrades,
   usePositions,
-  useTicker,
 } from '../hooks/useTradingStore';
 import {
   clearJournalSignals,
   closedTradeDayKey,
   localDayKey,
-  updateTradeClosedInJournal,
 } from '../engine/tradeJournal';
 import { tradingEngine } from '../engine/tradingEngine';
 import { mt5Bridge } from '../engine/mt5Bridge';
-import { getInstrumentConfig, getSupportedSymbol, SupportedSymbol } from '../engine/instrumentConfig';
+import { getInstrumentConfig, SupportedSymbol } from '../engine/instrumentConfig';
 import {
   CalendarDays,
   ChevronLeft,
@@ -74,11 +72,17 @@ function formatTradeTimeLabel(trade: JournalTradeRecord): string {
   return '—';
 }
 
-function formatCompactMoney(val: number): string {
+function formatCompactMoney(val: number, currency?: string): string {
+  if (!currency) return 'Unavailable';
   const abs = Math.abs(val);
   const sign = val > 0 ? '+' : val < 0 ? '-' : '';
-  if (abs >= 1000) return `${sign}$${(abs / 1000).toFixed(1)}k`;
-  return `${sign}$${abs.toFixed(abs >= 100 ? 0 : 2)}`;
+  if (abs >= 1000) return `${sign}${(abs / 1000).toFixed(1)}k ${currency}`;
+  return `${sign}${abs.toFixed(abs >= 100 ? 0 : 2)} ${currency}`;
+}
+
+function formatMoney(val: number, currency?: string): string {
+  if (!currency) return 'Unavailable';
+  return `${val >= 0 ? '+' : '-'}${Math.abs(val).toFixed(2)} ${currency}`;
 }
 
 export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
@@ -102,7 +106,6 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
     return { year: now.getFullYear(), month: now.getMonth() };
   });
 
-  const ticker = useTicker();
   const engine = useEngine();
   const closedTrades = useClosedTrades();
   const storedJournalTrades = useJournalTrades();
@@ -111,6 +114,7 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
 
   const mt5 = engine.mt5Account;
   const isMt5Connected = Boolean(mt5?.connected);
+  const accountCurrency = isMt5Connected ? mt5?.currency : undefined;
 
   useEffect(() => {
     if (!isOpen) return;
@@ -160,30 +164,10 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
 
     for (const [ticket, trade] of map.entries()) {
       if (trade.status === 'RUNNING') {
-        const matchingPos = livePositions.find(
-          (p) => p.ticket === ticket || (p.symbol === trade.symbol && p.type === trade.type)
-        );
+        const matchingPos = livePositions.find((p) => p.ticket === ticket);
         if (matchingPos) {
           trade.profit = matchingPos.profit;
           trade.pips = matchingPos.pips;
-          trade.closePrice = matchingPos.type === 'BUY' ? ticker.bid : ticker.ask;
-        } else {
-          const sym = trade.symbol || ticker.symbol || 'XAUUSD';
-          const pairSymbol = getSupportedSymbol(sym);
-          const pairQuote = pairSymbol ? tradingEngine.pairData[pairSymbol] : undefined;
-          const curBid = sym === ticker.symbol ? ticker.bid : (pairQuote?.bid ?? trade.openPrice);
-          const curAsk = sym === ticker.symbol ? ticker.ask : (pairQuote?.ask ?? trade.openPrice);
-          const curPrice = trade.type === 'BUY' ? curBid : curAsk;
-          const cfg = getInstrumentConfig(sym);
-          const pts = trade.type === 'BUY' ? curPrice - trade.openPrice : trade.openPrice - curPrice;
-          const pips = Number((pts / cfg.pipSize).toFixed(1));
-          const profit =
-            String(sym) === 'USDJPY'
-              ? Number(((pts * trade.volume * cfg.contractSize) / Math.max(1, curPrice)).toFixed(2))
-              : Number((pts * trade.volume * cfg.contractSize).toFixed(2));
-          trade.profit = profit;
-          trade.pips = pips;
-          trade.closePrice = curPrice;
         }
       }
     }
@@ -196,7 +180,7 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
       if (aTime !== bTime) return bTime.localeCompare(aTime);
       return b.ticket - a.ticket;
     });
-  }, [storedJournalTrades, closedTrades, livePositions, ticker.bid, ticker.ask, ticker.symbol]);
+  }, [storedJournalTrades, closedTrades, livePositions]);
 
   const closedOnly = useMemo(
     () => allTradesTaken.filter((t) => t.status !== 'RUNNING'),
@@ -279,7 +263,7 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
     return {
       netPnl: Number(netPnl.toFixed(2)),
       trades,
-      winRate: trades > 0 ? ((wins / trades) * 100).toFixed(1) : '0.0',
+      winRate: trades > 0 ? ((wins / trades) * 100).toFixed(1) : '—',
       greenDays,
       redDays,
     };
@@ -321,10 +305,13 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
   }, [journalSignals, signalFilter, searchQuery]);
 
   const totalTradesCount = allTradesTaken.length;
-  const runningCount = allTradesTaken.filter((t) => t.status === 'RUNNING').length;
+  const runningCount = livePositions.length;
+  const unconfirmedCount = allTradesTaken.filter(
+    (trade) => trade.status === 'RUNNING' && !livePositions.some((position) => position.ticket === trade.ticket)
+  ).length;
   const closedCount = closedOnly.length;
   const wins = closedOnly.filter((t) => t.profit > 0).length;
-  const winRate = closedCount > 0 ? ((wins / closedCount) * 100).toFixed(1) : '0.0';
+  const winRate = closedCount > 0 ? ((wins / closedCount) * 100).toFixed(1) : '—';
   const totalNet = Number(closedOnly.reduce((sum, t) => sum + t.profit, 0).toFixed(2));
 
   const totalSignalsCount = journalSignals.length;
@@ -369,7 +356,9 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
     } else {
       csvContent = 'Ticket,Symbol,Type,Volume,OpenPrice,ClosePrice,Profit,Pips,Status,Reason,ClosedAt\n';
       for (const t of allTradesTaken) {
-        csvContent += `${t.ticket},${t.symbol || ''},${t.type},${t.volume},${t.openPrice},${t.closePrice},${t.profit},${t.pips},${t.status},${t.reason},${t.closedAt || t.openTime || ''}\n`;
+        const isUnconfirmed = t.status === 'RUNNING' && !livePositions.some((position) => position.ticket === t.ticket);
+        const closePrice = t.status === 'RUNNING' ? '' : t.closePrice;
+        csvContent += `${t.ticket},${t.symbol || ''},${t.type},${t.volume},${t.openPrice},${closePrice},${isUnconfirmed ? '' : t.profit},${isUnconfirmed ? '' : t.pips},${isUnconfirmed ? 'AWAITING_MT5' : t.status},${t.reason},${t.closedAt || t.openTime || ''}\n`;
       }
     }
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
@@ -383,32 +372,12 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
   };
 
   const handleCloseRunningTrade = (ticket: number) => {
+    if (!livePositions.some((position) => position.ticket === ticket)) return;
     tradingEngine.closePosition(ticket, 'Manual');
-    const liveTrade = allTradesTaken.find((t) => t.ticket === ticket);
-    if (liveTrade) {
-      updateTradeClosedInJournal(
-        ticket,
-        liveTrade.closePrice || liveTrade.openPrice,
-        liveTrade.profit,
-        liveTrade.pips,
-        'Manual'
-      );
-    }
   };
 
   const handleCloseAllRunningTrades = () => {
     tradingEngine.closeAll('Manual');
-    for (const t of allTradesTaken) {
-      if (t.status === 'RUNNING') {
-        updateTradeClosedInJournal(
-          t.ticket,
-          t.closePrice || t.openPrice,
-          t.profit,
-          t.pips,
-          'Manual'
-        );
-      }
-    }
   };
 
   const handleClearCurrent = () => {
@@ -529,7 +498,7 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
         <div className="flex-1 overflow-y-auto p-5 space-y-4">
           {/* Account Totals Strip */}
           {activeTab !== 'signals' ? (
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+            <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-2.5">
               <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-slate-50/70 dark:bg-[#141f35]">
                 <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400 block">Closed Trades</span>
                 <strong className="text-sm font-extrabold text-slate-900 dark:text-white tabular-nums block mt-0.5">
@@ -537,25 +506,35 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
                 </strong>
               </div>
               <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-slate-50/70 dark:bg-[#141f35]">
-                <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400 block">Running</span>
+                <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400 block">Broker Positions</span>
                 <strong className="text-sm font-extrabold text-sky-600 dark:text-sky-400 tabular-nums block mt-0.5">
                   {runningCount}
                 </strong>
               </div>
               <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-slate-50/70 dark:bg-[#141f35]">
+                <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400 block">Awaiting MT5</span>
+                <strong className="text-sm font-extrabold text-amber-600 dark:text-amber-400 tabular-nums block mt-0.5">
+                  {unconfirmedCount}
+                </strong>
+              </div>
+              <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-slate-50/70 dark:bg-[#141f35]">
                 <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400 block">Win Rate</span>
                 <strong className="text-sm font-extrabold text-slate-900 dark:text-white tabular-nums block mt-0.5">
-                  {winRate}% ({wins}W / {closedCount - wins}L)
+                  {winRate}{closedCount > 0 ? '%' : ''} ({wins}W / {closedOnly.filter((trade) => trade.profit < 0).length}L / {closedOnly.filter((trade) => trade.profit === 0).length}BE)
                 </strong>
               </div>
               <div className="p-3 rounded-xl border border-slate-200 dark:border-[#2b3b59] bg-slate-50/70 dark:bg-[#141f35]">
                 <span className="text-[10px] uppercase font-bold text-slate-500 dark:text-slate-400 block">Realized Net P&amp;L</span>
                 <strong
                   className={`text-sm font-extrabold tabular-nums block mt-0.5 ${
-                    totalNet >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'
+                    closedCount === 0
+                      ? 'text-slate-500 dark:text-slate-400'
+                      : totalNet >= 0
+                        ? 'text-emerald-600 dark:text-emerald-400'
+                        : 'text-rose-600 dark:text-rose-400'
                   }`}
                 >
-                  {totalNet >= 0 ? '+' : ''}${totalNet.toFixed(2)}
+                  {closedCount > 0 ? formatMoney(totalNet, accountCurrency) : '—'}
                 </strong>
               </div>
             </div>
@@ -620,7 +599,7 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
                   <span>
                     <span className="text-slate-500 dark:text-slate-400">Month P&amp;L: </span>
                     <strong className={monthSummary.netPnl >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}>
-                      {monthSummary.netPnl >= 0 ? '+' : ''}${monthSummary.netPnl.toFixed(2)}
+                      {monthSummary.trades > 0 ? formatMoney(monthSummary.netPnl, accountCurrency) : '—'}
                     </strong>
                   </span>
                   <span className="text-slate-500 dark:text-slate-400">
@@ -628,7 +607,7 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
                     <strong className="text-rose-500">{monthSummary.redDays}L</strong>
                   </span>
                   <span className="text-slate-500 dark:text-slate-400">
-                    Trades: <strong className="text-slate-900 dark:text-white">{monthSummary.trades}</strong> ({monthSummary.winRate}%)
+                    Trades: <strong className="text-slate-900 dark:text-white">{monthSummary.trades}</strong> ({monthSummary.winRate}{monthSummary.trades > 0 ? '%' : ''})
                   </span>
                 </div>
               </div>
@@ -703,7 +682,7 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
                                     : 'text-slate-700 dark:text-slate-200'
                               }`}
                             >
-                              {formatCompactMoney(s.netPnl)}
+                              {formatCompactMoney(s.netPnl, accountCurrency)}
                             </div>
                             <div className="text-[10px] font-mono text-slate-500 dark:text-slate-400 tabular-nums">
                               {s.winCount}W/{s.lossCount}L
@@ -738,7 +717,7 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
                             : 'text-rose-600 dark:text-rose-400'
                         }`}
                       >
-                        {selectedDaySummary.netPnl >= 0 ? '+' : ''}${selectedDaySummary.netPnl.toFixed(2)} USD ·{' '}
+                        {formatMoney(selectedDaySummary.netPnl, accountCurrency)} ·{' '}
                         {selectedDaySummary.tradeCount} trades ({selectedDaySummary.winCount}W / {selectedDaySummary.lossCount}L)
                       </span>
                     ) : (
@@ -797,7 +776,7 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
                               </td>
                               <td className="py-2 px-3 text-right font-extrabold tabular-nums">
                                 <span className={t.profit >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}>
-                                  {t.profit >= 0 ? '+' : ''}${t.profit.toFixed(2)}
+                                  {formatMoney(t.profit, accountCurrency)}
                                 </span>
                                 <span className="block text-[10px] font-normal text-slate-400">
                                   {t.pips >= 0 ? '+' : ''}{t.pips.toFixed(1)} pips
@@ -823,7 +802,7 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
                     {(
                       [
                         { id: 'all', label: `All (${totalTradesCount})` },
-                        { id: 'running', label: `Running (${runningCount})` },
+                        { id: 'running', label: `Open / Awaiting (${runningCount + unconfirmedCount})` },
                         { id: 'closed', label: `Closed (${closedCount})` },
                       ] as const
                     ).map((f) => (
@@ -898,6 +877,8 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
                   <tbody className="divide-y divide-slate-100 dark:divide-[#23314c]">
                     {filteredTrades.map((t) => {
                       const isRunning = t.status === 'RUNNING';
+                      const hasLivePosition = livePositions.some((position) => position.ticket === t.ticket);
+                      const isAwaitingBrokerSync = isRunning && !hasLivePosition;
                       const sym = (t.symbol || 'XAUUSD') as SupportedSymbol;
                       const d = getInstrumentConfig(sym).digits;
                       return (
@@ -932,13 +913,18 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
                             )}
                           </td>
                           <td className="py-2.5 px-2">
-                            {isRunning ? (
+                            {isAwaitingBrokerSync ? (
+                              <span className="text-amber-600 dark:text-amber-400 text-[11px] font-semibold">
+                                Awaiting MT5 confirmation
+                              </span>
+                            ) : isRunning ? (
                               <div className="flex items-center gap-1.5 flex-wrap">
                                 <span className="text-emerald-600 dark:text-emerald-400 font-bold text-[11px]">
-                                  RUNNING
+                                  OPEN · MT5
                                 </span>
                                 <button
                                   type="button"
+                                  aria-label={`Close position #${t.ticket}`}
                                   onClick={() => handleCloseRunningTrade(t.ticket)}
                                   className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-rose-500/15 hover:bg-rose-500/25 text-rose-500 transition-colors cursor-pointer"
                                 >
@@ -952,12 +938,18 @@ export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
                             )}
                           </td>
                           <td className="py-2.5 px-3 text-right font-mono font-bold tabular-nums">
-                            <span className={t.profit >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}>
-                              {t.profit >= 0 ? '+' : ''}${t.profit.toFixed(2)}
-                            </span>
-                            <span className="text-[10px] text-slate-400 block font-normal">
-                              {t.pips >= 0 ? '+' : ''}{t.pips.toFixed(1)} pips
-                            </span>
+                            {isAwaitingBrokerSync ? (
+                              <span className="text-slate-400 font-normal">Unavailable</span>
+                            ) : (
+                              <>
+                                <span className={t.profit >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}>
+                                  {isAwaitingBrokerSync ? 'Unavailable' : formatMoney(t.profit, accountCurrency)}
+                                </span>
+                                <span className="text-[10px] text-slate-400 block font-normal">
+                                  {t.pips >= 0 ? '+' : ''}{t.pips.toFixed(1)} pips
+                                </span>
+                              </>
+                            )}
                           </td>
                         </tr>
                       );
