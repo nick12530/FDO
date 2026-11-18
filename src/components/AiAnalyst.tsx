@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { TerminalSnapshot } from '../types/smc';
 import { Sparkles, RefreshCw } from 'lucide-react';
 import { GoogleGenAI } from '@google/genai';
+import { tradingEngine } from '../engine/tradingEngine';
 
 interface AiAnalystProps {
   snapshot: TerminalSnapshot;
@@ -30,11 +31,15 @@ Analyze the current live market state:
 - Unmitigated Zones: ${snapshot.zones.map((z) => `${z.kind} ${z.bullish ? 'Demand' : 'Supply'} (${z.bottom}-${z.top}) with ${z.tests} tests`).join('; ')}
 - Institutional Session: ${snapshot.session.activeSessionName} (Tradable: ${snapshot.session.tradable})
 - Active Signal: ${snapshot.signal ? `${snapshot.signal.direction} with confluence score ${snapshot.signal.score} (SL: ${snapshot.signal.sl}, TP: ${snapshot.signal.tp})` : 'No active setup above 5.0 threshold'}
+- Live News Pulse: ${(tradingEngine.getLiveNewsAnalysis()?.summary) || 'Awaiting live world news sync'}
+- Headline Risk: ${tradingEngine.getLiveNewsAnalysis()?.riskLevel || 'unknown'}
+- Top Headlines: ${(tradingEngine.getLiveNewsItems() || []).slice(0, 5).map((n) => `[${n.category}] ${n.title}`).join(' | ') || 'None yet'}
 
-Provide an ultra-concise, institutional trading brief in 3 short bullet sections:
+Provide an ultra-concise, institutional trading brief in 4 short bullet sections:
 1. Institutional Order Flow & Liquidity
 2. Dealing Range & Zone POI Context
-3. Tactical Execution Plan
+3. Live News & Macro Overlays (how headlines confirm or conflict with the signal)
+4. Tactical Execution Plan
 Be professional, analytical, and direct. Avoid conversational filler.`;
 
     try {

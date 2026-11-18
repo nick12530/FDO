@@ -42,7 +42,9 @@ import { PairsSignalDeck } from './components/PairsSignalDeck';
 import { TradingViewWidget } from './components/TradingViewWidget';
 import { SignalEngineCard } from './components/SignalEngineCard';
 import { RunningTradesHUD } from './components/RunningTradesHUD';
+import { LiveNewsFeedPanel } from './components/LiveNewsFeedPanel';
 import { SignalQualityCard } from './components/SignalQualityCard';
+import { worldNewsFeed } from './engine/newsFeed';
 
 // Floating Notification Beacon
 import { SignalToastNotification } from './components/SignalToastNotification';
@@ -91,6 +93,7 @@ export default function App() {
   const [activeModal, setActiveModal] = useState<
     'bridge' | 'settings' | 'closed_trades' | 'daily_report' | 'tradingview' | 'help' | 'webhook' | null
   >(null);
+  const [tradesJournalFilter, setTradesJournalFilter] = useState<'all' | 'running' | 'closed'>('all');
   const [reportDate, setReportDate] = useState(() => localDayKey(new Date()));
 
   // Confirmation dialog
@@ -116,6 +119,15 @@ export default function App() {
       const message = error instanceof Error ? error.message : String(error);
       tradingEngine.slog(`Saved MT5 connection could not be restored: ${message}`, 'warn');
     });
+  }, []);
+
+  // Live world news feed → trading engine (same refresh cadence as TradingView quotes)
+  useEffect(() => {
+    worldNewsFeed.setEngineSync((items, analysis) => {
+      tradingEngine.syncWorldNews(items, analysis);
+    });
+    worldNewsFeed.startFeed();
+    return () => worldNewsFeed.setEngineSync(null);
   }, []);
 
   // Keyboard Execution Hotkeys: Space (Execute), Esc (Close/Reset), Ctrl+Shift+K (Kill Switch)
@@ -247,7 +259,14 @@ export default function App() {
   const handleOpenBridge = useCallback(() => setActiveModal('bridge'), []);
   const handleOpenTradingView = useCallback(() => setActiveModal('tradingview'), []);
   const handleOpenHelp = useCallback(() => setActiveModal('help'), []);
-  const handleOpenClosedTrades = useCallback(() => setActiveModal('closed_trades'), []);
+  const handleOpenClosedTrades = useCallback(() => {
+    setTradesJournalFilter('all');
+    setActiveModal('closed_trades');
+  }, []);
+  const handleOpenAllTrades = useCallback((filter: 'all' | 'running' | 'closed' = 'all') => {
+    setTradesJournalFilter(filter);
+    setActiveModal('closed_trades');
+  }, []);
 
   const handleSelectSymbol = useCallback((symbol: SupportedSymbol) => {
     tradingEngine.switchSymbol(symbol);
@@ -354,6 +373,7 @@ export default function App() {
           <div className="min-w-0">
             <RunningTradesHUD
               onOpenTradeStation={handleOpenClosedTrades}
+              onOpenAllTrades={handleOpenAllTrades}
             />
           </div>
 
@@ -374,6 +394,9 @@ export default function App() {
               />
             </div>
           </div>
+
+          {/* Live world economic / political / financial news (feeds decision engine) */}
+          <LiveNewsFeedPanel />
 
           <SignalQualityCard
             ticker={ticker}
@@ -421,7 +444,11 @@ export default function App() {
           />
         )}
         {activeModal === 'closed_trades' && (
-          <ClosedTradesModal isOpen={true} onClose={handleCloseModal} />
+          <ClosedTradesModal
+            isOpen={true}
+            onClose={handleCloseModal}
+            defaultTradeFilter={tradesJournalFilter}
+          />
         )}
         {activeModal === 'daily_report' && (
           <DailyReportModal

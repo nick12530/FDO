@@ -28,6 +28,11 @@ import { INSTRUMENTS, SupportedSymbol, getInstrumentConfig } from './instrumentC
 import { getGlobalSessionStatus, isSessionPreferredForPair, evaluateNewsRisk } from './sessionTimezones';
 import { dispatchApproachingEntryAlert, dispatchSniperAlert } from '../utils/webhookNotifier';
 import { analyzeCandlestickPatterns, CandlestickPatternMatch } from './candlestickPatterns';
+import {
+  evaluateNewsSignalConfluence,
+  pairNewsBiasScore,
+  type NewsMarketAnalysis,
+} from './newsAnalysis';
 
 export interface LiquidityLevels {
   equalHighs: number[];
@@ -71,6 +76,8 @@ export interface PairAnalysis {
   sessionName: string;
   isPreferredSession: boolean;
   newsStatus: string;
+  newsBiasScore?: number;
+  newsConfluenceNote?: string;
 
   // Signal & Score
   bias: 'BUY' | 'SELL' | 'WAITING';
@@ -410,7 +417,8 @@ export function analyzeInstrument(
   riskPct: number,
   openPositions: Position[],
   economicEvents: EconomicEvent[] | null = null,
-  symbolSpec?: SymbolTradingSpec | null
+  symbolSpec?: SymbolTradingSpec | null,
+  liveNewsAnalysis: NewsMarketAnalysis | null = null
 ): PairAnalysis {
   const config = getInstrumentConfig(symbol);
   const price = (liveBid + liveAsk) / 2;
@@ -462,8 +470,9 @@ export function analyzeInstrument(
   const sessions = getGlobalSessionStatus();
   const isPreferredSession = isSessionPreferredForPair(symbol, sessions);
 
-  // 6. News Risk
+  // 6. News Risk (scheduled economic calendar + live world headline analysis)
   const newsRisk = evaluateNewsRisk(symbol, economicEvents);
+  const headlineLean = pairNewsBiasScore(symbol, liveNewsAnalysis);
 
   // 7. Structural events
   const lastBOS = msM15.events.filter((e) => e.kind === 'BOS').slice(-1)[0] || null;
@@ -592,9 +601,18 @@ export function analyzeInstrument(
     scoreCandle = Math.round((candlePattern.reliability / 100) * 5);
   }
 
-  const confluenceScore =
+  const newsSignalDecision = evaluateNewsSignalConfluence(
+    symbol,
+    tentativeBias,
+    liveNewsAnalysis
+  );
+  const rawConfluence =
     scoreHtf + scoreStructure + scoreLiquidity + scoreBosChoch + scoreObFvg +
     scoreMomentum + scoreSession + scoreSpread + scoreCandle;
+  const confluenceScore = Math.max(
+    0,
+    Math.min(100, rawConfluence + newsSignalDecision.scoreAdjustment)
+  );
 
   // 9. Stop Loss & Multi-Target Take Profit (Structure-based for Maximum Pips)
   const slBuffer = atr * 0.3;
@@ -662,6 +680,9 @@ export function analyzeInstrument(
     } else if (newsRisk.hasNewsRisk) {
       status = 'BLOCKED';
       rejectionReason = `TRADE_REJECTED: ${newsRisk.reason}`;
+    } else if (newsSignalDecision.statusHint === 'BLOCKED') {
+      status = 'BLOCKED';
+      rejectionReason = `TRADE_REJECTED: ${newsSignalDecision.reason || 'LIVE_NEWS_CONFLICT'}`;
     } else if (!correlationResult.allowed && (confluenceScore < 70 && (confluenceScore > 10 || confluenceScore < 7.0))) {
       status = 'BLOCKED';
       rejectionReason = correlationResult.reason || 'TRADE_REJECTED: CORRELATION_LIMIT_EXCEEDED';
@@ -716,6 +737,7 @@ export function analyzeInstrument(
     if (scoreObFvg >= 5) reasons.push(`Discount/Premium POI Retest (+${scoreObFvg})`);
     if (scoreSession >= 5) reasons.push(`${sessions.activeSessionName} (+${scoreSession})`);
     if (scoreCandle >= 5) reasons.push(`${candlePattern.name} (${candlePattern.bias}) (+${scoreCandle})`);
+    if (newsSignalDecision.reason) reasons.push(newsSignalDecision.reason);
 
     signalObj = {
       direction: tentativeBias,
@@ -776,7 +798,12 @@ export function analyzeInstrument(
     volatility,
     sessionName: sessions.activeSessionName,
     isPreferredSession,
-    newsStatus: newsRisk.reason || (newsRisk.isDataUnavailable ? 'NEWS FILTER: DATA UNAVAILABLE' : 'Normal Conditions'),
+    newsStatus:
+      newsSignalDecision.reason ||
+      newsRisk.reason ||
+      (newsRisk.isDataUnavailable ? 'NEWS FILTER: DATA UNAVAILABLE' : 'Normal Conditions'),
+    newsBiasScore: headlineLean,
+    newsConfluenceNote: newsSignalDecision.reason,
     bias: tentativeBias,
     signal: signalObj,
     confluenceScore,

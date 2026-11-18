@@ -1,6 +1,22 @@
 import math
 
 
+def has_consecutive_losses_today(
+    trades: list[dict],
+    max_losses: int,
+    utc_date: str,
+) -> bool:
+    today_trades = [
+        trade
+        for trade in trades
+        if isinstance(trade.get("closedAt"), str)
+        and trade["closedAt"][:10] == utc_date
+    ]
+    return len(today_trades) >= max_losses and all(
+        trade["profit"] <= 0 for trade in today_trades[:max_losses]
+    )
+
+
 def is_valid_close_volume(
     requested_volume: float,
     position_volume: float,

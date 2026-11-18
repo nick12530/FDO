@@ -2,7 +2,7 @@
   "riskPercentPerTrade": 2.0,
   "maxPortfolioRiskPercent": 6.0,
   "maxDailyLossPercent": 4.0,
-  "maxConsecutiveLosses": 3,
+  "maxConsecutiveLosses": 5,
   "maxOpenPositions": 5,
   "adaptiveMicroFloorEnabled": true,
   "maxMicroFloorRiskDollar": 15.0,

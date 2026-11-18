@@ -76,6 +76,12 @@ import {
   checkCorrelationExposure,
   calculateSmallAccountPositionSize,
 } from './multiPairScanner';
+import {
+  getWorldNewsAutoTradeBlockReason,
+  evaluateNewsSignalConfluence,
+  type NewsMarketAnalysis,
+  type WorldNewsItem,
+} from './newsAnalysis';
 import { signalAudioNotifier } from '../utils/audioNotification';
 import { dispatchExecutionNotification } from '../utils/webhookNotifier';
 
@@ -305,6 +311,12 @@ export class TradingEngine {
   circuitBreakerEnabled: boolean = true;
   newsBlackout: boolean = false;
   bypassNewsBlackout: boolean = false;
+  worldNewsImpactEnabled: boolean = (() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('smc_world_news_impact_enabled') === 'true';
+    }
+    return false;
+  })();
   connected: boolean = false;
   currentTimeframe: ChartTimeframe = 'M15';
   allowHighConfluenceOverride: boolean = true;
@@ -321,6 +333,8 @@ export class TradingEngine {
   private lastPairDataError = '';
   private economicEvents: EconomicEvent[] = [];
   private economicCalendarAvailable = false;
+  private liveNewsItems: WorldNewsItem[] = [];
+  private liveNewsAnalysis: NewsMarketAnalysis | null = null;
   private entryHistory: Array<{
     at: number;
     direction: TradeDirection;
@@ -730,6 +744,33 @@ export class TradingEngine {
     this.invalidateEvents();
     this.emit('events');
     this.refreshScanner();
+  }
+
+  /**
+   * Ingest live world news + headline analysis used with TradingView/SMC signals.
+   */
+  syncWorldNews(items: WorldNewsItem[], analysis: NewsMarketAnalysis | null): void {
+    this.liveNewsItems = analysis ? items : [];
+    this.liveNewsAnalysis = analysis;
+    this.invalidateEvents();
+    this.emit('events');
+    this.refreshScanner();
+  }
+
+  setWorldNewsImpactEnabled(enabled: boolean): void {
+    this.worldNewsImpactEnabled = enabled;
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('smc_world_news_impact_enabled', String(enabled));
+    }
+    this.refreshScanner();
+  }
+
+  getLiveNewsAnalysis(): NewsMarketAnalysis | null {
+    return this.liveNewsAnalysis;
+  }
+
+  getLiveNewsItems(): WorldNewsItem[] {
+    return this.liveNewsItems;
   }
 
   private async refreshBrokerPairData() {
@@ -1395,7 +1436,8 @@ export class TradingEngine {
         this.account.risk_pct,
         this.positions,
         events,
-        data.symbolSpec
+        data.symbolSpec,
+        this.worldNewsImpactEnabled ? this.liveNewsAnalysis : null
       );
       advanceSignalValidations(sym, cM1);
       if (
@@ -1641,6 +1683,22 @@ export class TradingEngine {
         `Scanner confluence ${matchingScannerAnalysis.confluenceScore}/100 is below the ${getInstrumentConfig(targetSymbol).minScore}/100 setup threshold.`;
     }
     if (this.mt5Account.connected && this.instrumentType === 'standard') {
+      if (this.worldNewsImpactEnabled) {
+        if (!isManual) {
+          const worldNewsBlock = getWorldNewsAutoTradeBlockReason(this.liveNewsAnalysis, now);
+          if (worldNewsBlock) return worldNewsBlock;
+        }
+        if (signal && this.liveNewsAnalysis) {
+          const liveNewsGate = evaluateNewsSignalConfluence(
+            targetSymbol as SupportedSymbol,
+            signal.direction,
+            this.liveNewsAnalysis
+          );
+          if (liveNewsGate.statusHint === 'BLOCKED') {
+            return `TRADE_REJECTED: ${liveNewsGate.reason || 'LIVE_NEWS_CONFLICT'}`;
+          }
+        }
+      }
       if (!this.economicCalendarAvailable && this.economicEvents.length === 0 && !isManual) {
         return 'TRADE_REJECTED: NEWS_DATA_UNAVAILABLE';
       }
@@ -1783,9 +1841,9 @@ export class TradingEngine {
     }
 
     if (this.circuitBreakerEnabled) {
-      const consecutiveLosses = this.closedTrades.slice(0, RISK_CONFIG.maxConsecutiveLosses)
+      const consecutiveLosses = todayClosedTrades.slice(0, RISK_CONFIG.maxConsecutiveLosses)
         .every((trade) => trade.profit <= 0);
-      if (this.closedTrades.length >= RISK_CONFIG.maxConsecutiveLosses && consecutiveLosses) {
+      if (todayClosedTrades.length >= RISK_CONFIG.maxConsecutiveLosses && consecutiveLosses) {
         if (!isManual && !hasValidProfitableSignal) {
           return 'Consecutive-loss circuit breaker reached.';
         }

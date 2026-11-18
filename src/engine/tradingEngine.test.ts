@@ -11,6 +11,7 @@ import { TradingEngine, getDefaultSymbolSpec } from './tradingEngine';
 import { Candle } from '../types/smc';
 import { calculateRiskBasedVolume } from './riskConfig';
 import { mt5Bridge } from './mt5Bridge';
+import { analyzeWorldNews } from './newsAnalysis';
 
 describe('risk-based position sizing', () => {
   it('sizes a known XAU-style contract from equity, stop, tick value, and broker lot step', () => {
@@ -234,6 +235,44 @@ describe('scanner signals in the active signal engine', () => {
     expect(engine.getEntryBlockReason('BUY', signal, Date.now(), true, 'EURUSD')).toBe(
       'TRADE_REJECTED: NEWS_DATA_UNAVAILABLE'
     );
+  });
+
+  it('keeps live headline impact off until explicitly enabled', () => {
+    if (typeof localStorage !== 'undefined') localStorage.clear();
+    const engine = new TradingEngine();
+    engine.stopEngineLoops();
+    engine.mt5Account.connected = true;
+    engine.bypassNewsBlackout = true;
+    engine.syncEconomicCalendar([]);
+    engine.syncWorldNews([], analyzeWorldNews([
+      {
+        id: 'rate-decision',
+        title: 'Central bank announces surprise interest rate decision',
+        summary: '',
+        url: 'https://example.com/rates',
+        source: 'Wire',
+        category: 'economic',
+        publishedAt: new Date().toISOString(),
+      },
+    ]));
+    const signal = {
+      strategy: 'Trend Pullback' as const,
+      direction: 'BUY' as const,
+      timeframe: 'M5' as const,
+      score: 7,
+      entry: 1.1,
+      sl: 1.098,
+      tp: 1.104,
+      timestamp: new Date().toISOString(),
+      reasons: [],
+      atr: 0.001,
+    };
+
+    expect(engine.worldNewsImpactEnabled).toBe(false);
+    expect(engine.getEntryBlockReason('BUY', signal, Date.now(), false, 'EURUSD')).not.toContain('NEWS FILTER:');
+
+    engine.setWorldNewsImpactEnabled(true);
+    expect(engine.getEntryBlockReason('BUY', signal, Date.now(), false, 'EURUSD')).toContain('NEWS FILTER:');
   });
 });
 
@@ -561,6 +600,28 @@ describe('TradingEngine Store Architecture', () => {
     engine.directionCooldownSeconds = 15;
     engine.recordAcceptedEntry('BUY', null);
     expect(engine.getEntryBlockReason('BUY', null)).toBe('Direction cooldown is active.');
+  });
+
+  it('does not carry the consecutive-loss circuit breaker across UTC trading days', () => {
+    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const losses = Array.from({ length: 3 }, (_, index) => ({
+      ticket: index + 1,
+      type: 'BUY' as const,
+      volume: 0.01,
+      openPrice: 2000,
+      closePrice: 1995,
+      profit: -5,
+      pips: -50,
+      closedAt: yesterday,
+      reason: 'SL' as const,
+    }));
+
+    engine.closedTrades = losses;
+    expect(engine.getEntryBlockReason('BUY', null)).not.toBe('Consecutive-loss circuit breaker reached.');
+
+    const today = new Date().toISOString();
+    engine.closedTrades = losses.map((trade) => ({ ...trade, closedAt: today }));
+    expect(engine.getEntryBlockReason('BUY', null)).toBe('Consecutive-loss circuit breaker reached.');
   });
 
   it('allows high-confluence signal fallback override when daily limit is reached', () => {

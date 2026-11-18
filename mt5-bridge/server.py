@@ -11,6 +11,7 @@ import logging
 import time
 import sqlite3
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request as UrlRequest, urlopen
@@ -27,10 +28,11 @@ mt5 = cast(Any, mt5)
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from risk_math import is_valid_close_volume, stop_risk, volume_for_risk
+from risk_math import has_consecutive_losses_today, is_valid_close_volume, stop_risk, volume_for_risk
 from broker_time import future_broker_clock_offset_seconds
 from signal_freshness import is_signal_stale
 from calendar_feed import normalize_finnhub_calendar, normalize_forexfactory_calendar
+from news_feed import merge_news_items, parse_rss_items
 
 app = FastAPI(title="Local MT5 Bridge", docs_url=None, redoc_url=None)
 
@@ -48,6 +50,17 @@ _closed_trades_cache_ttl = 5.0  # Cache closed trades for 5s to eliminate redund
 _economic_calendar_cache: tuple[float, str, list[dict]] | None = None
 _economic_calendar_cache_lock = threading.Lock()
 _economic_calendar_cache_ttl = 15 * 60
+_world_news_cache: tuple[float, list[dict], str] | None = None
+_world_news_cache_lock = threading.Lock()
+_world_news_cache_ttl = 60.0
+_WORLD_NEWS_FEEDS: tuple[tuple[str, str], ...] = (
+    ("Google World", "https://news.google.com/rss/headlines/section/topic/WORLD?hl=en-US&gl=US&ceid=US:en"),
+    ("Google Business", "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-US&gl=US&ceid=US:en"),
+    ("Google Economy", "https://news.google.com/rss/search?q=economy+OR+inflation+OR+federal+reserve+OR+ECB+OR+interest+rates&hl=en-US&gl=US&ceid=US:en"),
+    ("Google Forex", "https://news.google.com/rss/search?q=forex+OR+gold+OR+EURUSD+OR+USDJPY+OR+GBPUSD+when:1d&hl=en-US&gl=US&ceid=US:en"),
+    ("BBC Business", "https://feeds.bbci.co.uk/news/business/rss.xml"),
+    ("CNBC World", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100727362"),
+)
 RISK_CONFIG = json.loads((Path(__file__).resolve().parents[1] / "risk-config.json").read_text(encoding="utf-8"))
 STATE_DIRECTORY = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SMCBridge"
 STATE_DIRECTORY.mkdir(parents=True, exist_ok=True)
@@ -156,45 +169,80 @@ def resolve_broker_symbol(symbol: str) -> str:
     if not cleaned:
         return cleaned
 
-    # 1. Exact match in MT5
-    info = mt5.symbol_info(cleaned)
-    if info is not None:
-        return cleaned
+    upper_clean = cleaned.upper().replace("/", "")
+    disabled_mode = getattr(mt5, "SYMBOL_TRADE_MODE_DISABLED", 0)
+    exact_name = None
+
+    def is_tradable(name: str) -> bool:
+        info = mt5.symbol_info(name)
+        return (
+            info is not None
+            and getattr(info, "trade_mode", disabled_mode) != disabled_mode
+        )
+
+    def choose_tradable(candidates: list[str]) -> str | None:
+        tradable = [name for name in candidates if is_tradable(name)]
+        if not tradable:
+            return None
+
+        visible = [
+            name for name in tradable
+            if (info := mt5.symbol_info(name))
+            and getattr(info, "visible", True)
+        ]
+        return visible[0] if visible else tradable[0]
 
     try:
+        exact_info = mt5.symbol_info(cleaned)
+        if exact_info is not None:
+            exact_name = cleaned
+            if getattr(exact_info, "trade_mode", disabled_mode) != disabled_mode:
+                return cleaned
+
         all_symbols = mt5.symbols_get()
         if not all_symbols:
-            return cleaned
+            return exact_name or cleaned
 
-        upper_clean = cleaned.upper().replace("/", "")
+        exact_candidates = [
+            item.name for item in all_symbols
+            if item.name.upper() == upper_clean
+        ]
+        selected = choose_tradable(exact_candidates)
+        if selected:
+            return selected
+        if exact_candidates:
+            exact_name = exact_candidates[0]
 
-        # 2. Case-insensitive exact match
-        for s in all_symbols:
-            if s.name.upper() == upper_clean:
-                return s.name
+        suffix_candidates = [
+            item.name for item in all_symbols
+            if item.name.upper().startswith(upper_clean)
+        ]
+        selected = choose_tradable(suffix_candidates)
+        if selected:
+            return selected
 
-        # 3. Match broker suffix (e.g. XAUUSD matches XAUUSD.vx, XAUUSDm, XAUUSD.r, XAUUSDpro)
-        candidates = [s.name for s in all_symbols if s.name.upper().startswith(upper_clean)]
-        if candidates:
-            visible = [c for c in candidates if (sym_info := mt5.symbol_info(c)) and getattr(sym_info, "visible", True)]
-            return visible[0] if visible else candidates[0]
+        contains_candidates = [
+            item.name for item in all_symbols
+            if upper_clean in item.name.upper()
+        ]
+        selected = choose_tradable(contains_candidates)
+        if selected:
+            return selected
 
-        # 4. Match embedded symbol (e.g. mEURUSD, pro.EURUSD)
-        contains_candidates = [s.name for s in all_symbols if upper_clean in s.name.upper()]
-        if contains_candidates:
-            visible = [c for c in contains_candidates if (sym_info := mt5.symbol_info(c)) and getattr(sym_info, "visible", True)]
-            return visible[0] if visible else contains_candidates[0]
-
-        # 5. Gold alias match (e.g. XAUUSD <-> GOLD)
         if "XAU" in upper_clean or "GOLD" in upper_clean:
-            gold_candidates = [s.name for s in all_symbols if "XAUUSD" in s.name.upper() or "GOLD" in s.name.upper()]
-            if gold_candidates:
-                visible = [c for c in gold_candidates if (sym_info := mt5.symbol_info(c)) and getattr(sym_info, "visible", True)]
-                return visible[0] if visible else gold_candidates[0]
+            gold_candidates = [
+                item.name for item in all_symbols
+                if "XAUUSD" in item.name.upper()
+                or "GOLD" in item.name.upper()
+            ]
+            selected = choose_tradable(gold_candidates)
+            if selected:
+                return selected
+
     except Exception:
         pass
 
-    return cleaned
+    return exact_name or cleaned
 
 
 def get_symbol_spec(login: int, server: str, symbol: str, info: Any) -> dict:
@@ -592,9 +640,9 @@ def _deal_cost(deal: Any) -> float:
     )
 
 
-def read_closed_trades(days: int, symbol: str) -> list[dict]:
-    clean_sym = symbol.strip().upper()
-    cache_key = f"{clean_sym}:{days}"
+def read_closed_trades(days: int, symbol: str | None = None) -> list[dict]:
+    clean_sym = symbol.strip().upper() if symbol else ""
+    cache_key = f"{clean_sym or '*'}:{days}"
     now_ts = time.time()
 
     # Fast in-memory cache hit (5s TTL) avoids repetitive heavy 180-day deal scans & IPC overhead
@@ -614,10 +662,15 @@ def read_closed_trades(days: int, symbol: str) -> list[dict]:
         raise HTTPException(status_code=503, detail=f"MT5 positions unavailable: {mt5.last_error()}")
     open_position_ids = {int(position.ticket) for position in open_positions}
     deals_by_position: dict[int, list[Any]] = {}
-    resolved_symbol = resolve_broker_symbol(symbol)
+    resolved_symbol = resolve_broker_symbol(clean_sym) if clean_sym else ""
     for deal in deals:
-        deal_sym = str(deal.symbol)
-        if deal_sym == symbol or deal_sym == resolved_symbol or deal_sym.startswith(symbol):
+        deal_sym = str(deal.symbol).upper()
+        if (
+            not clean_sym
+            or deal_sym == clean_sym
+            or deal_sym == resolved_symbol.upper()
+            or deal_sym.startswith(clean_sym)
+        ):
             deals_by_position.setdefault(int(deal.position_id), []).append(deal)
 
     exits_by_position: dict[int, list[Any]] = {}
@@ -643,7 +696,12 @@ def read_closed_trades(days: int, symbol: str) -> list[dict]:
                     position_deals = [
                         deal
                         for deal in historical_position_deals
-                        if str(deal.symbol) == symbol or str(deal.symbol) == resolved_symbol or str(deal.symbol).startswith(symbol)
+                        if (
+                            not clean_sym
+                            or str(deal.symbol).upper() == clean_sym
+                            or str(deal.symbol).upper() == resolved_symbol.upper()
+                            or str(deal.symbol).upper().startswith(clean_sym)
+                        )
                     ]
                     entries = [deal for deal in position_deals if deal.entry == mt5.DEAL_ENTRY_IN]
             except Exception as exc:
@@ -671,7 +729,7 @@ def read_closed_trades(days: int, symbol: str) -> list[dict]:
         }
         rationale = str(entry.comment).strip()
         # SAFETY-FIX: Compute pip size dynamically from symbol (JPY: 0.01, XAUUSD/metals: 0.1, others: 0.0001) via mt5.symbol_info
-        deal_sym = str(entry.symbol) or symbol
+        deal_sym = str(entry.symbol) or clean_sym
         sym_info = mt5.symbol_info(deal_sym)
         upper_sym = deal_sym.upper()
         if "JPY" in upper_sym:
@@ -814,6 +872,83 @@ def economic_calendar(request: Request) -> dict:
     )
 
 
+def fetch_world_news_feed(source_name: str, feed_url: str) -> tuple[str, list[dict], str | None]:
+    upstream_request = UrlRequest(
+        feed_url,
+        headers={
+            "Accept": "application/rss+xml, application/xml, text/xml, */*",
+            "User-Agent": "NIFTY-SMC-Terminal/1.0",
+        },
+    )
+    try:
+        with urlopen(upstream_request, timeout=8) as response:
+            payload = response.read(1_000_001)
+    except (HTTPError, URLError, TimeoutError, OSError) as error:
+        return source_name, [], type(error).__name__
+    if len(payload) > 1_000_000:
+        return source_name, [], "response too large"
+
+    parsed = parse_rss_items(payload.decode("utf-8", errors="replace"), source_name)
+    if not parsed:
+        return source_name, [], "empty or invalid feed"
+    return source_name, parsed, None
+
+
+@app.get("/api/world-news")
+def world_news(request: Request) -> dict:
+    """Live world / economic / political / financial news aggregated from public RSS feeds."""
+    require_bridge_token(request)
+    global _world_news_cache
+
+    now_monotonic = time.monotonic()
+    with _world_news_cache_lock:
+        if (
+            _world_news_cache is not None
+            and now_monotonic - _world_news_cache[0] < _world_news_cache_ttl
+        ):
+            items, source = _world_news_cache[1], _world_news_cache[2]
+            return {
+                "available": True,
+                "items": items,
+                "source": source,
+                "updatedAt": datetime.now(timezone.utc).isoformat(),
+            }
+
+    batches: list[list[dict]] = []
+    used_sources: list[str] = []
+    failures: list[str] = []
+
+    with ThreadPoolExecutor(max_workers=len(_WORLD_NEWS_FEEDS)) as executor:
+        futures = [
+            executor.submit(fetch_world_news_feed, source_name, feed_url)
+            for source_name, feed_url in _WORLD_NEWS_FEEDS
+        ]
+        for future in as_completed(futures):
+            source_name, parsed, failure = future.result()
+            if failure:
+                failures.append(f"{source_name}: {failure}")
+                continue
+            batches.append(parsed)
+            used_sources.append(source_name)
+
+    items = merge_news_items(batches, limit=48)
+    if not items:
+        detail = "; ".join(failures) or "No news providers responded"
+        raise HTTPException(status_code=503, detail=f"World news feed unavailable: {detail}.")
+
+    source_label = " + ".join(used_sources[:3]) + (" +" if len(used_sources) > 3 else "")
+    with _world_news_cache_lock:
+        _world_news_cache = (time.monotonic(), items, source_label)
+
+    return {
+        "available": True,
+        "items": items,
+        "source": source_label,
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+        "feedCount": len(used_sources),
+    }
+
+
 @app.post("/api/connect")
 def connect(payload: ConnectRequest, request: Request) -> dict:
     require_bridge_token(request)
@@ -876,10 +1011,10 @@ def set_circuit_breaker_control(payload: CircuitBreakerControlRequest, request: 
 def history(
     request: Request,
     days: int = Query(default=180, ge=1, le=365),
-    symbol: str = Query(default="XAUUSD", min_length=1, max_length=32),
+    symbol: str | None = Query(default=None, min_length=1, max_length=32),
 ) -> list[dict]:
     require_bridge_token(request)
-    return read_closed_trades(days, symbol.strip())
+    return read_closed_trades(days, symbol)
 
 
 def resolve_filling_mode(info) -> int:
@@ -970,6 +1105,12 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
     if info is None:
         raise HTTPException(status_code=400, detail=f"MT5 could not select symbol {symbol!r} (requested as {raw_symbol!r}).")
 
+    if getattr(info, "trade_mode", getattr(mt5, "SYMBOL_TRADE_MODE_DISABLED", 0)) == getattr(mt5, "SYMBOL_TRADE_MODE_DISABLED", 0):
+        raise HTTPException(
+            status_code=423,
+            detail=f"TRADE_REJECTED: SYMBOL_TRADING_DISABLED ({symbol!r} is disabled by the broker).",
+        )
+
     tick = mt5.symbol_info_tick(symbol)
     if info is None or tick is None:
         raise HTTPException(status_code=503, detail=f"No current MT5 quote for {symbol!r}.")
@@ -989,7 +1130,12 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
     # BRIDGE-LEVEL SPREAD GATE: Protect against spread blowout during rollover or news spikes
     point_size = float(getattr(info, "point", symbol_spec["tickSize"])) or symbol_spec["tickSize"]
     spread_points = abs(tick.ask - tick.bid) / point_size if point_size > 0 else 0.0
-    max_allowed_spread = INSTRUMENT_MAX_SPREADS.get(symbol.upper(), 45.0)
+    canonical_symbol = raw_symbol.upper().replace("/", "")
+    canonical_symbol = next(
+        (key for key in INSTRUMENT_MAX_SPREADS if canonical_symbol.startswith(key)),
+        canonical_symbol,
+    )
+    max_allowed_spread = INSTRUMENT_MAX_SPREADS.get(canonical_symbol, 45.0)
     if spread_points > max_allowed_spread:
         logger.warning(f"🚫 [423 Locked] Spread {spread_points:.1f}pts exceeds max allowable {max_allowed_spread:.1f}pts on {symbol}.")
         raise HTTPException(
@@ -1060,8 +1206,10 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
             )
 
         recent_losses = read_closed_trades(1, symbol)
-        if len(recent_losses) >= RISK_CONFIG["maxConsecutiveLosses"] and all(
-            trade["profit"] <= 0 for trade in recent_losses[:RISK_CONFIG["maxConsecutiveLosses"]]
+        if has_consecutive_losses_today(
+            recent_losses,
+            RISK_CONFIG["maxConsecutiveLosses"],
+            now.date().isoformat(),
         ):
             logger.warning("🚫 [423 Locked] Consecutive-loss circuit breaker reached.")
             raise HTTPException(
@@ -1314,7 +1462,7 @@ def place_trade(payload: TradeRequest, request: Request) -> dict:
         "USDJPY": 10002,
         "GBPUSD": 10003,
         "XAUUSD": 20261001,
-    }.get(symbol.upper(), 20261001)
+    }.get(canonical_symbol, 20261001)
 
     result = None
     applied_sl_tp_afterwards = False

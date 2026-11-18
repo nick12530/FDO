@@ -245,6 +245,17 @@ export class MT5BridgeConnector {
     }
   }
 
+  async fetchWorldNews(): Promise<{
+    available: boolean;
+    items: unknown[];
+    source: string;
+  }> {
+    return this.request('/api/world-news', {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+    });
+  }
+
   getSymbol(): string {
     return this.symbol;
   }
@@ -683,7 +694,7 @@ export class MT5BridgeConnector {
     this.closedTradesInFlight = true;
     try {
       const trades = await this.request<ClosedTrade[]>(
-        `/api/history?days=180&symbol=${encodeURIComponent(this.symbol)}`,
+        '/api/history?days=180',
         {}
       );
       this.onClosedTradesCallback?.(trades);

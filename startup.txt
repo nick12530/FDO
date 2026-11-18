@@ -1,0 +1,8 @@
+cd F:\FDO
+npm run dev
+
+
+cd F:\FDO
+powershell -ExecutionPolicy Bypass -File .\mt5-bridge\start_pc.ps1
+
+powershell -ExecutionPolicy Bypass -File .\mt5-bridge\start_pc.ps1

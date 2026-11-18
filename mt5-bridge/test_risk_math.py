@@ -1,9 +1,20 @@
 import unittest
 
-from risk_math import is_valid_close_volume, stop_risk, volume_for_risk
+from risk_math import has_consecutive_losses_today, is_valid_close_volume, stop_risk, volume_for_risk
 
 
 class RiskMathTests(unittest.TestCase):
+    def test_consecutive_loss_breaker_ignores_losses_from_prior_utc_days(self) -> None:
+        losses = [
+            {"closedAt": "2026-11-17T23:59:00+00:00", "profit": -1},
+            {"closedAt": "2026-11-18T00:01:00+00:00", "profit": -1},
+            {"closedAt": "2026-11-18T00:02:00+00:00", "profit": -1},
+        ]
+
+        self.assertFalse(has_consecutive_losses_today(losses, 3, "2026-11-18"))
+        losses.insert(0, {"closedAt": "2026-11-18T00:00:00+00:00", "profit": -1})
+        self.assertTrue(has_consecutive_losses_today(losses, 3, "2026-11-18"))
+
     def test_stop_risk_counts_only_adverse_distance(self) -> None:
         self.assertEqual(stop_risk("BUY", 0.1, 100, 90, 1, 2), 2.0)
         self.assertEqual(stop_risk("SELL", 0.1, 100, 110, 1, 2), 2.0)

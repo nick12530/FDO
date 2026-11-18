@@ -19,6 +19,7 @@ import { readSignalValidations, subscribeJournal } from '../engine/tradeJournal'
 import type { SignalValidationRecord } from '../engine/signalValidation';
 import type { PairAnalysis } from '../engine/multiPairScanner';
 import type { SupportedSymbol } from '../engine/instrumentConfig';
+import { worldNewsFeed, type NewsFeedState } from '../engine/newsFeed';
 
 export function useTicker(): TickerState {
   const subscribe = useCallback((cb: () => void) => tradingEngine.on('ticker', cb), []);
@@ -136,6 +137,14 @@ export function useJournalTrades(): JournalTradeRecord[] {
 
 let cachedValidationsRaw = '';
 let cachedValidationsSnapshot: SignalValidationRecord[] = [];
+
+export function useNewsFeed(): NewsFeedState {
+  const subscribe = useCallback((cb: () => void) => {
+    return worldNewsFeed.subscribe(() => cb());
+  }, []);
+  const getSnapshot = useCallback(() => worldNewsFeed.getState(), []);
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
 
 export function useSignalValidations(): SignalValidationRecord[] {
   const subscribe = useCallback((cb: () => void) => subscribeJournal(cb), []);

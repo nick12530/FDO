@@ -43,17 +43,25 @@ interface ClosedTradesModalProps {
   isOpen: boolean;
   onClose: () => void;
   defaultTab?: 'trades' | 'signals';
+  defaultTradeFilter?: 'all' | 'running' | 'closed';
 }
 
 export const ClosedTradesModal: React.FC<ClosedTradesModalProps> = ({
   isOpen,
   onClose,
   defaultTab = 'trades',
+  defaultTradeFilter = 'all',
 }) => {
   const [activeTab, setActiveTab] = useState<'trades' | 'signals'>(defaultTab);
-  const [tradeFilter, setTradeFilter] = useState<'all' | 'running' | 'closed'>('all');
+  const [tradeFilter, setTradeFilter] = useState<'all' | 'running' | 'closed'>(defaultTradeFilter);
   const [signalFilter, setSignalFilter] = useState<'all' | 'executed' | 'rejected'>('all');
   const [searchQuery, setSearchQuery] = useState('');
+
+  useEffect(() => {
+    if (!isOpen) return;
+    setActiveTab(defaultTab);
+    setTradeFilter(defaultTradeFilter);
+  }, [isOpen, defaultTab, defaultTradeFilter]);
 
   const ticker = useTicker();
   const closedTrades = useClosedTrades();

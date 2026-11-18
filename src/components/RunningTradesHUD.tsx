@@ -8,18 +8,20 @@ import {
   Shield,
   X,
   Zap,
-  Target,
-  ArrowRight,
-  Clock,
+  History,
   Layers,
-  Sparkles,
 } from 'lucide-react';
 
 interface RunningTradesHUDProps {
   onOpenTradeStation?: () => void;
+  /** Opens the audit journal covering running + closed positions */
+  onOpenAllTrades?: (filter?: 'all' | 'running' | 'closed') => void;
 }
 
-export const RunningTradesHUD: React.FC<RunningTradesHUDProps> = ({ onOpenTradeStation }) => {
+export const RunningTradesHUD: React.FC<RunningTradesHUDProps> = ({
+  onOpenTradeStation,
+  onOpenAllTrades,
+}) => {
   const { positions } = usePositions();
   const ticker = useTicker();
   const engine = useEngine();
@@ -27,6 +29,7 @@ export const RunningTradesHUD: React.FC<RunningTradesHUDProps> = ({ onOpenTradeS
   const totalPositions = positions.length;
   const totalFloatingPnl = Number(positions.reduce((sum, p) => sum + p.profit, 0).toFixed(2));
   const isOverallProfitable = totalFloatingPnl >= 0;
+  const openAllTrades = onOpenAllTrades || onOpenTradeStation;
 
   if (totalPositions === 0) {
     return (
@@ -40,14 +43,30 @@ export const RunningTradesHUD: React.FC<RunningTradesHUDProps> = ({ onOpenTradeS
             </span>
           </div>
         </div>
-        <button
-          type="button"
-          onClick={onOpenTradeStation}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-sky-500 hover:bg-sky-400 text-slate-950 font-bold font-sans text-xs shadow-xs transition-colors cursor-pointer"
-        >
-          <Zap className="w-3.5 h-3.5 fill-current" />
-          <span>Start Trade</span>
-        </button>
+        <div className="flex items-center gap-2 shrink-0">
+          {openAllTrades && (
+            <>
+              <button
+                type="button"
+                onClick={() => openAllTrades('all')}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-sky-500/10 hover:bg-sky-500/20 text-sky-700 dark:text-sky-300 font-bold font-sans text-xs border border-sky-500/30 transition-colors cursor-pointer"
+                title="View all open and closed trades"
+              >
+                <Layers className="w-3.5 h-3.5" />
+                <span>All Trades</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => openAllTrades('closed')}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-slate-700 dark:text-zinc-200 font-bold font-sans text-xs border border-slate-200 dark:border-zinc-700 transition-colors cursor-pointer"
+                title="View closed trade history"
+              >
+                <History className="w-3.5 h-3.5" />
+                <span>Closed Trades</span>
+              </button>
+            </>
+          )}
+        </div>
       </div>
     );
   }
@@ -68,8 +87,8 @@ export const RunningTradesHUD: React.FC<RunningTradesHUDProps> = ({ onOpenTradeS
           </span>
         </div>
 
-        {/* Floating P&L Counter */}
-        <div className="flex items-center gap-3">
+        {/* Floating P&L Counter + trade journal navigation */}
+        <div className="flex items-center gap-2 sm:gap-3 flex-wrap justify-end">
           <div className="text-right">
             <div className="text-[10px] uppercase text-slate-400">Total Floating Basket</div>
             <div
@@ -80,6 +99,37 @@ export const RunningTradesHUD: React.FC<RunningTradesHUDProps> = ({ onOpenTradeS
               {isOverallProfitable ? '+' : ''}${totalFloatingPnl.toFixed(2)} USD
             </div>
           </div>
+          {openAllTrades && (
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => openAllTrades('all')}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-sky-500/10 hover:bg-sky-500/20 text-sky-700 dark:text-sky-300 font-bold border border-sky-500/30 transition-colors cursor-pointer text-[11px]"
+                title="Track all open and closed positions in the audit journal"
+              >
+                <Layers className="w-3.5 h-3.5" />
+                <span>All Trades</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => openAllTrades('running')}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 font-bold border border-emerald-500/30 transition-colors cursor-pointer text-[11px]"
+                title="View all currently open positions"
+              >
+                <Zap className="w-3.5 h-3.5" />
+                <span>Open</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => openAllTrades('closed')}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-slate-700 dark:text-zinc-200 font-bold border border-slate-200 dark:border-zinc-700 transition-colors cursor-pointer text-[11px]"
+                title="Open closed trade history"
+              >
+                <History className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Closed</span>
+              </button>
+            </div>
+          )}
           <button
             type="button"
             onClick={() => tradingEngine.closeAll('Manual')}
