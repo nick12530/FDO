@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { HistoricalTick } from './mt5Bridge';
 import type { ReplayCandidate } from './historicalReplay';
-import { discoverTechnicalReplaySignals, replayHistoricalSignals } from './historicalReplay';
+import {
+  discoverSmcReplaySignals,
+  discoverTechnicalReplaySignals,
+  replayHistoricalSignals,
+} from './historicalReplay';
 
 const signal = (overrides: Partial<ReplayCandidate> = {}): ReplayCandidate => ({
   id: 'EURUSD:M1:breakout:BUY:1000',
@@ -59,6 +63,15 @@ function historicalBars(
 }
 
 describe('historical tick replay', () => {
+  it('withholds SMC replay when historical news coverage is unavailable', () => {
+    const result = discoverSmcReplaySignals('EURUSD', {
+      M1: [], M5: [], M15: [], H1: [],
+    }, []);
+
+    expect(result.candidates).toEqual([]);
+    expect(result.unavailableReason).toMatch(/historical news/i);
+  });
+
   it('does not let later candles change a previously discovered technical signal', () => {
     const endTime = 1_700_000_000 - (1_700_000_000 % 3600);
     const market = {
@@ -108,6 +121,21 @@ describe('historical tick replay', () => {
     expect(result.metrics.netExpectancyR).toBeCloseTo(1.4);
   });
 
+  it('marks trades unresolved across gaps in broker tick coverage', () => {
+    const result = replayHistoricalSignals(
+      [signal()],
+      [
+        tick(1_060_000, 1.1, 1.1002),
+        tick(1_121_000, 1.102, 1.1022),
+      ],
+      { ticksAvailable: true }
+    );
+
+    expect(result.fills[0].outcome).toBe('UNRESOLVED');
+    expect(result.tickCoverage.gapsOver60Seconds).toBe(1);
+    expect(result.unavailableReasons.join(' ')).toMatch(/gaps exceeded 60 seconds/i);
+  });
+
   it('keeps protective targets active after the signal entry window expires', () => {
     const result = replayHistoricalSignals(
       [signal({ expiryTimestamp: 1_070_000 })],
@@ -136,8 +164,9 @@ describe('historical tick replay', () => {
     expect(result.fills[0].grossR).toBeLessThan(-1);
     expect(result.metrics.netExpectancyR).toBeNull();
     expect(result.metrics.netProfitFactor).toBeNull();
+    expect(result.metrics.grossMaxDrawdownR).not.toBeNull();
     expect(result.unavailableReasons).toContain(
-      'Broker transaction-cost schedule was not provided; net expectancy, profit factor, and drawdown are unavailable.'
+      'Broker transaction-cost schedule was not provided; net expectancy, profit factor, and net drawdown are unavailable.'
     );
   });
 

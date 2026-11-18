@@ -13,6 +13,15 @@ const TIMEFRAME_MS: Record<Signal['timeframe'], number> = {
 const MIN_RESOLVED_SAMPLES = 20;
 const MIN_OUT_OF_SAMPLE_RESOLVED_SAMPLES = 5;
 export const HISTORICAL_REPLAY_POLICY_VERSION = 1;
+const MAX_CONTIGUOUS_TICK_GAP_MS = 60_000;
+
+export interface ReplayTickCoverage {
+  tickCount: number;
+  firstTickMs: number | null;
+  lastTickMs: number | null;
+  largestGapMs: number | null;
+  gapsOver60Seconds: number;
+}
 
 export interface ReplayCandidate extends Signal {
   id: string;
@@ -23,6 +32,7 @@ export interface SmcReplayDiscovery {
   candidates: ReplayCandidate[];
   rejectedForUnavailableNews: number;
   otherRejected: number;
+  unavailableReason?: string;
 }
 
 export interface ReplayFill {
@@ -55,6 +65,7 @@ export interface ReplayMetrics {
   wins: number;
   losses: number;
   breakevens: number;
+  winRate: number | null;
   unresolvedCount: number;
   unfilledCount: number;
   invalidCount: number;
@@ -62,7 +73,8 @@ export interface ReplayMetrics {
   netExpectancyR: number | null;
   grossProfitFactor: number | null;
   netProfitFactor: number | null;
-  maxDrawdownR: number | null;
+  grossMaxDrawdownR: number | null;
+  netMaxDrawdownR: number | null;
   averageMfeR: number | null;
   averageMaeR: number | null;
   transactionCostsKnown: boolean;
@@ -85,6 +97,7 @@ export interface HistoricalReplayResult {
     strategy: Record<string, ReplayMetrics>;
     scoreRange: Record<string, ReplayMetrics>;
   };
+  tickCoverage: ReplayTickCoverage;
   unavailableReasons: string[];
 }
 
@@ -182,6 +195,14 @@ export function discoverSmcReplaySignals(
     historicalEvents?: EconomicEvent[] | null;
   } = {}
 ): SmcReplayDiscovery {
+  if (options.historicalEvents === null || options.historicalEvents === undefined) {
+    return {
+      candidates: [],
+      rejectedForUnavailableNews: 0,
+      otherRejected: 0,
+      unavailableReason: 'Historical SMC, liquidity-reversal, and news-dependent signals are unavailable because archived historical news was not supplied.',
+    };
+  }
   const config = getInstrumentConfig(symbol);
   const frames = {
     M1: market.M1.map(toCandle),
@@ -350,6 +371,12 @@ function replayOne(
       outcome: 'UNFILLED', grossR: null, mfeR: null, maeR: null,
     };
   }
+  if (entryAt - discoveredAt > MAX_CONTIGUOUS_TICK_GAP_MS) {
+    return {
+      ...base, entryAt: null, entryPrice: null, exitAt: null, exitPrice: null,
+      outcome: 'UNRESOLVED', grossR: null, mfeR: null, maeR: null,
+    };
+  }
   if (
     signal.direction === 'BUY'
       ? !(signal.sl < entryPrice && entryPrice < signal.tp)
@@ -426,6 +453,12 @@ function replayOne(
   }
   for (let index = entryGroupEnd; index < ticks.length;) {
     const timeMs = ticks[index].timeMs;
+    if (timeMs - ticks[index - 1].timeMs > MAX_CONTIGUOUS_TICK_GAP_MS) {
+      return {
+        ...base, entryAt, entryPrice, exitAt: null, exitPrice: null,
+        outcome: 'UNRESOLVED', grossR: null, mfeR: mfe, maeR: mae,
+      };
+    }
     let groupEnd = index + 1;
     while (groupEnd < ticks.length && ticks[groupEnd].timeMs === timeMs) groupEnd += 1;
     const groupResult = evaluateQuoteGroup(ticks.slice(index, groupEnd));
@@ -478,13 +511,21 @@ export function summarizeReplayFills(
   const grossLosses = Math.abs(grossValues.filter((value) => value < 0).reduce((sum, value) => sum + value, 0));
   const netWins = netValues.filter((value) => value > 0).reduce((sum, value) => sum + value, 0);
   const netLosses = Math.abs(netValues.filter((value) => value < 0).reduce((sum, value) => sum + value, 0));
-  let peak = 0;
-  let equity = 0;
-  let drawdown = 0;
+  let grossPeak = 0;
+  let grossEquity = 0;
+  let grossDrawdown = 0;
+  let netPeak = 0;
+  let netEquity = 0;
+  let netDrawdown = 0;
+  for (const value of grossValues) {
+    grossEquity += value;
+    grossPeak = Math.max(grossPeak, grossEquity);
+    grossDrawdown = Math.max(grossDrawdown, grossPeak - grossEquity);
+  }
   for (const value of netValues) {
-    equity += value;
-    peak = Math.max(peak, equity);
-    drawdown = Math.max(drawdown, peak - equity);
+    netEquity += value;
+    netPeak = Math.max(netPeak, netEquity);
+    netDrawdown = Math.max(netDrawdown, netPeak - netEquity);
   }
   return {
     signalCount: fills.length,
@@ -493,6 +534,7 @@ export function summarizeReplayFills(
     wins: winners,
     losses: grossValues.filter((value) => value < 0).length,
     breakevens: grossValues.filter((value) => value === 0).length,
+    winRate: resolved.length ? winners / resolved.length : null,
     unresolvedCount: fills.filter((fill) => fill.outcome === 'UNRESOLVED').length,
     unfilledCount: fills.filter((fill) => fill.outcome === 'UNFILLED').length,
     invalidCount: fills.filter((fill) => fill.outcome === 'INVALID').length,
@@ -502,7 +544,8 @@ export function summarizeReplayFills(
     netProfitFactor: costsKnown
       ? netLosses > 0 ? netWins / netLosses : netWins > 0 ? Infinity : null
       : null,
-    maxDrawdownR: costsKnown && netValues.length ? drawdown : null,
+    grossMaxDrawdownR: grossValues.length ? grossDrawdown : null,
+    netMaxDrawdownR: costsKnown && netValues.length ? netDrawdown : null,
     averageMfeR: mean(resolved.map((fill) => fill.mfeR).filter((value): value is number => value !== null)),
     averageMaeR: mean(resolved.map((fill) => fill.maeR).filter((value): value is number => value !== null)),
     transactionCostsKnown: costsKnown,
@@ -531,6 +574,13 @@ export function replayHistoricalSignals(
 ): HistoricalReplayResult {
   const ticks = historicalTicks.filter(isValidQuote).sort((a, b) => a.timeMs - b.timeMs);
   const fills = signals.map((signal) => replayOne(signal, ticks));
+  let largestGapMs: number | null = null;
+  let gapsOver60Seconds = 0;
+  for (let index = 1; index < ticks.length; index += 1) {
+    const gap = ticks[index].timeMs - ticks[index - 1].timeMs;
+    largestGapMs = largestGapMs === null ? gap : Math.max(largestGapMs, gap);
+    if (gap > MAX_CONTIGUOUS_TICK_GAP_MS) gapsOver60Seconds += 1;
+  }
   const sortedSignals = [...signals].sort(
     (a, b) => discoveryTime(a) - discoveryTime(b)
   );
@@ -550,8 +600,13 @@ export function replayHistoricalSignals(
   if (!options.ticksAvailable || ticks.length === 0) {
     unavailableReasons.push('Genuine bid/ask tick history is unavailable; fills and performance are not established.');
   }
+  if (gapsOver60Seconds > 0) {
+    unavailableReasons.push(
+      `${gapsOver60Seconds} tick-data gaps exceeded 60 seconds; any replay position crossing such a gap is unresolved.`
+    );
+  }
   if (!Number.isFinite(options.roundTurnCostR) || options.roundTurnCostR! < 0) {
-    unavailableReasons.push('Broker transaction-cost schedule was not provided; net expectancy, profit factor, and drawdown are unavailable.');
+    unavailableReasons.push('Broker transaction-cost schedule was not provided; net expectancy, profit factor, and net drawdown are unavailable.');
   }
   if (fills.filter((fill) => fill.grossR !== null).length < MIN_RESOLVED_SAMPLES) {
     unavailableReasons.push(`Fewer than ${MIN_RESOLVED_SAMPLES} resolved broker-tick samples; performance is insufficient.`);
@@ -581,6 +636,13 @@ export function replayHistoricalSignals(
         const lower = Math.floor(fill.score / 10) * 10;
         return `${lower}-${lower + 9}`;
       }, options.roundTurnCostR ?? null),
+    },
+    tickCoverage: {
+      tickCount: ticks.length,
+      firstTickMs: ticks[0]?.timeMs ?? null,
+      lastTickMs: ticks[ticks.length - 1]?.timeMs ?? null,
+      largestGapMs,
+      gapsOver60Seconds,
     },
     unavailableReasons,
   };

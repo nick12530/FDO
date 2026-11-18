@@ -5,6 +5,7 @@ import { HistoricalReplayPanel } from './HistoricalReplayPanel';
 const bridgeMocks = vi.hoisted(() => ({
   getHistoricalCandles: vi.fn(),
   getHistoricalTicks: vi.fn(),
+  getHistoricalTicksChunked: vi.fn(),
 }));
 
 vi.mock('../engine/mt5Bridge', () => ({
@@ -28,6 +29,7 @@ describe('HistoricalReplayPanel', () => {
     vi.clearAllMocks();
     bridgeMocks.getHistoricalCandles.mockResolvedValue(response);
     bridgeMocks.getHistoricalTicks.mockResolvedValue(response);
+    bridgeMocks.getHistoricalTicksChunked.mockResolvedValue(response);
   });
 
   it('loads real broker history and reports missing ticks without inventing performance', async () => {
@@ -39,13 +41,13 @@ describe('HistoricalReplayPanel', () => {
       expect(screen.getByText(/Source: MT5/)).toBeTruthy();
     });
     expect(bridgeMocks.getHistoricalCandles).toHaveBeenCalledTimes(4);
-    expect(bridgeMocks.getHistoricalTicks).toHaveBeenCalledTimes(1);
+    expect(bridgeMocks.getHistoricalTicksChunked).toHaveBeenCalledTimes(1);
     expect(screen.getByText(/Genuine bid\/ask tick history is unavailable/)).toBeTruthy();
-    expect(screen.getByText(/Net \/ drawdown/)).toBeTruthy();
+    expect(screen.getByText(/Net expectancy \/ PF/)).toBeTruthy();
   });
 
   it('rejects history responses that cross an account switch', async () => {
-    bridgeMocks.getHistoricalTicks.mockResolvedValue({
+    bridgeMocks.getHistoricalTicksChunked.mockResolvedValue({
       ...response,
       accountLogin: 123,
     });

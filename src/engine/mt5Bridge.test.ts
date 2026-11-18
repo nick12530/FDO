@@ -74,6 +74,68 @@ describe('PC-local MT5 Bridge', () => {
     );
   });
 
+  it('fetches historical ticks in bounded six-hour requests', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      json: async () => ({
+        source: 'MetaTrader5',
+        accountLogin: 12345,
+        accountServer: 'Broker-Demo',
+        symbol: 'EURUSD',
+        requestedStart: 100,
+        requestedEnd: 200,
+        count: 0,
+        ticks: [],
+      }),
+    });
+    global.fetch = fetchSpy;
+    const connector = new MT5BridgeConnector();
+
+    await connector.getHistoricalTicksChunked('EURUSD', 100, 100 + 7 * 60 * 60);
+
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(fetchSpy.mock.calls[0][0]).toContain(`start=100&end=${100 + 6 * 60 * 60}`);
+    expect(fetchSpy.mock.calls[1][0]).toContain(`start=${100 + 6 * 60 * 60}`);
+  });
+
+  it('subdivides a tick chunk again when MT5 exceeds its record limit', async () => {
+    const fetchSpy = vi.fn().mockImplementation(async (url: string) => {
+      const parsed = new URL(url);
+      const start = Number(parsed.searchParams.get('start'));
+      const end = Number(parsed.searchParams.get('end'));
+      const overLimit = end - start > 3 * 60 * 60;
+      return {
+        ok: !overLimit,
+        status: overLimit ? 413 : 200,
+        headers: { get: () => 'application/json' },
+        json: async () => overLimit
+          ? { detail: 'Tick range exceeds the 500,000-record research limit.' }
+          : {
+              source: 'MetaTrader5',
+              accountLogin: 12345,
+              accountServer: 'Broker-Demo',
+              symbol: 'EURUSD',
+              requestedStart: start,
+              requestedEnd: end,
+              count: 0,
+              ticks: [],
+            },
+      };
+    });
+    global.fetch = fetchSpy;
+    const connector = new MT5BridgeConnector();
+
+    await connector.getHistoricalTicksChunked('EURUSD', 100, 100 + 7 * 60 * 60);
+
+    expect(fetchSpy).toHaveBeenCalledTimes(4);
+    expect(fetchSpy.mock.calls.some(([url]) => {
+      const parsed = new URL(url as string);
+      return Number(parsed.searchParams.get('end')) - Number(parsed.searchParams.get('start')) <= 3 * 60 * 60;
+    })).toBe(true);
+  });
+
   describe('ping reachability', () => {
     it('returns ok: true when bridge server responds with HTTP 200', async () => {
       global.fetch = vi.fn().mockResolvedValue({

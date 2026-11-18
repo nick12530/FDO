@@ -73,6 +73,10 @@ _economic_calendar_cache_ttl = 15 * 60
 _live_news_cache: tuple[float, list[dict]] | None = None
 _live_news_cache_lock = threading.Lock()
 _live_news_cache_ttl = 60.0
+_historical_research_cache: dict[tuple, tuple[float, dict]] = {}
+_historical_research_cache_lock = threading.Lock()
+_historical_research_cache_ttl = 60.0
+_historical_research_cache_limit = 16
 RISK_CONFIG = json.loads((Path(__file__).resolve().parents[1] / "risk-config.json").read_text(encoding="utf-8"))
 STATE_DIRECTORY = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SMCBridge"
 STATE_DIRECTORY.mkdir(parents=True, exist_ok=True)
@@ -119,9 +123,6 @@ def initialize_state_database() -> None:
         )
         connection.execute(
             "INSERT OR IGNORE INTO control_state (state_key, state_value) VALUES ('trading_halted', 'false')"
-        )
-        connection.execute(
-            "UPDATE control_state SET state_value = 'false' WHERE state_key = 'trading_halted'"
         )
         connection.execute(
             "INSERT OR IGNORE INTO control_state (state_key, state_value) VALUES ('auto_trade', 'false')"
@@ -1090,6 +1091,33 @@ def _finite_research_number(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _historical_cache_get(key: tuple) -> dict | None:
+    now = time.monotonic()
+    with _historical_research_cache_lock:
+        cached = _historical_research_cache.get(key)
+        if cached is None:
+            return None
+        expires_at, value = cached
+        if expires_at <= now:
+            _historical_research_cache.pop(key, None)
+            return None
+        return value
+
+
+def _historical_cache_put(key: tuple, value: dict) -> None:
+    if len(value.get("candles", value.get("ticks", []))) > 20_000:
+        return
+    with _historical_research_cache_lock:
+        _historical_research_cache.pop(key, None)
+        while len(_historical_research_cache) >= _historical_research_cache_limit:
+            oldest = min(_historical_research_cache, key=lambda item: _historical_research_cache[item][0])
+            _historical_research_cache.pop(oldest, None)
+        _historical_research_cache[key] = (
+            time.monotonic() + _historical_research_cache_ttl,
+            value,
+        )
+
+
 def _research_symbol_spec(login: int, server: str, symbol: str, info: Any) -> dict:
     spec = get_symbol_spec(login, server, symbol, info)
     if getattr(info, "digits", None) is None:
@@ -1111,6 +1139,12 @@ def research_candles(
         raise HTTPException(status_code=400, detail="Research range must be positive and no longer than 366 days.")
     account = require_account()
     broker_symbol = resolve_broker_symbol(symbol)
+    cache_key = (
+        "candles", account["login"], account["server"], broker_symbol, timeframe.upper(), start, end
+    )
+    cached = _historical_cache_get(cache_key)
+    if cached is not None:
+        return cached
     symbol_info = mt5.symbol_info(broker_symbol) if broker_symbol else None
     if symbol_info is None:
         raise HTTPException(status_code=404, detail=f"MT5 symbol {symbol!r} is unavailable.")
@@ -1155,7 +1189,7 @@ def research_candles(
             "realVolume": int(rate["real_volume"]),
         })
     candles.sort(key=lambda candle: candle["openTime"])
-    return {
+    response = {
         "source": "MetaTrader5",
         "accountLogin": account["login"],
         "accountServer": account["server"],
@@ -1169,6 +1203,8 @@ def research_candles(
         "count": len(candles),
         "candles": candles,
     }
+    _historical_cache_put(cache_key, response)
+    return response
 
 
 @app.get("/api/research/ticks")
@@ -1180,8 +1216,8 @@ def research_ticks(
 ) -> dict:
     """Return genuine bid/ask tick history; never substitute bars or generated quotes."""
     require_bridge_token(request)
-    if end <= start or end - start > 7 * 24 * 60 * 60:
-        raise HTTPException(status_code=400, detail="Tick research range must be positive and no longer than 7 days.")
+    if end <= start or end - start > 6 * 60 * 60:
+        raise HTTPException(status_code=400, detail="Tick research chunks must be positive and no longer than 6 hours.")
     account = require_account()
     broker_symbol = resolve_broker_symbol(symbol)
     symbol_info = mt5.symbol_info(broker_symbol) if broker_symbol else None
@@ -1190,6 +1226,10 @@ def research_ticks(
     copy_flags = getattr(mt5, "COPY_TICKS_ALL", None)
     if copy_flags is None or not callable(getattr(mt5, "copy_ticks_range", None)):
         raise HTTPException(status_code=501, detail="This MT5 adapter does not provide historical tick data.")
+    cache_key = ("ticks", account["login"], account["server"], broker_symbol, start, end)
+    cached = _historical_cache_get(cache_key)
+    if cached is not None:
+        return cached
     ticks = mt5.copy_ticks_range(
         broker_symbol,
         datetime.fromtimestamp(start, tz=timezone.utc),
@@ -1215,7 +1255,7 @@ def research_ticks(
             "flags": int(tick["flags"]),
         })
     rows.sort(key=lambda tick: tick["timeMs"])
-    return {
+    response = {
         "source": "MetaTrader5",
         "accountLogin": account["login"],
         "accountServer": account["server"],
@@ -1228,6 +1268,8 @@ def research_ticks(
         "count": len(rows),
         "ticks": rows,
     }
+    _historical_cache_put(cache_key, response)
+    return response
 
 
 def resolve_filling_mode(info) -> int:

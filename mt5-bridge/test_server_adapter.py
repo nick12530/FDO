@@ -21,6 +21,7 @@ class FakeMT5Adapter:
         self.calls = []
         self.rates = []
         self.ticks = []
+        self.login = 12345
 
     def symbol_info(self, symbol):
         self.calls.append(("symbol_info", symbol))
@@ -44,7 +45,7 @@ class FakeMT5Adapter:
 
     def account_info(self):
         return SimpleNamespace(
-            login=12345,
+            login=self.login,
             server="Broker-Demo",
             balance=1000,
             equity=1000,
@@ -111,6 +112,24 @@ class TestServerTestDependencies(unittest.TestCase):
 
         self.assertIn("order_requests", tables)
         self.assertIn("control_state", tables)
+
+    def test_kill_switch_state_survives_database_reinitialization(self):
+        with closing(sqlite3.connect(self.server.STATE_DATABASE)) as connection, connection:
+            connection.execute(
+                "UPDATE control_state SET state_value = 'true' WHERE state_key = 'trading_halted'"
+            )
+
+        self.server.initialize_state_database()
+
+        with closing(sqlite3.connect(self.server.STATE_DATABASE)) as connection:
+            halted = connection.execute(
+                "SELECT state_value FROM control_state WHERE state_key = 'trading_halted'"
+            ).fetchone()[0]
+        self.assertEqual(halted, "true")
+        with closing(sqlite3.connect(self.server.STATE_DATABASE)) as connection, connection:
+            connection.execute(
+                "UPDATE control_state SET state_value = 'false' WHERE state_key = 'trading_halted'"
+            )
 
     def test_execution_quote_validation_uses_executable_side_and_fails_closed(self):
         buy_price, spread = self.server.validate_execution_quote(
@@ -193,6 +212,32 @@ class TestServerTestDependencies(unittest.TestCase):
         with self.assertRaises(self.server.HTTPException) as error:
             self.server.research_ticks(request, "EURUSD", now - 10, now)
         self.assertEqual(error.exception.status_code, 501)
+
+    def test_research_ticks_are_cached_per_account_and_limited_to_six_hour_chunks(self):
+        adapter = FakeMT5Adapter()
+        self.server.configure_mt5_adapter(adapter)
+        now = int(time.time())
+        adapter.ticks = [
+            {"time_msc": (now - 15) * 1000, "bid": 1.1, "ask": 1.1002,
+             "last": 0, "volume": 0, "flags": 6},
+        ]
+        request = SimpleNamespace(
+            headers={},
+            query_params={},
+            client=SimpleNamespace(host="testclient"),
+        )
+
+        first = self.server.research_ticks(request, "EURUSD", now - 20, now - 10)
+        second = self.server.research_ticks(request, "EURUSD", now - 20, now - 10)
+
+        self.assertEqual(first, second)
+        self.assertEqual(sum(call[0] == "copy_ticks_range" for call in adapter.calls), 1)
+        adapter.login = 67890
+        self.server.research_ticks(request, "EURUSD", now - 20, now - 10)
+        self.assertEqual(sum(call[0] == "copy_ticks_range" for call in adapter.calls), 2)
+        with self.assertRaises(self.server.HTTPException) as error:
+            self.server.research_ticks(request, "EURUSD", now - 7 * 60 * 60, now)
+        self.assertEqual(error.exception.status_code, 400)
 
 
 if __name__ == "__main__":

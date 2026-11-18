@@ -266,6 +266,86 @@ export class MT5BridgeConnector {
     return this.request(`/api/research/ticks?${query}`, { method: 'GET' }, 60_000);
   }
 
+  async getHistoricalTicksChunked(
+    symbol: string,
+    start: number,
+    end: number
+  ): Promise<HistoricalResearchResponse> {
+    const chunkSeconds = 6 * 60 * 60;
+    const ranges: Array<[number, number]> = [];
+    for (let chunkStart = start; chunkStart < end;) {
+      const chunkEnd = Math.min(end, chunkStart + chunkSeconds);
+      ranges.push([chunkStart, chunkEnd]);
+      chunkStart = chunkEnd;
+    }
+
+    const fetchRange = async (
+      chunkStart: number,
+      chunkEnd: number
+    ): Promise<Array<{ start: number; end: number; response: HistoricalResearchResponse }>> => {
+      try {
+        const response = await this.getHistoricalTicks(symbol, chunkStart, chunkEnd);
+        return [{ start: chunkStart, end: chunkEnd, response }];
+      } catch (error) {
+        if (
+          !(error instanceof Error) ||
+          !/500,000-record/i.test(error.message) ||
+          chunkEnd - chunkStart <= 1
+        ) throw error;
+        const midpoint = chunkStart + Math.floor((chunkEnd - chunkStart) / 2);
+        const [left, right] = await Promise.all([
+          fetchRange(chunkStart, midpoint),
+          fetchRange(midpoint, chunkEnd),
+        ]);
+        return [...left, ...right];
+      }
+    };
+
+    const responses: Array<{ start: number; end: number; response: HistoricalResearchResponse }> = [];
+    for (let index = 0; index < ranges.length; index += 4) {
+      const batch = ranges.slice(index, index + 4);
+      responses.push(...await Promise.all(
+        batch.map(([chunkStart, chunkEnd]) =>
+          fetchRange(chunkStart, chunkEnd)
+        )
+      ).then((results) => results.flat()));
+    }
+    if (responses.length === 0) {
+      throw new Error('Historical tick range is empty.');
+    }
+    responses.sort((a, b) => a.start - b.start);
+    const first = responses[0].response;
+    if (responses.some(({ response }) =>
+      response.source !== first.source ||
+      response.accountLogin !== first.accountLogin ||
+      response.accountServer !== first.accountServer ||
+      response.symbol !== first.symbol
+    )) {
+      throw new Error('Historical tick chunks do not share the same MT5 source, account, and broker symbol.');
+    }
+    const ticks: HistoricalTick[] = [];
+    for (const [responseIndex, result] of responses.entries()) {
+      const previousChunk = responses[responseIndex - 1];
+      const overlapBoundaryMs = result.start * 1000;
+      for (const tick of result.response.ticks ?? []) {
+        if (
+          previousChunk &&
+          previousChunk.end === result.start &&
+          tick.timeMs === overlapBoundaryMs
+        ) continue;
+        ticks.push(tick);
+      }
+    }
+    ticks.sort((a, b) => a.timeMs - b.timeMs);
+    return {
+      ...first,
+      requestedStart: start,
+      requestedEnd: end,
+      count: ticks.length,
+      ticks,
+    };
+  }
+
   /**
    * Performs an instant ping test to check the local PC bridge and its latency.
    */

@@ -3,12 +3,14 @@ import { AlertTriangle, Play, RefreshCw } from 'lucide-react';
 import type { InstrumentType } from '../types/smc';
 import { getSupportedSymbol, type SupportedSymbol } from '../engine/instrumentConfig';
 import {
+  discoverSmcReplaySignals,
   discoverTechnicalReplaySignals,
   replayHistoricalSignals,
   type HistoricalReplayResult,
   type ReplayMetrics,
 } from '../engine/historicalReplay';
 import { mt5Bridge, type HistoricalResearchResponse } from '../engine/mt5Bridge';
+import type { SymbolTradingSpec } from '../types/smc';
 
 interface ReplayRun {
   result: HistoricalReplayResult;
@@ -33,6 +35,29 @@ function isConsistentAccount(responses: HistoricalResearchResponse[]): boolean {
       response.accountServer === responses[0].accountServer &&
       response.symbol === responses[0].symbol
   );
+}
+
+function toSymbolTradingSpec(
+  spec: HistoricalResearchResponse['symbolSpec']
+): SymbolTradingSpec | null {
+  if (!spec) return null;
+  const {
+    point, tickSize, tickValue, contractSize, volumeMin, volumeMax,
+    volumeStep, tradeStopsLevel, tradeFreezeLevel,
+  } = spec;
+  if (
+    point === null || tickSize === null || tickValue === null ||
+    contractSize === null || volumeMin === null || volumeMax === null ||
+    volumeStep === null || tradeStopsLevel === null || tradeFreezeLevel === null ||
+    ![point, tickSize, tickValue, contractSize, volumeMin, volumeMax, volumeStep,
+      tradeStopsLevel, tradeFreezeLevel].every(Number.isFinite)
+  ) return null;
+  return {
+    point, tickSize, tickValue, contractSize, volumeMin, volumeMax,
+    volumeStep, tradeStopsLevel, tradeFreezeLevel,
+    tradeMode: spec.tradeMode ?? undefined,
+    tradeDisabled: spec.tradeDisabled ?? undefined,
+  };
 }
 
 export const HistoricalReplayPanel: React.FC<HistoricalReplayPanelProps> = ({
@@ -69,7 +94,7 @@ export const HistoricalReplayPanel: React.FC<HistoricalReplayPanelProps> = ({
         mt5Bridge.getHistoricalCandles(supportedSymbol, 'M5', start, end),
         mt5Bridge.getHistoricalCandles(supportedSymbol, 'M15', start, end),
         mt5Bridge.getHistoricalCandles(supportedSymbol, 'H1', start, end),
-        mt5Bridge.getHistoricalTicks(supportedSymbol, start, end),
+        mt5Bridge.getHistoricalTicksChunked(supportedSymbol, start, end),
       ]);
       if (generation !== requestGeneration.current) return;
       if (!isConsistentAccount(responses)) {
@@ -85,14 +110,24 @@ export const HistoricalReplayPanel: React.FC<HistoricalReplayPanelProps> = ({
       const ticks = tickResponse.ticks ?? [];
       const tickSize = m1.symbolSpec?.tickSize;
       const digits = m1.symbolSpec?.digits;
-      const signals = discoverTechnicalReplaySignals(supportedSymbol, market, {
+      const technicalSignals = discoverTechnicalReplaySignals(supportedSymbol, market, {
         instrumentType,
         tickSize: tickSize !== null && tickSize !== undefined && tickSize > 0 ? tickSize : undefined,
         digits: digits !== null && digits !== undefined ? digits : undefined,
       });
+      const smcDiscovery = discoverSmcReplaySignals(
+        supportedSymbol,
+        market,
+        ticks,
+        { symbolSpec: toSymbolTradingSpec(m1.symbolSpec), historicalEvents: null }
+      );
+      const signals = [...technicalSignals, ...smcDiscovery.candidates];
       const result = replayHistoricalSignals(signals, ticks, {
         ticksAvailable: tickResponse.count > 0,
       });
+      if (smcDiscovery.unavailableReason) {
+        result.unavailableReasons.unshift(smcDiscovery.unavailableReason);
+      }
       const minimumBars = 52;
       const shortFrames = Object.entries(market)
         .filter(([, candles]) => candles.length < minimumBars)
@@ -155,8 +190,10 @@ export const HistoricalReplayPanel: React.FC<HistoricalReplayPanelProps> = ({
           <div className="space-y-1">
             <p className="font-semibold">Research only. No orders are sent or positions modified.</p>
             <p>
-              Technical strategies only. Historical SMC news context and broker transaction-cost schedules are unavailable;
-              net performance is withheld. Gross R excludes fees and is not a forecast.
+              Trend-continuation and volatility-breakout strategies are replayed from closed broker candles.
+              SMC and liquidity-reversal strategies are withheld because historical news archives are unavailable;
+              broker transaction-cost schedules are also unavailable, so net performance is withheld.
+              Gross R excludes fees and is not a forecast.
             </p>
           </div>
         </div>
@@ -169,6 +206,15 @@ export const HistoricalReplayPanel: React.FC<HistoricalReplayPanelProps> = ({
           <p className="font-mono text-[11px] text-slate-500 dark:text-slate-400">
             Source: MT5 · Replay policy v{result.replayPolicyVersion} · Account {run.accountLogin} / {run.accountServer} · {new Date(run.start * 1000).toISOString()} – {new Date(run.end * 1000).toISOString()} · {run.candleCount.toLocaleString()} candles · {run.tickCount.toLocaleString()} ticks
           </p>
+          <p className="text-[11px] text-slate-500 dark:text-slate-400">
+            Tick coverage: {result.tickCoverage.firstTickMs === null
+              ? 'no valid bid/ask records'
+              : `${new Date(result.tickCoverage.firstTickMs).toISOString()} – ${new Date(result.tickCoverage.lastTickMs!).toISOString()}`}
+            {' · '}largest gap {result.tickCoverage.largestGapMs === null
+              ? '—'
+              : `${Math.round(result.tickCoverage.largestGapMs / 1000)}s`}
+            {' · '}{result.tickCoverage.gapsOver60Seconds} gaps over 60s; positions spanning such gaps remain unresolved.
+          </p>
 
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
             <Metric label="Signals" value={String(metrics.signalCount)} />
@@ -178,10 +224,10 @@ export const HistoricalReplayPanel: React.FC<HistoricalReplayPanelProps> = ({
           </div>
 
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-            <Metric label="Gross W / L / BE" value={`${metrics.wins} / ${metrics.losses} / ${metrics.breakevens}`} />
-            <Metric label="Unresolved" value={String(metrics.unresolvedCount)} />
+            <Metric label="Gross win rate" value={metrics.winRate === null ? '—' : `${(metrics.winRate * 100).toFixed(1)}% (${metrics.wins}/${metrics.resolvedCount})`} />
+            <Metric label="Gross max drawdown (R)" value={metrics.grossMaxDrawdownR === null ? '—' : `${metrics.grossMaxDrawdownR.toFixed(2)}R`} />
             <Metric label="Average MFE / MAE (R)" value={`${metrics.averageMfeR?.toFixed(2) ?? '—'} / ${metrics.averageMaeR?.toFixed(2) ?? '—'}`} />
-            <Metric label="Net / drawdown" value="Unavailable: costs" />
+            <Metric label="Net expectancy / PF" value="Unavailable: costs" />
           </div>
 
           <div className="rounded-lg border border-slate-200 p-3 dark:border-[#2b3b59]">
